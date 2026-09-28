@@ -89,10 +89,79 @@ class _Noise1:
         return a + (b - a) * t
 
 
+class _Path:
+    """One passage of a cave: a smoothed floor polyline plus its size profile."""
+
+    def __init__(self, points, width, height, scale, flare, mouth_size, materials, seed):
+        dense = _catmull_rom([tuple(p) for p in points])
+        self.poly, s = [dense[0]], [0.0]
+        for p in dense[1:]:
+            step = math.hypot(p[0] - self.poly[-1][0], p[1] - self.poly[-1][1])
+            if step > 0.5:
+                self.poly.append(p)
+                s.append(s[-1] + step)
+        self.poly_s = s
+        self.length = s[-1]
+        self.width, self.height = width, height
+        self.scale = scale or (lambda f: 1.0)
+        self.flare = flare
+        self.mouth_size = mouth_size          # (w, h) for the main path, None for branches
+        self.materials = sorted(materials, key=lambda m: m[0])
+        self.n_width = (_Noise1(f"{seed}r", 96), _Noise1(f"{seed}l", 96))
+
+    def nearest(self, x, y):
+        """(s, distance, side(+1 right / -1 left), floor z, tangent) of the closest point."""
+        best = None
+        P = self.poly
+        for k in range(len(P) - 1):
+            a, b = P[k], P[k + 1]
+            ex, ey = b[0] - a[0], b[1] - a[1]
+            L2 = ex * ex + ey * ey
+            t = max(0.0, min(1.0, ((x - a[0]) * ex + (y - a[1]) * ey) / L2)) if L2 else 0.0
+            px, py = a[0] + ex * t, a[1] + ey * t
+            dd = (x - px) ** 2 + (y - py) ** 2
+            if best is None or dd < best[0]:
+                best = (dd, k, t, px, py, ex, ey)
+        dd, k, t, px, py, ex, ey = best
+        s = self.poly_s[k] + (self.poly_s[k + 1] - self.poly_s[k]) * t
+        z = P[k][2] + (P[k + 1][2] - P[k][2]) * t
+        L = math.hypot(ex, ey) or 1.0
+        side = 1 if (ex * (y - py) - ey * (x - px)) < 0 else -1
+        return s, math.sqrt(dd), side, z, (ex / L, ey / L)
+
+    def dims(self, s, side=0):
+        """(half width, height, flare factor) at arc length s."""
+        f = _smoothstep(s / self.flare) if self.flare else 1.0
+        k = self.scale(s / self.length)
+        if self.mouth_size:
+            mw, mh = self.mouth_size
+            hw = (mw / 2 + (self.width / 2 - mw / 2) * f) * k
+            h = (mh + (self.height - mh) * f) * k
+        else:
+            hw, h = self.width / 2 * k, self.height * k
+        if side:
+            hw *= 1 + 0.25 * f * self.n_width[0 if side > 0 else 1](s)
+        return hw, h, f
+
+    def at_s(self, s):
+        P, S = self.poly, self.poly_s
+        s = max(0.0, min(self.length, s))
+        for k in range(len(P) - 1):
+            if S[k + 1] >= s:
+                t = (s - S[k]) / (S[k + 1] - S[k]) if S[k + 1] > S[k] else 0
+                a, b = P[k], P[k + 1]
+                L = math.hypot(b[0] - a[0], b[1] - a[1]) or 1.0
+                return ((a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t),
+                        ((b[0] - a[0]) / L, (b[1] - a[1]) / L))
+        a, b = P[-2], P[-1]
+        L = math.hypot(b[0] - a[0], b[1] - a[1]) or 1.0
+        return (b[0], b[1], b[2]), ((b[0] - a[0]) / L, (b[1] - a[1]) / L)
+
+
 class Cave:
     def __init__(self, name, mouth, direction, mouth_size, path, *, cell=32, width=176, height=144,
                  roughness=16, floor_noise=3, flare=128, seed=0, materials=((0.0, ROCK),), blend=0.0,
-                 scale=None, avoid=()):
+                 scale=None, avoid=(), branches=()):
         """
         mouth:      floor centre of the doorway on the OUTER face of the room wall.
         direction:  axis unit vector (dx, dy) pointing out of the room.
@@ -102,6 +171,10 @@ class Cave:
         materials:  [(start_fraction, Material)]; `blend` makes boundaries ragged.
         scale:      optional f(fraction) -> size multiplier (chambers).
         avoid:      air boxes of other rooms the cave must keep clear of.
+        branches:   side passages: [{"at": fraction of the main path where it leaves,
+                    "path": [floor points...], optional "width", "height", "scale",
+                    "materials"}]. Branch k is addressed as branch=k+1 in floor_point(),
+                    camera() and frame().
         """
         self.name = name
         self.cell = cell
@@ -118,21 +191,19 @@ class Cave:
         self._n_floor = _Noise2(f"{seed}f", cell * 3)
         self._n_ceil = _Noise2(f"{seed}c", cell * 2.5)
         self._n_mat = _Noise2(f"{seed}m", cell * 2)
-        self._n_width = (_Noise1(f"{seed}r", 96), _Noise1(f"{seed}l", 96))
 
-        # --- the path (horizontal arc length s) ---------------------------------
+        # --- the paths: main (from the mouth) + branches ---------------------------
         d = self.dir
-        start = tuple(mouth)
         lead = (mouth[0] + d[0] * 64, mouth[1] + d[1] * 64, mouth[2])
-        dense = _catmull_rom([start, lead] + [tuple(p) for p in path])
-        self.poly, s = [dense[0]], [0.0]
-        for p in dense[1:]:
-            step = math.hypot(p[0] - self.poly[-1][0], p[1] - self.poly[-1][1])
-            if step > 0.5:
-                self.poly.append(p)
-                s.append(s[-1] + step)
-        self.poly_s = s
-        self.length = s[-1]
+        main = _Path([tuple(mouth), lead] + [tuple(p) for p in path], width, height, scale, flare,
+                     tuple(mouth_size), self.materials, seed)
+        self.paths = [main]
+        for k, br in enumerate(branches):
+            start, _ = main.at_s(br["at"] * main.length)
+            self.paths.append(_Path([start] + [tuple(p) for p in br["path"]], br.get("width", width),
+                                    br.get("height", height), br.get("scale"), 0, None,
+                                    br.get("materials", self.materials), f"{seed}b{k}"))
+        self.length = main.length
 
         # --- grid: axis = outward axis, i >= 0 outward from the wall face ----------
         self.axis = 0 if d[0] else 1
@@ -154,75 +225,61 @@ class Cave:
         return (a - self.face) * self.sign / self.cell, (o - self.o0) / self.cell
 
     # ------------------------------------------------------------ path queries
-    def _nearest(self, x, y):
-        """(s, distance, side(+1 right / -1 left), floor z, tangent) of the closest path point."""
-        best = None
-        P = self.poly
-        for k in range(len(P) - 1):
-            a, b = P[k], P[k + 1]
-            ex, ey = b[0] - a[0], b[1] - a[1]
-            L2 = ex * ex + ey * ey
-            t = max(0.0, min(1.0, ((x - a[0]) * ex + (y - a[1]) * ey) / L2)) if L2 else 0.0
-            px, py = a[0] + ex * t, a[1] + ey * t
-            dd = (x - px) ** 2 + (y - py) ** 2
-            if best is None or dd < best[0]:
-                best = (dd, k, t, px, py, ex, ey)
-        dd, k, t, px, py, ex, ey = best
-        s = self.poly_s[k] + (self.poly_s[k + 1] - self.poly_s[k]) * t
-        z = P[k][2] + (P[k + 1][2] - P[k][2]) * t
-        L = math.hypot(ex, ey) or 1.0
-        side = 1 if (ex * (y - py) - ey * (x - px)) < 0 else -1
-        return s, math.sqrt(dd), side, z, (ex / L, ey / L)
-
-    def _dims(self, s, side=0):
-        """(half width, height, flare factor) at arc length s."""
-        f = _smoothstep(s / self.flare) if self.flare else 1.0
-        k = self.scale(s / self.length)
-        mw, mh = self.mouth_size
-        hw = (mw / 2 + (self.width / 2 - mw / 2) * f) * k
-        if side:
-            hw *= 1 + 0.25 * f * self._n_width[0 if side > 0 else 1](s)
-        h = (mh + (self.height - mh) * f) * k
-        return hw, h, f
-
     def _heights(self, x, y):
-        """(floor, ceiling) at a grid vertex; equal when closed."""
-        s, dist, side, zf, _ = self._nearest(x, y)
-        hw, h, f = self._dims(s, side)
-        t = dist / hw
-        edge = zf + 0.55 * h + self.roughness * 0.5 * self._n_ceil(x, y) * f
-        if t >= 1:
-            return edge, edge
-        rise = _smoothstep((t - 0.5) / 0.5)
-        floor = zf + self.floor_noise * self._n_floor(x, y) * f * (1 - rise) + (edge - zf) * rise
-        ceil = zf + h * (0.55 + 0.45 * math.sqrt(1 - t * t)) + self.roughness * 0.6 * self._n_ceil(x, y) * f
-        if ceil - floor < 4:
-            mid = (ceil + floor) / 2
-            return mid, mid
-        return floor, ceil
+        """(floor, ceiling) at a grid vertex; equal when closed. The air of all paths is
+        merged (union of their spans)."""
+        opened, closed = [], []
+        for path in self.paths:
+            s, dist, side, zf, _ = path.nearest(x, y)
+            hw, h, f = path.dims(s, side)
+            t = dist / hw
+            edge = zf + 0.55 * h + self.roughness * 0.5 * self._n_ceil(x, y) * f
+            if t >= 1:
+                closed.append((t, edge))
+                continue
+            rise = _smoothstep((t - 0.5) / 0.5)
+            floor = zf + self.floor_noise * self._n_floor(x, y) * f * (1 - rise) + (edge - zf) * rise
+            ceil = zf + h * (0.55 + 0.45 * math.sqrt(1 - t * t)) + self.roughness * 0.6 * self._n_ceil(x, y) * f
+            if ceil - floor < 4:
+                closed.append((t, (ceil + floor) / 2))
+            else:
+                opened.append((floor, ceil))
+        if opened:
+            return min(f for f, _ in opened), max(c for _, c in opened)
+        edge = min(closed)[1]
+        return edge, edge
+
+    def _nearest_path(self, x, y):
+        """(path, s) of the path whose air is relatively closest to (x, y)."""
+        best = None
+        for path in self.paths:
+            s, dist, side, _, _ = path.nearest(x, y)
+            t = dist / path.dims(s, side)[0]
+            if best is None or t < best[0]:
+                best = (t, path, s)
+        return best[1], best[2]
 
     # ------------------------------------------------------------ grid build
     def _build(self, avoid):
         c = self.cell
         mw, mh = self.mouth_size
         z0 = self.mouth[2]
-        w_max = self.width / 2 * max(self.scale(k / 20) for k in range(21)) * 1.3
-        R = w_max + 2.5 * c
-        ii, jj = [], []
-        for p in self.poly:
-            i, j = self._ij(p[0], p[1])
-            ii.append(i)
-            jj.append(j)
-        r = R / c
-        i_hi = math.ceil(max(ii) + r) + 1
-        j_lo, j_hi = math.floor(min(jj) - r) - 1, math.ceil(max(jj) + r) + 1
-
         cells = set()
-        for i in range(0, i_hi):
-            for j in range(j_lo, j_hi):
-                cx, cy = self._xy(i + 0.5, j + 0.5)
-                if self._nearest(cx, cy)[1] <= R:
-                    cells.add((i, j))
+        for path in self.paths:
+            R = path.width / 2 * max(path.scale(k / 20) for k in range(21)) * 1.3 + 2.5 * c
+            ii, jj = [], []
+            for p in path.poly:
+                i, j = self._ij(p[0], p[1])
+                ii.append(i)
+                jj.append(j)
+            r = R / c
+            i_lo, i_hi = max(0, math.floor(min(ii) - r) - 1), math.ceil(max(ii) + r) + 1
+            j_lo, j_hi = math.floor(min(jj) - r) - 1, math.ceil(max(jj) + r) + 1
+            for i in range(i_lo, i_hi):
+                for j in range(j_lo, j_hi):
+                    cx, cy = self._xy(i + 0.5, j + 0.5)
+                    if (i, j) not in cells and path.nearest(cx, cy)[1] <= R:
+                        cells.add((i, j))
         # cells overlapping other rooms' air are left out (those rooms' shells take over)
         blocked = set()
         for (i, j) in cells:
@@ -288,10 +345,10 @@ class Cave:
         return out
 
     def _material_at(self, x, y):
-        s = self._nearest(x, y)[0]
-        frac = s / self.length - self.blend * self._n_mat(x, y)
-        mat = self.materials[0][1]
-        for start, m in self.materials:
+        path, s = self._nearest_path(x, y)
+        frac = s / path.length - self.blend * self._n_mat(x, y)
+        mat = path.materials[0][1]
+        for start, m in path.materials:
             if frac >= start:
                 mat = m
         return mat
@@ -366,40 +423,29 @@ class Cave:
                     return True
         return False
 
-    def _at_s(self, s):
-        P, S = self.poly, self.poly_s
-        s = max(0.0, min(self.length, s))
-        for k in range(len(P) - 1):
-            if S[k + 1] >= s:
-                t = (s - S[k]) / (S[k + 1] - S[k]) if S[k + 1] > S[k] else 0
-                a, b = P[k], P[k + 1]
-                L = math.hypot(b[0] - a[0], b[1] - a[1]) or 1.0
-                return (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t), ((b[0] - a[0]) / L, (b[1] - a[1]) / L)
-        a, b = P[-2], P[-1]
-        L = math.hypot(b[0] - a[0], b[1] - a[1]) or 1.0
-        return (b[0], b[1]), ((b[0] - a[0]) / L, (b[1] - a[1]) / L)
-
-    def floor_point(self, frac, lateral=0.0, above=0):
-        """Point on the cave floor at `frac` of its length; lateral -1..1 spans the flat
-        middle of the floor (left..right)."""
-        s = frac * self.length
-        (x, y), t = self._at_s(s)
+    def floor_point(self, frac, lateral=0.0, above=0, branch=0):
+        """Point on the floor at `frac` of the main path (branch=0) or of branch k (1..);
+        lateral -1..1 spans the flat middle of the floor (left..right)."""
+        path = self.paths[branch]
+        s = frac * path.length
+        (x, y, z0), t = path.at_s(s)
         right = (t[1], -t[0])
-        hw, _, _ = self._dims(s)
+        hw, _, _ = path.dims(s)
         x, y = x + right[0] * lateral * 0.45 * hw, y + right[1] * lateral * 0.45 * hw
         q = self.heights_at(x, y)
-        z = q[0] if q else self._nearest(x, y)[3]
+        z = q[0] if q else z0
         return (round(x), round(y), math.ceil(z) + above)
 
-    def frame(self, frac):
-        """(floor_centre, tangent, right) at a fraction of the length."""
-        _, t = self._at_s(frac * self.length)
-        return self.floor_point(frac), (t[0], t[1], 0.0), (t[1], -t[0], 0.0)
+    def frame(self, frac, branch=0):
+        """(floor_centre, tangent, right) at a fraction of a path."""
+        path = self.paths[branch]
+        _, t = path.at_s(frac * path.length)
+        return self.floor_point(frac, branch=branch), (t[0], t[1], 0.0), (t[1], -t[0], 0.0)
 
-    def camera(self, frac, eye=64, look_ahead=0.15, lateral=0.0, pitch=None):
+    def camera(self, frac, eye=64, look_ahead=0.15, lateral=0.0, pitch=None, branch=0):
         """Camera pose (x, y, z, pitch, yaw) standing at frac, looking at frac+look_ahead."""
-        p = self.floor_point(frac, lateral)
-        q = self.floor_point(min(1.0, frac + look_ahead))
+        p = self.floor_point(frac, lateral, branch=branch)
+        q = self.floor_point(min(1.0, frac + look_ahead), branch=branch)
         yaw = math.degrees(math.atan2(q[1] - p[1], q[0] - p[0])) % 360
         if pitch is None:
             dist = math.hypot(q[0] - p[0], q[1] - p[1]) or 1
@@ -407,8 +453,11 @@ class Cave:
         return (p[0], p[1], p[2] + eye, round(pitch, 1), round(yaw, 1))
 
     def checkpoints(self, n=9):
-        """Floor points along the cave, for reachability checks."""
-        return [self.floor_point((k + 0.5) / n) for k in range(n)]
+        """Floor points along every path, for reachability checks."""
+        pts = [self.floor_point((k + 0.5) / n) for k in range(n)]
+        for b in range(1, len(self.paths)):
+            pts += [self.floor_point((k + 0.5) / 4, branch=b) for k in range(4)]
+        return pts
 
 
 def _barycentric(p, tri):

@@ -276,6 +276,60 @@ class Level:
         self.features.append(cave)
         return cave
 
+    def stairs(self, name, lower: Room, upper: Room, top, down, width=80, rise=16, tread=16,
+               tread_tex="FIFTIES_TRD03", riser_tex="CRETE4_STP01", side_tex="FIFTIES_DSK5B"):
+        """Staircase from `upper`'s floor down into `lower`, through a hole in the slab
+        between them (`lower` must sit directly under `upper`, `wall` units apart).
+
+        top:   (x, y) centre of the top edge, where you step off onto upper's floor.
+        down:  compass direction the stairs descend toward ('north', 'south', ...).
+        The hole is registered as air and is as long as head clearance needs (a
+        standing player is 72 tall). Returns (steps func_detail entity, hole Room); put
+        a railing around the hole's open sides (props.railing).
+        """
+        from .geometry import box
+        from .mapfile import Entity
+        drop = upper.floor - lower.floor
+        if drop % rise:
+            raise ValueError(f"stairs {name}: height {drop} is not a multiple of rise {rise}")
+        if upper.floor - lower.ceiling != self.wall:
+            raise ValueError(f"stairs {name}: {lower.name} must be directly under {upper.name} "
+                             f"({self.wall} units of slab between them)")
+        dirs = {"north": (1, 1), "south": (1, -1), "east": (0, 1), "west": (0, -1)}
+        axis, sign = dirs[down]
+        other = 1 - axis
+        n = drop // rise
+        # hole: over every step where a standing player's head would reach the slab, plus
+        # the player's full width (32): the box still stands on a step while its origin is
+        # up to 16 past the step's edge, and its front reaches 16 further
+        need = sum(1 for k in range(1, n + 1) if lower.floor + k * rise + 72 > lower.ceiling - 4)
+        hole_len = need * tread + 32 + 8
+        lo, hi = [0, 0, lower.ceiling], [0, 0, upper.floor]
+        a0, a1 = sorted((top[axis], top[axis] + sign * hole_len))
+        lo[axis], hi[axis] = a0, a1
+        lo[other], hi[other] = top[other] - width / 2, top[other] + width / 2
+        for r in (lower, upper):
+            if not (r.mins[other] <= lo[other] and hi[other] <= r.maxs[other]
+                    and r.mins[axis] <= a0 and a1 <= r.maxs[axis]):
+                raise ValueError(f"stairs {name}: hole {lo}..{hi} is not inside room {r.name}")
+        hole = self.air(f"{name}-hole", lo, hi, like=upper)
+        steps = []
+        for k in range(1, n + 1):          # k = n is the top step, level with upper's floor
+            along0 = top[axis] + sign * (n - k) * tread
+            along1 = along0 + sign * tread
+            smin, smax = [0, 0, lower.floor], [0, 0, lower.floor + k * rise]
+            smin[axis], smax[axis] = sorted((along0, along1))
+            smin[other], smax[other] = top[other] - width / 2, top[other] + width / 2
+            b = box(tuple(smin), tuple(smax), side_tex, comment=f"{name} step {k}")
+            v = _unit(axis, sign)                      # texture 'down' = toward the front edge,
+            u = (-v[1], v[0], 0)                       # so the nosing strip sits on the edge
+            b.fit("top", tread_tex, u_axis=u, v_axis=v)
+            b.fit(down, riser_tex)
+            steps.append(b)
+        if steps[0].bounds()[0][axis] < lower.mins[axis] - 0.5 or steps[0].bounds()[1][axis] > lower.maxs[axis] + 0.5:
+            raise ValueError(f"stairs {name}: the bottom step runs out of room {lower.name}")
+        return Entity("func_detail", brushes=steps, kv={"zhlt_detaillevel": "1"}), hole
+
     # --- queries ------------------------------------------------------------
     def all_air(self):
         return self.rooms + [o.room for o in self.openings] + self.extra_air
@@ -390,6 +444,12 @@ class Level:
             f.emit(m)
         m.level = self
         return brushes
+
+
+def _unit(axis, sign=1):
+    v = [0, 0, 0]
+    v[axis] = sign
+    return tuple(v)
 
 
 def _opening_material(mat: Material):

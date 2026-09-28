@@ -45,6 +45,12 @@ class Hulls:
         self.entities = b.entities
         self.bsp = b
 
+    def models(self):
+        """(mins, maxs) of every brush model (index = the number in model "*N")."""
+        L = self.bsp.lumps["models"]
+        return [(struct.unpack_from("<3f", L, i * 64), struct.unpack_from("<3f", L, i * 64 + 12))
+                for i in range(len(L) // 64)]
+
     def _plane(self, idx):
         nx, ny, nz, d, _ = self.planes[idx]
         return (nx, ny, nz), d
@@ -362,3 +368,187 @@ def _in_polygon(p, poly, n, eps=0.05):
         elif (s > 0) != (sign > 0):
             return False
     return True
+
+
+# ---------------------------------------------------------------- walking & progression
+
+STEP_HEIGHT = 18      # sv_stepsize
+JUMP_HEIGHT = 45      # standing jump
+MAX_FALL = 600        # ~ where falling damage becomes lethal
+HALF = (16, 16, 36)   # standing player half extents (hull 1)
+
+
+class Walker:
+    """Where a player can get to ON FOOT: gravity, 18-unit steps, 45-unit jumps, falls
+    up to MAX_FALL, ladders (func_ladder volumes), and doors - locked doors block until
+    their lock opens. Positions are standing-player origins on an 8-unit grid."""
+
+    def __init__(self, hulls, ladders=(), step=8):
+        self.h = hulls
+        self.step = step
+        self.ladders = [(tuple(lo[k] - HALF[k] for k in range(3)), tuple(hi[k] + HALF[k] for k in range(3)))
+                        for lo, hi in ladders]
+        self.blockers = []
+        self._cache = {}
+
+    def _solid(self, p):
+        if p not in self._cache:
+            self._cache[p] = self.h.contents(1, p) != -1
+        if self._cache[p]:
+            return True
+        return any(all(lo[k] < p[k] < hi[k] for k in range(3)) for lo, hi in self.blockers)
+
+    def _on_ladder(self, p):
+        return any(all(lo[k] <= p[k] <= hi[k] for k in range(3)) for lo, hi in self.ladders)
+
+    def _drop(self, x, y, z):
+        """Fall from (x, y, z) to the ground (or onto a ladder); None if blocked, lethal
+        or bottomless."""
+        start = z
+        if self._solid((x, y, z)):
+            return None
+        while True:
+            if z != start and self._on_ladder((x, y, z)):
+                return (x, y, z)
+            if self._solid((x, y, z - 1)):
+                return (x, y, z)
+            if start - z > MAX_FALL:
+                return None
+            # hull-1 solids are >= 72 thick vertically, so 8-unit strides can't skip one
+            z -= 8 if not (self._solid((x, y, z - 8)) or self._on_ladder((x, y, z - 8))) else 1
+
+    def _moves(self, p):
+        x, y, z = p
+        on_ladder = self._on_ladder(p)
+        out = []
+        for dx, dy in ((self.step, 0), (-self.step, 0), (0, self.step), (0, -self.step)):
+            nx, ny = x + dx, y + dy
+            dest = None
+            for lift in (STEP_HEIGHT, 0, JUMP_HEIGHT):
+                if not self._solid((x, y, z + lift)) and not self._solid((nx, ny, z + lift)):
+                    dest = self._drop(nx, ny, z + lift)
+                    if dest:
+                        break
+            if dest:
+                out.append(dest)
+        if on_ladder:   # climb
+            for dz in (self.step, -self.step):
+                q = (x, y, z + dz)
+                if not self._solid(q):
+                    out.append(q if self._on_ladder(q) else (self._drop(x, y, z + dz) or q))
+        return out
+
+    def settle(self, p):
+        x, y, z = (round(c) for c in p)
+        for up in range(64):
+            if not self._solid((x, y, z + up)):
+                return self._drop(x, y, z + up) or (x, y, z + up)
+        return (x, y, z)
+
+    def flood(self, seeds, limit=400000):
+        seen = set(seeds)
+        todo = deque(seeds)
+        while todo and len(seen) < limit:
+            p = todo.popleft()
+            for q in self._moves(p):
+                if q not in seen:
+                    seen.add(q)
+                    todo.append(q)
+        return seen
+
+
+def _placed(models, e):
+    """World bounds of a brush entity (models with an ORIGIN brush are stored relative
+    to the entity's origin)."""
+    lo, hi = models[int(e["model"][1:])]
+    o = tuple(float(c) for c in e["origin"].split()) if e.get("origin") else (0, 0, 0)
+    return tuple(lo[k] + o[k] for k in range(3)), tuple(hi[k] + o[k] for k in range(3))
+
+
+def _entity_graph(ents):
+    """targetname -> list of targetnames it fires (through relays and multi_managers)."""
+    fires = {}
+    for e in ents:
+        name = e.get("targetname")
+        if not name:
+            continue
+        out = []
+        if e.get("classname") == "multi_manager":
+            out = [k for k in e if k not in ("classname", "targetname", "origin", "wait", "spawnflags")]
+        elif e.get("target"):
+            out = [e["target"]]
+        fires.setdefault(name, []).extend(out)
+    return fires
+
+
+def _closure(names, fires):
+    seen, todo = set(), list(names)
+    while todo:
+        n = todo.pop()
+        if n in seen:
+            continue
+        seen.add(n)
+        todo.extend(fires.get(n, ()))
+    return seen
+
+
+def progression(hulls, checkpoints, map_entities=(), radius=24):
+    """Walk the map from the player start, collecting pickups and pressing buttons that
+    are within reach, opening locked doors as their locks get triggered, until nothing
+    changes. Returns (unreached checkpoints, unlock log, locks never opened, reached)."""
+    ents = hulls.entities
+    models = hulls.models()
+    fires = _entity_graph(ents)
+    ladders = [_placed(models, e) for e in ents if e.get("classname") == "func_ladder"]
+    w = Walker(hulls, ladders)
+    doors = []   # (lock name, blocker box in origin space, door name)
+    for e in ents:
+        if e.get("classname", "").startswith("func_door") and e.get("master") and e.get("model", "").startswith("*"):
+            lo, hi = _placed(models, e)
+            blo = tuple(lo[k] - HALF[k] for k in range(3))
+            bhi = tuple(hi[k] + HALF[k] for k in range(3))
+            doors.append((e["master"], (blo, bhi), e.get("targetname") or e["model"]))
+    triggers = []   # (kind, reach test, target)
+    for e in ents:
+        cls = e.get("classname", "")
+        if not e.get("target"):
+            continue
+        if cls.startswith(("item_", "weapon_", "ammo_")) and e.get("origin"):
+            o = tuple(float(c) for c in e["origin"].split())
+            triggers.append((f"{cls} at {tuple(round(c) for c in o)}",
+                             lambda p, o=o: abs(p[0] - o[0]) <= 32 and abs(p[1] - o[1]) <= 32 and -72 <= p[2] - o[2] <= 72,
+                             e["target"]))
+        elif cls in ("func_button", "func_rot_button") and e.get("model", "").startswith("*"):
+            lo, hi = _placed(models, e)
+            triggers.append((f"{cls} at {tuple(round((a + b) / 2) for a, b in zip(lo, hi))}",
+                             lambda p, lo=lo, hi=hi: sum(max(0, lo[k] - p[k], p[k] - hi[k]) ** 2 for k in range(3)) <= 64 * 64,
+                             e["target"]))
+    opened, log = set(), []
+    start = next(e for e in ents if e.get("classname") == "info_player_start")
+    seeds = {w.settle(tuple(float(c) for c in start["origin"].split()))}
+    reached = set()
+    while True:
+        w.blockers = [box for lock, box, _ in doors if lock not in opened]
+        reached = w.flood(list(seeds | reached))
+        new = set()
+        for desc, reach, target in triggers:
+            locks = {n for n in _closure([target], fires) if any(n == d[0] for d in doors)} - opened - new
+            if locks and any(reach(p) for p in reached):
+                new |= locks
+                log.append(f"{', '.join(sorted(locks))} opened by {desc}")
+        if not new:
+            break
+        opened |= new
+    grid = {}
+    for p in reached:
+        grid.setdefault((int(p[0] // 64), int(p[1] // 64)), []).append(p)
+
+    def near(c):
+        # a checkpoint that falls inside furniture counts as reached from next to it
+        r = radius if hulls.contents(1, tuple(round(v) for v in c)) == -1 else 64
+        gx, gy = int(c[0] // 64), int(c[1] // 64)
+        return any(abs(p[0] - c[0]) <= r and abs(p[1] - c[1]) <= r and abs(p[2] - c[2]) <= 48
+                   for ix in (gx - 1, gx, gx + 1) for iy in (gy - 1, gy, gy + 1) for p in grid.get((ix, iy), ()))
+    missing = [(name, pts) for name, pts in checkpoints if not any(near(c) for c in pts)]
+    never = sorted({lock for lock, _, _ in doors} - opened)
+    return missing, log, never, reached

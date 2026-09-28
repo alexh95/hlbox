@@ -35,9 +35,10 @@ def use_reach(m, level):
         lo, hi = _bounds(e)
         rooms = reach[id(e)] = []
         for r in level.rooms:
-            # where a player's origin can be in that room (standing or crouched)
+            # where a player's origin can be in that room: crouched on the floor up to
+            # standing at the top of a jump (45)
             olo = (r.mins[0] + 16, r.mins[1] + 16, r.floor + 18)
-            ohi = (r.maxs[0] - 16, r.maxs[1] - 16, r.ceiling - 18)
+            ohi = (r.maxs[0] - 16, r.maxs[1] - 16, min(r.ceiling - 18, r.floor + 36 + 45))
             if _box_dist(olo, ohi, lo, hi) <= PLAYERUSE_RADIUS:
                 rooms.append(r.name)
         if len(rooms) > 1:
@@ -51,3 +52,35 @@ def use_reach(m, level):
                 problems.append(f"{_name(a)} and {_name(b)} are {d:.0f} units apart: a player using one may "
                                 f"trigger the other (keep usable things >= {2 * PLAYERUSE_RADIUS} apart)")
     return problems
+
+
+def doorway_clearance(m, level, depth=64):
+    """Doorways need open floor in front of them on both sides: no stair hole, railing,
+    crate or other furniture within `depth` units of the opening (a player must be able
+    to walk straight up to a door, not around obstacles)."""
+    problems = []
+    blockers = []
+    for r in level.extra_air:
+        if r.name.endswith("-hole"):
+            blockers.append((f"stair hole {r.name[:-5]}", r.box.mins, r.box.maxs))
+    for e in m.entities:
+        if e.classname == "func_detail":
+            for b in e.brushes:
+                lo, hi = b.bounds()
+                blockers.append((b.comment or "furniture", lo, hi))
+    for op in level.openings:
+        if op.room.name.endswith("-mouth"):
+            continue
+        a = op.axis
+        o = 1 - a
+        (lo, hi) = op.mins, op.maxs
+        for sign, room in ((-1, op.a), (+1, op.b)) if op.direction[a] > 0 else ((+1, op.a), (-1, op.b)):
+            face = lo[a] if sign < 0 else hi[a]
+            zmin, zmax = [0, 0, lo[2]], [0, 0, lo[2] + 72]
+            zmin[a], zmax[a] = sorted((face, face + sign * depth))
+            zmin[o], zmax[o] = lo[o] - 8, hi[o] + 8
+            for name, blo, bhi in blockers:
+                if all(blo[k] < zmax[k] and zmin[k] < bhi[k] for k in range(3)) and blo[2] < lo[2] + 8:
+                    problems.append(f"{name} blocks the way to doorway {op.room.name} "
+                                    f"(within {depth} units on the {room.name} side)")
+    return sorted(set(problems))

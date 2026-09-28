@@ -61,6 +61,21 @@ def read_wad(path):
     return out
 
 
+class MemTexture:
+    """A custom texture held in memory (see Map.add_texture)."""
+
+    def __init__(self, name, img):
+        self.name, self._img = name, img
+        self.width, self.height = img.size
+        self.wad = None   # set when the map's custom WAD is written
+
+    def image(self):
+        return self._img.convert("RGBA" if self.name.startswith("{") else "RGB")
+
+    def __repr__(self):
+        return f"<MemTexture {self.name} {self.width}x{self.height}>"
+
+
 class TextureDB:
     """All textures from a list of WADs. Later WADs don't override earlier ones."""
 
@@ -92,10 +107,15 @@ class TextureDB:
             pat = f"*{pat}*"
         return [t for k, t in sorted(self.textures.items()) if fnmatch.fnmatch(k, pat)]
 
+    def register(self, name, img):
+        """Add (or replace) an in-memory custom texture."""
+        self.textures[name.upper()] = MemTexture(name, img)
+
     def wads_for(self, names):
         """The subset of WAD paths that provide the given texture names."""
-        used = {self.get(n).wad for n in names if n.upper() in self.textures}
-        return [str(w) for w in self.wads if str(w) in used]
+        used = {str(self.get(n).wad) for n in names if n.upper() in self.textures and self.get(n).wad}
+        out = [str(w) for w in self.wads if str(w) in used]
+        return out + sorted(u for u in used if u not in out)
 
 
 @lru_cache(maxsize=1)

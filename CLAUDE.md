@@ -41,7 +41,13 @@ The verification loop after every change:
      that reaches into intended solid. That means walk-through walls or see-through
      gaps.
    - **Invisible walls:** solid collision where the player's box fits in open air.
-   - **Reachability:** every room and cave stretch can be reached from the player start.
+   - **Walkability and progression:** every room, cave stretch and `m.checkpoints`
+     entry must be reachable ON FOOT: steps of at most 18, jumps of at most 45, falls
+     under 600, ladders.
+     - Locked doors stay shut until a reachable pickup or button fires their key, and
+       the walk repeats as locks open.
+     - "locks never opened" plus unreachable rooms means you can get locked out
+       (a key behind its own door).
    - **Coverage:** every visible face exists in the BSP.
    A clean compile does NOT mean clean collision. The compiler's "ambiguous leafnode"
    warnings once hid walk-through cave walls, and only `verify` (or a playtest) shows
@@ -55,6 +61,11 @@ Screenshots open a 1280x720 Half-Life window for about 10-20 s and then close it
 They refuse to run if HL is already open. The user's HL video settings are restored
 afterwards. Camera: pitch > 0 looks down; yaw 0 = east (+X), 90 = north (+Y).
 A standing player's eye is 64 units above the floor.
+
+Extra walkability targets go in `m.checkpoints = [(name, floor_point)]`, e.g. a
+mezzanine or a key table. A checkpoint inside furniture counts as reached from next to
+it. `shots` warns when a camera sits inside solid geometry; its picture would show the
+void.
 
 Cameras are best defined in `build()` as `m.cameras = {"name": (x, y, z, pitch, yaw[, fire])}`,
 so they can use computed positions such as `cave.camera(0.4)`. `fire` is a list of
@@ -95,10 +106,24 @@ def build():
   the shared wall. Rooms that touch or overlap are an error unless they share a
   `group=` (then they merge into one space). `lvl.air(name, mins, maxs, like=room)` adds
   alcoves and window holes. `doorway(..., sill=40)` makes a window.
+- **Stairs between floors.** `steps, hole = lvl.stairs(name, lower, upper, top=(x, y),
+  down="north")` makes a staircase from `upper`'s floor down into `lower`, which must
+  sit directly below (`wall` units of slab).
+  - The hole through the slab is sized for head clearance *including the player's
+    32-unit width*. Keep that margin if you edit it; `tests/test_verify.py` guards it.
+  - `m.add(steps)`, then put `props.railing(...)` on the hole's open sides.
+- **Ladders.** `props.ladder(foot_on_surface, top_z, facing)` returns the visible
+  see-through ladder plus the invisible `func_ladder` that does the climbing. Put it
+  against something solid (the ladder itself is non-solid). Leave a gap of at least 64
+  in any railing at the top; 32 is zero in collision terms.
 - **Caves.** Use `cave = lvl.tunnel(name, from_room, side, center, path=[...], mouth=(w, h),
   width=, height=, roughness=, seed=, cell=32, materials=[(0.0, ROCK), (0.5, XEN)],
-  blend=, scale=f(s))`. It cuts a hole in `from_room`'s `side` wall and grows a cave
-  along the floor path.
+  blend=, scale=f(s), branches=[{"at": 0.25, "path": [...], "width":, "height":,
+  "scale":, "materials": [(0.0, ROCK)]}])`. It cuts a hole in `from_room`'s `side` wall
+  and grows a cave along the floor path.
+  - **Branches** leave the main path at fraction `at`. They use the main materials
+    unless given their own, and are addressed with `branch=1..` in
+    `floor_point`/`frame`/`camera`.
   - **Construction:** a 2.5-D heightfield. On a `cell`-unit grid, each triangle is a
     floor column (sloped top) plus a ceiling column (sloped bottom). Every side is a
     vertical plane through shared integer grid points, so it's watertight by
@@ -123,9 +148,37 @@ def build():
   inside room air, or make sure they seal.
 - **Entities.** `Entity(classname, brushes=[...], kv={...}, **keyvalues)`. Tuples become
   "x y z". Furniture goes in `props.detail(...)` (func_detail), which stays solid without
-  cutting visibility. `props` has table, chair, crate (texture fitted per face),
-  crystal, door_rotating, door_sliding, ceiling_light, light, point(classname, pos,
-  facing, **kv), switch, lock, xen_plantlight, player_start and yaw_towards.
+  cutting visibility. What `props` offers:
+  - **Furniture:** table, chair, crate (texture fitted per face), radio,
+    filing_cabinet, bookshelf, vending_machine, barrel, pipe, and
+    `front_box(..., facing, front_tex)` for anything box-shaped with a front.
+  - **Wall items:** wall_art (pictures, clocks, fuse boxes, whiteboards).
+  - **Structure:** railing, ladder, door_rotating, door_sliding.
+  - **Lights:** ceiling_light, light.
+  - **Logic:** switch, lock, pickup (item plus message plus sound, firing targets).
+  - **Presentation:** projector (with a visible additive light cone) and screen
+    (toggleable slides).
+  - **Xen:** crystal, xen_plantlight.
+  - **Helpers:** point(classname, pos, facing, **kv), player_start, compass,
+    yaw_towards.
+- **Custom (non-standard) textures.** `m.add_texture("NAME", image_or_path)` makes one
+  usable immediately (fit, alignment). It's written to `<map>_custom.wad` and embedded
+  in the BSP with `-wadinclude`, so the map ships as one file.
+  - `hlmap.art.pixel_svg(path)` rasterizes pixel-art SVGs exactly.
+  - `hlmap.art.slide(size, bg, art, box, texts)` composes an image.
+  - A `+0NAME`/`+ANAME` pair on a func_wall toggles when fired (slides, signs).
+  - Rules: names up to 15 characters, sizes rounded to multiples of 16, one
+    256-colour palette each.
+- **Pickups as keys.** `props.pickup("item_security", pos, fires=["records_lock_key"],
+  message=...)`. Items fire their target when picked up and drop onto the surface
+  below `pos` at map start.
+  - The item models are tiny, so show a stand-in: `props.flat_prop(pos, w, d, tex,
+    name="card_prop")`, then `pickup(..., hide=["card_prop"], invisible=True)`. The
+    prop disappears when the item is taken (via a trigger_relay `killtarget`).
+- **Photos of real people.** Use only images the user provides and has permission to
+  use. Don't pull a person's photo from the web into a map (consent, copyright; this
+  repo is public). `wall_art(..., frame="FIFTIES_DSK1")` with `m.add_texture()` frames
+  any image.
 - **Locks.** `m.add(props.lock("storage_lock", door.center))` then
   `door_rotating(..., master="storage_lock")`. The door rattles (locked_sound 12) and
   won't open until something fires `storage_lock_key`. The lock is a multisource plus a
@@ -140,6 +193,9 @@ def build():
   player that they're facing, and walls don't block it. Never put a switch on a wall
   shared with another room. Keep usable things at least 128 apart. `build` warns about
   both (`hlmap/checks.py`).
+- **Keep doorways clear.** No stair hole, railing, crate or furniture within 64 units
+  in front of a doorway on either side (`checks.doorway_clearance`, run by `build`).
+  Put stairwells at the far end of a room, not by its door.
 - **Xen.** Available entities: `xen_plantlight` (retracts near the player and turns
   off its `target` light; see props.xen_plantlight), `xen_hair`, `xen_spore_small`,
   `xen_spore_medium`, `xen_spore_large` and `xen_tree` (it attacks). Crystals:

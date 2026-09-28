@@ -69,6 +69,7 @@ class Map:
         self.worldspawn.kv.update(world_kv)
         self.entities: list[Entity] = []
         self.texlights: dict[str, str] = {}   # texture -> "r g b intensity" (info_texlights)
+        self.custom_textures: dict = {}       # name -> PIL image, written to <map>_custom.wad
 
     # --- building -------------------------------------------------------
     def add_world(self, *brushes):
@@ -86,6 +87,21 @@ class Map:
     def texlight(self, texture, rgb=(255, 255, 255), intensity=1000):
         """Make every face with `texture` emit light (written as an info_texlights entity)."""
         self.texlights[texture] = f"{rgb[0]} {rgb[1]} {rgb[2]} {intensity}"
+
+    def add_texture(self, name, image):
+        """Add a non-standard texture (PIL image or image path). It is usable right away
+        (fit(), alignment) and gets embedded in the BSP, so the map needs no extra files.
+        Names: max 15 chars; '+0'/'+A' prefixes make toggling pairs, '{' transparent."""
+        from PIL import Image
+        from .wad import default_db
+        from .wadwrite import _prepare
+        if len(name) > 15:
+            raise ValueError(f"texture name {name!r} is longer than 15 characters")
+        img = image if isinstance(image, Image.Image) else Image.open(image)
+        img = _prepare(img.convert("RGBA"))
+        self.custom_textures[name] = img
+        default_db().register(name, img)
+        return name
 
     def all_entities(self):
         return [self.worldspawn] + self.entities
@@ -166,5 +182,12 @@ class Map:
     def write(self, path):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        if self.custom_textures:
+            from .wad import default_db
+            from .wadwrite import write_wad
+            wad = path.with_name(f"{path.stem}_custom.wad")
+            write_wad(wad, self.custom_textures)
+            for name in self.custom_textures:
+                default_db().get(name).wad = str(wad)
         path.write_text(self.to_text(), encoding="latin-1")
         return path

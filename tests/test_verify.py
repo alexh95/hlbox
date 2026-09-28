@@ -85,6 +85,52 @@ def test_missing_face_is_detected():
     assert total >= 1
 
 
+def _two_rooms(key_in_first):
+    """Room A (spawn) -- locked door -- room B; the key is in A or (softlock) in B."""
+    from hlmap.verify import progression
+    m = Map("vlock")
+    lvl = Level(wall=16)
+    a = lvl.room("a", (0, 0, 0), (256, 256, 128), MAT)
+    b = lvl.room("b", (272, 0, 0), (528, 256, 128), MAT)
+    door = lvl.doorway(a, b, width=64, height=96)
+    lvl.build(m)
+    m.add(props.lock("lk", door.center), props.door_rotating(door, master="lk"))
+    key_at = (64, 200, 16) if key_in_first else (464, 200, 16)
+    m.add(props.pickup("item_security", key_at, fires=["lk_key"], sound=None))
+    m.add(props.player_start((64, 64, 0)), props.light((128, 128, 100)), props.light((400, 128, 100)))
+    out = Path(tempfile.mkdtemp()) / "vlock.map"
+    res = compile_map(m.write(out), profile="fast", steps=("csg", "bsp"))
+    assert res.ok, res.summary()
+    return progression(Hulls(res.bsp), lvl.checkpoints())
+
+
+def test_key_in_reach_opens_the_door():
+    missing, log, never, _ = _two_rooms(key_in_first=True)
+    assert missing == [] and never == [] and log
+
+
+def test_key_behind_its_own_door_is_a_softlock():
+    missing, log, never, _ = _two_rooms(key_in_first=False)
+    assert never == ["lk"] and [n for n, _ in missing] == ["room b"]
+
+
+def test_stairs_are_walkable():
+    """Level.stairs must leave head room for a 32-wide, 72-tall player all the way down."""
+    from hlmap.verify import progression
+    m = Map("vstairs")
+    lvl = Level(wall=16)
+    up = lvl.room("up", (0, 0, 0), (256, 256, 128), MAT)
+    down = lvl.room("down", (0, 0, -176), (256, 256, -16), MAT)
+    steps, hole = lvl.stairs("s", down, up, top=(128, 32), down="north")
+    lvl.build(m)
+    m.add(steps, props.player_start((48, 48, 0)), props.light((128, 128, 100)), props.light((128, 128, -40)))
+    out = Path(tempfile.mkdtemp()) / "vstairs.map"
+    res = compile_map(m.write(out), profile="fast", steps=("csg", "bsp"))
+    assert res.ok, res.summary()
+    missing, _, _, _ = progression(Hulls(res.bsp), lvl.checkpoints())
+    assert missing == [], missing
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

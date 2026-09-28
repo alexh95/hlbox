@@ -60,8 +60,9 @@ def cmd_build(a):
     problems = m.check()
     level = getattr(m, "level", None)
     if level:
-        from .checks import use_reach
+        from .checks import doorway_clearance, use_reach
         problems.extend(use_reach(m, level))
+        problems.extend(doorway_clearance(m, level))
         for e in m.entities:
             o = e.origin
             if o is not None and not e.brushes and e.classname != "info_texlights" and not level.is_inside(o):
@@ -115,6 +116,11 @@ def cmd_shots(a):
     bsp = config.BUILD_DIR / a.map / f"{a.map}.bsp"
     if not bsp.exists():
         sys.exit(f"{bsp} not found; run build first")
+    from .verify import Hulls
+    hulls = Hulls(bsp)
+    for name, cam in named:
+        if hulls.contents(0, tuple(cam[:3])) != -1:
+            print(f"WARNING: camera {name} at {tuple(cam[:3])} is inside solid geometry; its shot will be garbage")
     d = out_dir(a.map) / "shots"
     for name, _ in named:   # replace only the shots being retaken
         (d / f"{a.map}_{name}.png").unlink(missing_ok=True)
@@ -141,7 +147,7 @@ def cmd_shots(a):
 
 def run_verify(m, bsp_path, coverage_check=True):
     """Collision/visibility checks of a compiled BSP. Returns True if everything passed."""
-    from .verify import HULL_NAMES, Hulls, coverage, invisible_walls, leaks_into_solid, reachability
+    from .verify import HULL_NAMES, Hulls, coverage, invisible_walls, leaks_into_solid, progression
     level = getattr(m, "level", None)
     if level is None:
         print("verify: skipped (map has no Level to compare against)")
@@ -206,17 +212,22 @@ def run_verify(m, bsp_path, coverage_check=True):
                 print(f"    near {p['at']}  region {p['bounds'][0]}..{p['bounds'][1]}")
         else:
             print(f"verify ok   hull {hull} ({HULL_NAMES[hull]}): no invisible walls")
-    start = next((e for e in h.entities if e.get("classname") == "info_player_start"), None)
-    if start:
-        o = tuple(float(c) for c in start["origin"].split())
-        missing, n = reachability(h, level.checkpoints(), o)
-        if missing:
-            ok = False
-            print(f"verify FAIL reachability: {len(missing)} places a standing player can't reach from the start:")
-            for name, pts in missing[:8]:
-                print(f"    {name} near {tuple(round(c) for c in pts[0])}")
-        else:
-            print(f"verify ok   reachability: all {len(level.checkpoints())} checkpoints reachable ({n} positions)")
+    checkpoints = level.checkpoints() + [(name, [(p[0], p[1], p[2] + 37)])
+                                         for name, p in getattr(m, "checkpoints", [])]
+    missing, log, never, reached = progression(h, checkpoints)
+    for line in log:
+        print(f"verify      progression: {line}")
+    if missing:
+        ok = False
+        print(f"verify FAIL walkability: {len(missing)} places a player can't get to on foot "
+              f"(steps <= 18, jumps <= 45, ladders, locked doors):")
+        for name, pts in missing[:10]:
+            print(f"    {name} near {tuple(round(c) for c in pts[0])}")
+        if never:
+            print(f"    locks never opened: {', '.join(never)}")
+    else:
+        print(f"verify ok   walkability: all {len(checkpoints)} checkpoints reachable on foot "
+              f"({len(reached)} positions{', locks opened: ' + str(len(log)) if log else ''})")
     if coverage_check:
         missing, checked, total = coverage(h, world_brushes, level.is_air, solid_at)
         if missing:

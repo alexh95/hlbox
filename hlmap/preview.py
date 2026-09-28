@@ -227,6 +227,8 @@ def render(m, path, view="top", cut=None, px_per_unit=None, max_px=1400, title=N
             if e.brushes or e.origin is None or e.classname == "info_texlights":
                 continue
             o = e.origin
+            if view == "top" and not (cut - 160 <= o[2] <= cut + 160):
+                continue   # other floors
             c = P(uv(o))
             col = POINT_COLORS.get(e.classname, (240, 240, 240))
             if e.classname in QUIET:

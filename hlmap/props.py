@@ -14,6 +14,13 @@ YAW = {"east": 0, "north": 90, "west": 180, "south": 270}
 DIRS = {"east": (1, 0), "north": (0, 1), "west": (-1, 0), "south": (0, -1)}
 
 
+def compass(dx, dy):
+    """Nearest compass name ('east', 'north', ...) to a 2D direction."""
+    if abs(dx) >= abs(dy):
+        return "east" if dx >= 0 else "west"
+    return "north" if dy >= 0 else "south"
+
+
 def detail(*brushes, **kv):
     """Wrap brushes in a func_detail (no vis splits, still solid and lit)."""
     return Entity("func_detail", brushes=list(brushes), kv={"zhlt_detaillevel": "1", **kv})
@@ -269,3 +276,212 @@ def player_start(pos, facing=0):
 
 def yaw_towards(src, dst):
     return round(math.degrees(math.atan2(dst[1] - src[1], dst[0] - src[0]))) % 360
+
+
+# ---------------------------------------------------------------- structure helpers
+
+def railing(start, end, z, height=40, texture="FIFTIES_DSK5B", post_every=64, thick=4, side=None):
+    """Railing along an axis-aligned segment on floor height z: posts, a top rail and a
+    mid rail (func_detail, solid). `side` ('north'...) shifts it off the line so it sits
+    beside an edge instead of on it."""
+    (x0, y0), (x1, y1) = start, end
+    if x0 != x1 and y0 != y1:
+        raise ValueError("railing segments must be axis-aligned")
+    ox, oy = DIRS[side] if side else (0, 0)
+    h = thick / 2
+    sx, sy = ox * h, oy * h
+    cx0, cx1 = sorted((x0, x1))
+    cy0, cy1 = sorted((y0, y1))
+    brushes = []
+    length = max(cx1 - cx0, cy1 - cy0)
+    posts = max(1, math.ceil(length / post_every))
+    for i in range(posts + 1):
+        t = i / posts
+        px, py = x0 + (x1 - x0) * t + sx, y0 + (y1 - y0) * t + sy
+        brushes.append(box((px - h, py - h, z), (px + h, py + h, z + height), texture, comment="railing post"))
+    for rz in (z + height - thick, z + height / 2 - thick / 2):
+        if cx0 != cx1:
+            brushes.append(box((cx0, cy0 - h + sy, rz), (cx1, cy0 + h + sy, rz + thick), texture, comment="rail"))
+        else:
+            brushes.append(box((cx0 - h + sx, cy0, rz), (cx0 + h + sx, cy1, rz + thick), texture, comment="rail"))
+    return detail(*brushes)
+
+
+def ladder(base, top_z, facing, width=32, texture="{LADDER1", extra=32):
+    """Climbable ladder on a vertical surface. base = (x, y, z): centre of its foot ON
+    the surface; facing = direction the climber faces (toward the surface). The climbing
+    volume reaches `extra` units above top_z so players can step off at the top.
+    Returns [visible see-through ladder (func_illusionary), func_ladder volume]."""
+    fx, fy = DIRS[facing]
+    x, y, z = base
+    w = width / 2
+    if fx:   # surface is the plane x = const; the ladder sits in front of it
+        vis = box((x - 4, y - w, z), (x, y + w, top_z), "FIFTIES_DSK5B") if fx > 0 else \
+            box((x, y - w, z), (x + 4, y + w, top_z), "FIFTIES_DSK5B")
+        vol = box((x - 12, y - w, z), (x, y + w, top_z + extra), "AAATRIGGER") if fx > 0 else \
+            box((x, y - w, z), (x + 12, y + w, top_z + extra), "AAATRIGGER")
+        side = "west" if fx > 0 else "east"
+    else:
+        vis = box((x - w, y - 4, z), (x + w, y, top_z), "FIFTIES_DSK5B") if fy > 0 else \
+            box((x - w, y, z), (x + w, y + 4, top_z), "FIFTIES_DSK5B")
+        vol = box((x - w, y - 12, z), (x + w, y, top_z + extra), "AAATRIGGER") if fy > 0 else \
+            box((x - w, y, z), (x + w, y + 12, top_z + extra), "AAATRIGGER")
+        side = "south" if fy > 0 else "north"
+    from .wad import default_db
+    th = default_db().size(texture)[1]
+    vis.fit(side, texture, repeat=(1, max(1, round((top_z - z) / th))))
+    visual = Entity("func_illusionary", brushes=[vis], rendermode=4, renderamt=255)   # see-through
+    return [visual, Entity("func_ladder", brushes=[vol])]
+
+
+# ---------------------------------------------------------------- more furniture
+
+def front_box(x, y, z, w, d, h, facing, front, sides="FIFTIES_DSK5B", top=None, repeat=(1, 1)):
+    """Box standing on z, centred on (x, y): `w` across its front, `d` deep; the front
+    face points toward `facing` and gets `front` fitted (repeated)."""
+    fx, fy = DIRS[facing]
+    if fx:
+        b = box((x - d / 2, y - w / 2, z), (x + d / 2, y + w / 2, z + h), sides)
+    else:
+        b = box((x - w / 2, y - d / 2, z), (x + w / 2, y + d / 2, z + h), sides)
+    b.fit(facing, front, repeat=repeat)
+    if top:
+        b.fit("top", top)
+    return b
+
+
+def radio(x, y, z, facing, texture="C1A1_GGT8", w=24, h=24, d=16):
+    """A table-top radio set (func_detail), dial panel toward `facing`."""
+    return detail(front_box(x, y, z, w, d, h, facing, texture))
+
+
+def filing_cabinet(x, y, z, facing, drawers=4, texture="FIFTSFILE1", w=24, d=28):
+    return detail(front_box(x, y, z, w, d, 16 * drawers, facing, texture, sides="FIFTSFILE2",
+                             top="FIFTSFILE2", repeat=(1, drawers)))
+
+
+def bookshelf(x, y, z, facing, w=64, h=96, d=16, texture="PFAB_BKS1A"):
+    """Shelf full of books (one row of books per 16 units)."""
+    return detail(front_box(x, y, z, w, d, h, facing, texture, sides="FIFTIES_DSK1",
+                             repeat=(max(1, round(w / 32)), max(1, round(h / 16)))))
+
+
+def vending_machine(x, y, z, facing):
+    return detail(front_box(x, y, z, 48, 32, 80, facing, "GEN_VEND1", sides="GEN_VEND1A"))
+
+
+def wall_art(pos, facing, texture, w, h, depth=2, frame="FIFTIES_DSK5B"):
+    """Flat picture, clock, sign, fuse box... on a wall: pos = centre ON the wall
+    surface, facing = the direction it faces (into the room); `frame` = edge texture."""
+    fx, fy = DIRS[facing]
+    x, y, z = pos
+    if fx:
+        b = box((min(x, x + fx * depth), y - w / 2, z - h / 2), (max(x, x + fx * depth), y + w / 2, z + h / 2),
+                frame)
+    else:
+        b = box((x - w / 2, min(y, y + fy * depth), z - h / 2), (x + w / 2, max(y, y + fy * depth), z + h / 2),
+                frame)
+    b.fit(facing, texture)
+    return detail(b)
+
+
+def barrel(x, y, z, texture="BARREL2", top="BARRELTOP", r=16, h=48):
+    from .geometry import cylinder
+    return detail(cylinder((x, y), r, z, z + h, sides=10, tex={"top": top, "bottom": top, "sides": texture}))
+
+
+def pipe(start, end, size=8, texture="GENERIC029"):
+    """Axis-aligned square pipe between two points (e.g. along a ceiling)."""
+    lo = tuple(min(a, b) - (0 if a != b else size / 2) for a, b in zip(start, end))
+    hi = tuple(max(a, b) + (0 if a != b else size / 2) for a, b in zip(start, end))
+    return detail(box(lo, hi, texture, comment="pipe"))
+
+
+# ---------------------------------------------------------------- projector & slides
+
+def projector(lens, screen_lo, screen_hi, ceiling_z=None, body="FIFTIES_DSK5B", lens_tex="FLATBED_LITE1",
+              beam_tex="+0~WHITE", beam_alpha=28):
+    """Ceiling projector with its lens at `lens`, throwing a visible see-through light
+    cone onto the vertical screen rectangle screen_lo..screen_hi.
+    Returns [body (func_detail), beam (additive func_illusionary)]."""
+    from .geometry import hull
+    lx, ly, lz = lens
+    sc = tuple((a + b) / 2 for a, b in zip(screen_lo, screen_hi))
+    dx, dy = sc[0] - lx, sc[1] - ly
+    facing = ("east" if dx > 0 else "west") if abs(dx) > abs(dy) else ("north" if dy > 0 else "south")
+    fx, fy = DIRS[facing]
+    # 24 x 32 x 16 body behind the lens
+    if fx:
+        body_b = box((min(lx, lx - fx * 32), ly - 12, lz - 8), (max(lx, lx - fx * 32), ly + 12, lz + 8), body)
+    else:
+        body_b = box((lx - 12, min(ly, ly - fy * 32), lz - 8), (lx + 12, max(ly, ly - fy * 32), lz + 8), body)
+    body_b.comment = "projector"
+    body_b.fit(facing, lens_tex)
+    parts = [body_b]
+    if ceiling_z is not None:
+        cx, cy = lx - fx * 16, ly - fy * 16
+        parts.append(box((cx - 2, cy - 2, lz + 8), (cx + 2, cy + 2, ceiling_z), body, comment="projector rod"))
+    x0, y0, z0 = screen_lo
+    x1, y1, z1 = screen_hi
+    if fy:
+        yy = (y0 if fy > 0 else y1) - fy
+        far = [(x0, yy, z0), (x1, yy, z0), (x1, yy, z1), (x0, yy, z1)]
+    else:
+        xx = (x0 if fx > 0 else x1) - fx
+        far = [(xx, y0, z0), (xx, y1, z0), (xx, y1, z1), (xx, y0, z1)]
+    near = []
+    for a in (-3, 3):
+        for c in (-3, 3):
+            near.append((round(lx + fx * 2 + (a if fy else 0)), round(ly + fy * 2 + (a if fx else 0)), round(lz + c)))
+    beam = hull(near + [tuple(round(v) for v in p) for p in far], beam_tex, comment="projector beam")
+    return [detail(*parts), Entity("func_illusionary", brushes=[beam], rendermode=5, renderamt=beam_alpha)]
+
+
+def screen(lo, hi, facing, slide_tex, name=None, frame="FIFTIES_DSK5B"):
+    """Projection screen: thin panel lo..hi with `slide_tex` fitted on its front. With
+    `name` it is a func_wall that toggles between its '+0' and '+A' slide when fired."""
+    b = box(lo, hi, frame, comment="screen")
+    b.fit(facing, slide_tex)
+    if name:
+        return Entity("func_wall", brushes=[b], targetname=name)
+    return detail(b)
+
+
+def pickup(classname, pos, fires=(), message=None, sound="buttons/bell1.wav", name=None, facing=0,
+           hide=(), invisible=False):
+    """An item (e.g. item_security = access card) that, when picked up, fires every
+    targetname in `fires` (e.g. a lock's '<lock>_key'), shows `message`, plays `sound`
+    and removes the entities named in `hide` (e.g. a visible prop standing in for the
+    item). invisible=True hides the item's own model (use with a stand-in prop).
+    Items drop onto the floor/table below `pos` when the map starts."""
+    name = name or f"{classname}_{round(pos[0])}_{round(pos[1])}"
+    kv = {"target": name}
+    if invisible:
+        kv.update(rendermode=2, renderamt=0)
+    ents = [point(classname, pos, facing, **kv)]
+    mm = {t: 0 for t in fires}
+    for k, h in enumerate(hide):       # trigger_relay does killtarget; multi_manager can't
+        ents.append(Entity("trigger_relay", targetname=f"{name}_hide{k}", killtarget=h, origin=tuple(pos)))
+        mm[f"{name}_hide{k}"] = 0
+    if message:
+        ents.append(Entity("game_text", targetname=f"{name}_msg", origin=tuple(pos), message=message,
+                           x=-1, y=0.72, effect=0, color="255 220 0", color2="255 255 255",
+                           fadein=0.05, fadeout=0.6, holdtime=3.5, channel=2, spawnflags=1))
+        mm[f"{name}_msg"] = 0
+    if sound:
+        ents.append(Entity("ambient_generic", targetname=f"{name}_snd", origin=tuple(pos), message=sound,
+                           health=10, pitch=100, spawnflags=1 | 16 | 32))
+        mm[f"{name}_snd"] = 0
+    ents.append(Entity("multi_manager", targetname=name, origin=tuple(pos), kv=mm))
+    return ents
+
+
+def flat_prop(pos, w, d, texture, name=None, thick=1, sides="FIFTIES_DSK5B"):
+    """A thin flat object lying on a surface (paper, card, map): pos = centre of its
+    underside. With `name` it is a func_wall that can be removed (killtarget) later."""
+    x, y, z = pos
+    b = box((x - w / 2, y - d / 2, z), (x + w / 2, y + d / 2, z + thick), sides, comment="flat prop")
+    b.fit("top", texture)
+    if name:
+        return Entity("func_wall", brushes=[b], targetname=name)
+    return detail(b)

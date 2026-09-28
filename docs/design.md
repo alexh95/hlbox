@@ -85,7 +85,11 @@ build/<name>/plan.png   build/<name>/<name>.map  (Valve 220)
 - **Room groups.** Rooms that touch or overlap are rejected unless they share a
   `group`.
 - **Caves.** `Level.tunnel(...)` adds organic caves as a heightfield of columns
-  (§4.3); the level knows each cave's air for entity checks and verification.
+  (§4.3), with branches (side passages leaving the main path). The level knows each
+  cave's air for entity checks and verification.
+- **Stairs.** `Level.stairs(name, lower, upper, top, down)` connects stacked rooms
+  through a slab hole sized for a standing player's head (including their 32-unit
+  width), with fitted treads and risers.
 - **Limitation:** rooms are still axis-aligned. There are no slopes, angled walls or
   multi-level floors; tunnels are the only non-box spaces.
 
@@ -161,15 +165,26 @@ against the level's intended air and refuses to install on failure:
 - **Invisible walls.** Solid leaves of the player hulls must not contain positions
   where the player's box is inside air and touches no intended brush. The box is
   tested against brush planes pushed out by the box, as the compiler does.
-- **Reachability.** A flood fill of standing-player positions from the start reaches
-  every room and every cave stretch.
+- **Walkability and progression.** From the start, the player walks on foot (steps
+  up to 18, jumps up to 45, falls under 600, `func_ladder` volumes). Locked doors
+  block until a reachable pickup or button fires their key, through relays and
+  multi_managers; the walk repeats as locks open. Every room, cave stretch and
+  `m.checkpoints` entry must be reached. Locks that never open are reported, which is
+  how you'd get locked out of progress.
 - **Coverage.** Every generated face with real air in front has a matching face in
   the BSP. That catches polygons the compiler deleted, which you'd see through.
 - **Self-tests.** `tests/test_verify.py` compiles rooms with known defects and checks
-  each one is caught, plus that a clean room passes.
-- **Gameplay lint.** `checks.use_reach` flags usable entities that can be `+use`d
-  from more than one room (`+use` reaches 64 units through walls), and pairs close
-  enough to be confused.
+  each one is caught:
+  - holes, invisible walls and missing faces;
+  - a key locked behind its own door;
+  - stairs whose hole is too short (the too-short formula makes the test fail).
+  A clean room must pass.
+- **Gameplay lint** (`checks.py`):
+  - `use_reach` flags usable entities that can be `+use`d from more than one room
+    (`+use` reaches 64 units through walls), and pairs close enough to be confused.
+  - `doorway_clearance` flags stair holes, railings and furniture within 64 units in
+    front of a doorway. Playtest feedback: a stairwell in front of a door reads as
+    blocked, even though the 44-unit path around it was walkable.
 
 ### 3.9 Game integration (`hlmap/game.py`)
 - **Install.** Maps go to `valve/maps/`. The tool refuses to overwrite files it didn't
@@ -215,6 +230,10 @@ against the level's intended air and refuses to install on failure:
   textures then needs overlap tests between coplanar polygons instead of rectangles.
 
 ### 4.2 Architectural helpers
+**Done:** stairs between stacked rooms (`Level.stairs`), railings, ladders on a solid
+backing, and a two-storey room with a mezzanine (the records room in
+`maps/office.py`).
+
 - **Stairs:** a `stairs(start, end, width)` helper with 16-unit risers, and an
   optional invisible CLIP ramp so walking up isn't bumpy.
 - **Openings with content:**
@@ -305,8 +324,9 @@ Quality and budget measures:
 - **Logic helpers** for common patterns:
   - A button that opens a door.
   - A locked door with a key or keycard, using `multisource` or `env_global` as the
-    lock. Done: `props.lock` (a multisource plus a trigger_relay key). Still to do:
-    a key pickup that fires it.
+    lock. Done: `props.lock` (a multisource plus a trigger_relay key), and
+    `props.pickup` (e.g. the access card, `item_security`) that fires the key. The
+    progression check proves the key is reachable before its door.
   - One-shot and repeatable triggers.
   - Timed sequences with `multi_manager`.
   - Hurt, push and teleport volumes.
@@ -325,10 +345,13 @@ Quality and budget measures:
 
 Custom assets must ship next to the map. Where they live is an open decision (§10.1).
 
-- **Textures.**
-  - Write WAD3 files from PNG: quantize to 256 colours, generate the four mip levels,
-    and make sizes multiples of 16, preferably no more than 512 px.
-  - Embed them in the BSP with `-wadinclude` so the map stays self-contained.
+- **Textures. Done.**
+  - `Map.add_texture(name, image)` goes to `wadwrite.py`, which quantizes to 256
+    colours, builds the four mip levels and rounds sizes to multiples of 16.
+  - `-wadinclude` embeds the result in the BSP. Toggle pairs (`+0`/`+A`) and
+    transparent (`{`) textures work.
+  - `art.py` rasterizes pixel-art SVGs and composes slides. Example: the conference
+    projector's CCC slides from `assets/ccc_mascot.svg`.
 - **Models.**
   - Generate the mesh file and model script from Python (procedural props) or export
     from Blender. Compile to `.mdl` with Valve's model compiler.
@@ -360,16 +383,16 @@ Custom assets must ship next to the map. Where they live is an open decision (§
   against screenshots.
 
 ## 8. Verification roadmap
-Done: compiled-hull hole detection, invisible-wall detection, reachability, face
-coverage, the verifier self-tests, the `+use` reach lint and the budget report (§3.6,
-§3.8).
+Done: compiled-hull hole detection, invisible-wall detection, on-foot walkability
+with keys and locked doors, face coverage, the verifier self-tests, the `+use` reach
+lint and the budget report (§3.6, §3.8).
 - **More tests (pytest):**
   - Geometry invariants: valid convex brushes, outward normals, and CSG results that
     add back up to the original volume.
   - A verify-based test per geometry generator (rooms, caves).
   - Golden `.map` output for the example maps.
-- **Walkability.** Reachability ignores gravity. Add step height (18), jump height and
-  fall damage to find places a player can see but not get to.
+- **Return paths.** Walkability checks the way there, not back. Check that a player
+  can always return from every area (no one-way drops that trap them).
 - **Performance per view.** Record the `r_speeds` output (world and entity polygon
   counts) during screenshot runs to measure detail at each camera.
 - **Headless renderer.** Render the compiled BSP, with textures and lightmaps, from
@@ -405,7 +428,7 @@ Notes for if that changes:
 
 ## 10. Open decisions
 
-1. **Where custom assets go.**
+1. **Where custom assets go** (textures are solved: embedded in the BSP).
    - Option (a): namespaced folders inside `valve/` (`models/hlbox/`, `sound/hlbox/`),
      tracked by the install manifest so they can be removed cleanly.
    - Option (b): `valve_addon/`, which is only read when the player enables custom

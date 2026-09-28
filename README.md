@@ -6,7 +6,7 @@ with [SDHLT](https://github.com/seedee/SDHLT), installs it into Half-Life and ca
 in-engine screenshots to check the result. It was built so Claude Code can make maps
 end to end, but it works fine by hand too.
 
-![office map, in game](docs/office.jpg)
+![conference room with a projector showing custom CCC slides, in game](docs/office.jpg)
 ![generated cave turning into Xen, in game](docs/cave.jpg)
 
 ```python
@@ -58,12 +58,16 @@ playing it:
 - `hlmap/cave.py` builds organic caves. A heightfield of simple rock columns follows a
   path out of a doorway. It's watertight by construction, its collision is verified,
   and its materials can change along the way (rock turning into Xen).
-- `hlmap/verify.py` checks the compiled map's collision and visibility against the
-  intended design: holes, invisible walls, reachability and missing faces. `build`
-  won't install a map that fails.
-- `hlmap/props.py` has a table, chair, crates, crystals, hinged and sliding doors,
-  locks, light switches, switchable ceiling panel lights, Xen plant lights and the
-  player start.
+- `hlmap/verify.py` checks the compiled map against the intended design: collision
+  holes, invisible walls, missing faces, and on-foot walkability with keys and locked
+  doors (can every area be reached, can you get locked out). `build` won't install a
+  map that fails.
+- `hlmap/props.py` has furniture (tables, chairs, crates, radios, filing cabinets,
+  bookshelves, a vending machine, barrels, pipes, wall art), stairs railings and
+  ladders, doors with locks and key pickups, light switches and switchable ceiling
+  panels, a projector with toggleable slides, Xen plants and crystals.
+- `hlmap/wadwrite.py` and `hlmap/art.py` add non-standard textures from any image or
+  a pixel-art SVG, embedded in the compiled map.
 - `hlmap/compile.py` runs CSG/BSP/VIS/RAD with fast, normal and final profiles, and
   summarizes errors, leaks and how much of each engine limit the map uses. A leak path
   is drawn on the plan preview.

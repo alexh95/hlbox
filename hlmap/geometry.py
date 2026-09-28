@@ -198,8 +198,9 @@ class Brush:
         vec = {v: k for k, v in SIDE_NAMES.items()}.get(side, side)
         return max(self.faces, key=lambda f: dot(f.normal, vec))
 
-    def fit(self, side, tex=None, flip_u=False, flip_v=False, u_axis=None, v_axis=None):
-        """Stretch the texture so exactly one copy covers the face (doors, signs, screens).
+    def fit(self, side, tex=None, flip_u=False, flip_v=False, u_axis=None, v_axis=None, repeat=(1, 1)):
+        """Stretch the texture so exactly one copy (or repeat=(nu, nv) copies) covers the
+        face (doors, signs, screens, drawer fronts).
         u_axis/v_axis: texture right/down directions (default: face-aligned, unmirrored)."""
         from .wad import default_db
         f = self.face(side)
@@ -218,8 +219,8 @@ class Brush:
         us = [dot(p, u) for p in poly]
         vs = [dot(p, v) for p in poly]
         f.u_axis, f.v_axis = u, v
-        f.u_scale = (max(us) - min(us)) / tw
-        f.v_scale = (max(vs) - min(vs)) / th
+        f.u_scale = (max(us) - min(us)) / (tw * repeat[0])
+        f.v_scale = (max(vs) - min(vs)) / (th * repeat[1])
         f.u_offset = -min(us) / f.u_scale
         f.v_offset = -min(vs) / f.v_scale
         return self

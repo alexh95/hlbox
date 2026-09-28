@@ -108,7 +108,11 @@ def compile_map(map_path, profile="normal", steps=("csg", "bsp", "vis", "rad"), 
     full_log = []
     for step in steps:
         exe = config.HLT_DIR / TOOLS[step]
-        args = [str(exe), "-console", "0"] + opts[step] + list(extra.get(step, [])) + [str(base)]
+        args = [str(exe), "-console", "0"] + opts[step] + list(extra.get(step, []))
+        custom = base.with_name(f"{base.name}_custom.wad")
+        if step == "csg" and custom.exists():
+            args += ["-wadinclude", custom.name]   # embed the map's own textures in the BSP
+        args.append(str(base))
         t0 = time.time()
         proc = subprocess.run(args, cwd=str(map_path.parent), capture_output=True, text=True,
                               errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
