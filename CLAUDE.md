@@ -12,6 +12,8 @@ screenshots. There is no GUI editor in the loop.
 - `tools/sdhlt/` has the SDHLT v1.3.0 compilers (`tools/Win64/*.exe`), `sdhlt.wad` (tool textures) and `sdhlt.fgd`.
   It's not in git; `python -m hlmap setup` downloads it and verifies the checksums.
 - `docs/entities.md` is a quick reference for common entities and keyvalues.
+- `docs/design.md` covers capabilities, the roadmap, engine limits and open decisions.
+  The scope is maps for stock Half-Life; mod-only features are out of scope.
 - Half-Life lives at `E:\SteamLibrary\steamapps\common\Half-Life` (auto-detected; override with `HL_DIR`).
 
 ## Workflow (run from the project root)
