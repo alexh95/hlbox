@@ -1,0 +1,6 @@
+# generated maps, logs, previews, screenshots
+build/
+# third-party compilers, fetched by `python -m hlmap setup`
+tools/
+__pycache__/
+*.pyc
