@@ -82,8 +82,12 @@ build/<name>/plan.png   build/<name>/<name>.map  (Valve 220)
   Walls can put the texture's bottom edge on the floor. Floor and ceiling tile grids
   can be anchored to the room corner or centre.
 - **Sealing check.** `check()` rejects any opening that pokes outside every room shell.
-- **Limitation:** everything is axis-aligned. There are no slopes, angled walls,
-  multi-level floors or non-box spaces.
+- **Room groups.** Rooms that touch or overlap are rejected unless they share a
+  `group`.
+- **Caves.** `Level.tunnel(...)` adds organic caves as a heightfield of columns
+  (§4.3); the level knows each cave's air for entity checks and verification.
+- **Limitation:** rooms are still axis-aligned. There are no slopes, angled walls or
+  multi-level floors; tunnels are the only non-box spaces.
 
 ### 3.3 Entities and props (`hlmap/mapfile.py`, `hlmap/props.py`)
 - **Entities.** `Entity(classname, brushes, kv, **keyvalues)` covers every stock
@@ -100,8 +104,16 @@ build/<name>/plan.png   build/<name>/<name>.map  (Valve 220)
   - `door_rotating`: hinge side, one-way swing, sounds and a wait time. Handles the
     ORIGIN brush and mirrored door textures.
   - `door_sliding`.
-  - `ceiling_light`: a flush panel that emits light through its texture.
-  - `light`, `player_start` and `yaw_towards`.
+  - `ceiling_light`: a flush panel that emits light through its texture. With `name=`
+    it becomes switchable: a func_wall with `style -3`, a "piggyback" texture light
+    that follows a named light's switchable style.
+  - `switch`: a toggling func_button.
+  - `lock`: a multisource plus a trigger_relay "key"; doors use it as their `master`.
+  - `crate`, `crystal` and `xen_plantlight`.
+  - `light`, `point`, `player_start` and `yaw_towards`.
+  - Doors block light while compiling (`zhlt_lightflags 2`).
+- **Target checks.** `Map.check()` also flags any `target`/`master`/`killtarget`
+  that names no entity. A lock whose name matches nothing would leave the door unlocked.
 
 ### 3.4 Lighting
 - **Point lights** with colour and brightness.
@@ -125,6 +137,8 @@ build/<name>/plan.png   build/<name>/<name>.map  (Valve 220)
   log.
 - **Reporting.**
   - Errors and warnings are summarized.
+  - A budget line reports the share of each engine limit used, read from the
+    compiler's own chart, and warns at 70%.
   - A leak names the entity it was found from, keeps the pointfile, and draws the leak
     path on the plan preview.
 
@@ -138,7 +152,26 @@ build/<name>/plan.png   build/<name>/<name>.map  (Valve 220)
   - Point entities with labels and facing arrows.
   - Room names and sizes, a 64-unit grid with coordinates, and the leak path.
 
-### 3.8 Game integration (`hlmap/game.py`)
+### 3.8 Verification (`hlmap/verify.py`, `hlmap/checks.py`, `tests/`)
+A clean compile doesn't mean clean collision, so `build` verifies the compiled BSP
+against the level's intended air and refuses to install on failure:
+- **Holes.** Every empty leaf of the world's BSP trees is computed exactly as a convex
+  polytope, for the sight/bullet hull and the standing and crouching player hulls. Any
+  empty region reaching more than 1 unit into intended solid is a hole.
+- **Invisible walls.** Solid leaves of the player hulls must not contain positions
+  where the player's box is inside air and touches no intended brush. The box is
+  tested against brush planes pushed out by the box, as the compiler does.
+- **Reachability.** A flood fill of standing-player positions from the start reaches
+  every room and every cave stretch.
+- **Coverage.** Every generated face with real air in front has a matching face in
+  the BSP. That catches polygons the compiler deleted, which you'd see through.
+- **Self-tests.** `tests/test_verify.py` compiles rooms with known defects and checks
+  each one is caught, plus that a clean room passes.
+- **Gameplay lint.** `checks.use_reach` flags usable entities that can be `+use`d
+  from more than one room (`+use` reaches 64 units through walls), and pairs close
+  enough to be confused.
+
+### 3.9 Game integration (`hlmap/game.py`)
 - **Install.** Maps go to `valve/maps/`. The tool refuses to overwrite files it didn't
   install, using a manifest in `build/installed.json`.
 - **Play.** `play` launches Half-Life straight into a map.
@@ -151,7 +184,12 @@ build/<name>/plan.png   build/<name>/<name>.map  (Valve 220)
   3. Collect the BMPs as PNGs.
   4. Scan the console log.
   5. Delete all temporary files and restore the registry video settings.
-  - `--fire` triggers entities first. `@doors` opens every door and keeps it open.
+  - Cameras can be named, and defined in `build()` as `m.cameras`. `--only` retakes
+    a subset.
+  - Each camera can toggle entities first (`fire`), in order and 0.3 s apart. `@doors`
+    opens every door and keeps it open.
+  - `--console "developer 2" --log` saves the game console, which shows every entity
+    that received a trigger.
 - **Limitations:**
   - Needs a desktop session and takes over the screen for about 15 s.
   - Can't test collision or gameplay.
@@ -189,13 +227,56 @@ build/<name>/plan.png   build/<name>/<name>.map  (Valve 220)
   ladder brush).
 
 ### 4.3 Terrain and caves
+**Status:** caves are implemented as a heightfield (`hlmap/cave.py`, used by
+`maps/office.py`). All verification checks pass: no holes in any hull, no invisible
+walls, full reachability, full face coverage.
+
+A cave is a floor path leaving a room through a wall hole. Around the path, an
+axis-aligned grid (32 units) stores a floor and ceiling height per vertex:
+- the floor is flat near the path;
+- towards the edge the floor rises and the ceiling falls until they meet (closed);
+- noise is smoothed in 2-D;
+- the first cell row is exactly the doorway rectangle, then it flares;
+- materials change along the length with a ragged, noise-driven boundary.
+
+Every triangle becomes a floor column and a ceiling column, or one full column where
+it's closed. Cells away from the cave are merged solid columns. All vertices are
+integers and every side is a vertical plane through a shared grid edge, so it's exact
+by construction. The office cave comes to 1,040 world brushes: 11.8% of clipnodes and
+9.4% of world leaves. The compiler still prints 6 ambiguous-leaf warnings (3 in the
+large-monster hull), but verification shows none of them opens a hole or makes an
+invisible wall.
+
+**What failed first: lofted ring shells.** The first version lofted irregular rings
+along the path. Each surface triangle became a thin (8-unit) slanted rock plate. It
+compiled without leaks and looked right in screenshots. Playtesting then found
+walk-through walls, walk-through cave walls and a see-through polygon. The verifier
+reproduced all three on that BSP: empty player-hull regions over 100 units deep inside
+the rock. Thin slanted plates, rounded vertex positions and plates poking through each
+other at creases produce misclassified ("ambiguous") collision leaves and deleted
+faces. Measured variants of that design, all rejected:
+
+| Sealing | Leak | World leaves | Clipnodes | Ambiguous-leaf warnings (hulls 0/1/2/3) |
+|---|---|---|---|---|
+| Hidden rooms around func_detail rock | no | 36.1% | 16.7% | 0/5/0/5 |
+| Rock shell, back faces along vertex normals (default) | no | 7.5% | 9.8% | 3/9/7/6 |
+| Rock shell, back faces along face normals | **leaks** | ~33% | 9.4% | 11/10/11/7 |
+| Default + thicker rock (16) | no | 7.6% | 9.9% | 31/6/3/9 |
+| Default + `-cliptype precise` | no | 7.5% | 11.7% | 3/29/18/27 |
+
+Lessons:
+- Face-normal extrusion leaves wedge gaps that the compiler treats as leaks.
+- "No leak" and good screenshots say nothing about player collision.
+- Generated geometry needs thick, simple, exactly shared brushes, and verification of
+  the compiled hulls.
+
 The world can only be made of convex brushes; GoldSrc has no heightmaps,
 displacements or collidable static meshes. Four generators, all producing brushes:
 
 | Technique | Use | Output | Sealing |
 |---|---|---|---|
-| Heightfield | Outdoor ground, slopes | Two triangular prisms per grid cell, extruded down to a flat base | By construction |
-| Lofted tunnel | Passages from A to B | Irregular rings along a path; one outward-extruded brush per quad | By construction (closed rings, capped ends) |
+| Heightfield | Outdoor ground, slopes, **caves (done: floor + ceiling heightfields)** | Triangular columns per grid cell | By construction |
+| Lofted tunnel | Passages from A to B | Irregular rings along a path; one outward-extruded brush per quad | **Tried and rejected:** thin slanted plates break the collision hulls |
 | Mesh to brushes | Organic caves, rock formations | One brush per triangle, pushed outward, from a closed mesh (noise field → surface nets / marching cubes, or imported from Blender as OBJ) | Needs a check that the mesh has no holes |
 | Convex blob carving | Chambers, grottos | Irregular convex air blobs cut out of solid with the core from §4.1 | By construction; faceted look |
 
@@ -205,11 +286,11 @@ openings can join them to rooms, e.g. `lvl.tunnel(...)` then `lvl.connect(hall, 
 Quality and budget measures:
 - **Grid.** Put vertices on a 32–64 unit grid, snap them to integers, and drop sliver
   triangles after snapping.
-- **Visibility.** Make the rock surface `func_detail` inside a coarse world shell that
-  seals the level, so the rock doesn't shatter visibility into thousands of pieces.
-- **Collision.** Angled brushes can snag the player. Options are the
-  `-cliptype precise` compile option, SDHLT's BEVEL/BEVELHINT textures, or turning
-  collision off on the visible rock (`zhlt_noclip`) and adding a simplified CLIP hull.
+- **Visibility.** Heightfield rock is structural world geometry. It blocks vis, and
+  its big columns keep leaf counts moderate (9% for the office cave).
+- **Collision.** Prefer thick convex brushes with vertical sides, as the heightfield
+  uses. `-cliptype precise` made the thin-plate design worse (more ambiguous leaves).
+  Every generator must pass `verify`.
 - **Look.** RAD can smooth lighting across faces meeting at a shallow angle (default
   threshold 50°; `info_smoothvalue` sets it per texture), which makes faceted rock read
   smooth. Rock textures use world or face alignment.
@@ -224,7 +305,8 @@ Quality and budget measures:
 - **Logic helpers** for common patterns:
   - A button that opens a door.
   - A locked door with a key or keycard, using `multisource` or `env_global` as the
-    lock.
+    lock. Done: `props.lock` (a multisource plus a trigger_relay key). Still to do:
+    a key pickup that fires it.
   - One-shot and repeatable triggers.
   - Timed sequences with `multi_manager`.
   - Hurt, push and teleport volumes.
@@ -269,21 +351,25 @@ Custom assets must ship next to the map. Where they live is an open decision (§
 ## 7. Lighting roadmap
 - **More light types:** `light_spot` (a cone with pitch) and `light_environment` with
   sky brushes and `skyname` for outdoor areas.
-- **Switchable lights.** A named light gets its own light style from the compiler, so
-  buttons can turn it on and off. Pair this with the lit (`+0`) and unlit (`+A`)
-  animated light textures.
+- **Switchable lights.** Done. A named light gets its own light style from the
+  compiler, so buttons can turn it on and off. Texture lights follow it when their
+  brush entity has `style -3` and the same targetname (sdHLCSG `qcsg.cpp`); the entity
+  also flips its lit `+0` texture to the unlit `+A` frame. `zhlt_usestyle` is only read
+  after that style check, so on its own it does nothing.
 - **Presets per room type** (office, lab, industrial, emergency), with brightness tuned
   against screenshots.
 
 ## 8. Verification roadmap
-- **Tests (pytest):**
+Done: compiled-hull hole detection, invisible-wall detection, reachability, face
+coverage, the verifier self-tests, the `+use` reach lint and the budget report (§3.6,
+§3.8).
+- **More tests (pytest):**
   - Geometry invariants: valid convex brushes, outward normals, and CSG results that
     add back up to the original volume.
-  - Every level builder output is sealed.
+  - A verify-based test per geometry generator (rooms, caves).
   - Golden `.map` output for the example maps.
-  - A compile smoke test.
-- **Budget report.** Read the "Objects/Maxobjs" table from each compile step and warn
-  at about 70% of any limit (§11).
+- **Walkability.** Reachability ignores gravity. Add step height (18), jump height and
+  fall damage to find places a player can see but not get to.
 - **Performance per view.** Record the `r_speeds` output (world and entity polygon
   counts) during screenshot runs to measure detail at each camera.
 - **Headless renderer.** Render the compiled BSP, with textures and lightmaps, from
@@ -293,8 +379,7 @@ Custom assets must ship next to the map. Where they live is an open decision (§
   - Point entities stand on floors, not floating.
   - Player-start clearance: 32×32×72 of free space.
   - Doorway clearance.
-  - Reachability: a flood fill over walkable floor from the player start, checking step
-    height (18) and jump height, reports areas that can't be reached.
+  - Reachability with gravity (see Walkability above).
 
 ## 9. Out of scope: features that need a mod
 

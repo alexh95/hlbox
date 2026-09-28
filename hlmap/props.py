@@ -65,13 +65,18 @@ def chair(x, y, z, facing="north", seat="FIFTIES_DR6A", frame="FIFTIES_DSK1",
 
 def door_rotating(opening, hinge="left", texture="FIFTIES_DR6A2", edge="FIFTIES_DR6B",
                   thickness=8, speed=120, wait=4, distance=90, movesnd=9, stopsnd=4,
-                  targetname=None, use_only=False, swing_into=None):
+                  targetname=None, use_only=False, swing_into=None, master=None,
+                  locked_sound=12, unlocked_sound=13, opaque=True, **kv):
     """Hinged door filling a Level doorway.
 
     hinge:  'left' or 'right' as seen from room a (the first room given to doorway()).
     swing_into: None = opens away from the player; or a Room (opening.a / opening.b)
             to always swing into that room.
     wait:   seconds before closing again (-1 = stay open).
+    master: name of a lock (see lock()); while locked the door won't open and plays
+            `locked_sound` (12 = latch rattle). Extra **kv are passed through.
+    opaque: block light while compiling (zhlt_lightflags 2) so lit rooms don't bleed
+            through closed doors; the baked shadow stays when the door opens.
     Sounds: movesnd 0-10 (9/10 squeaky, 1 servo), stopsnd 0-8 (4 chunk, 1 clang).
     """
     axis = opening.axis
@@ -113,9 +118,13 @@ def door_rotating(opening, hinge="left", texture="FIFTIES_DR6A2", edge="FIFTIES_
         if ccw[0] * into[0] + ccw[1] * into[1] < 0:
             flags |= 2  # reverse direction
     kv = {"speed": speed, "wait": wait, "distance": distance, "movesnd": movesnd,
-          "stopsnd": stopsnd, "spawnflags": flags}
+          "stopsnd": stopsnd, "spawnflags": flags, **kv}
     if targetname:
         kv["targetname"] = targetname
+    if master:
+        kv.update(master=master, locked_sound=locked_sound, unlocked_sound=unlocked_sound)
+    if opaque:
+        kv.setdefault("zhlt_lightflags", 2)
     return Entity("func_door_rotating", brushes=[leaf, origin], kv=kv)
 
 
@@ -144,13 +153,24 @@ def door_sliding(opening, texture="LAB1_DOOR2A", edge="LAB1_DOOR2B", thickness=8
 # ---------------------------------------------------------------- lights
 
 def ceiling_light(x, y, ceiling_z, width=64, depth=80, texture="+0~FIFTS_LGHT01",
-                  trim="FIFTIES_DSK5B", drop=2):
+                  trim="FIFTIES_DSK5B", drop=2, name=None):
     """Flush fluorescent panel on the ceiling centered at (x, y), emitting via its texture.
-    Remember to register the texture: m.texlight(texture, (255, 250, 235), 4000)."""
+    Remember to register the texture: m.texlight(texture, (255, 250, 235), 4000).
+
+    name: make it switchable. Returns [func_wall panel, named light]; firing `name`
+    (e.g. from switch()) toggles the light style AND flips the panel to its +A (off)
+    texture frame. Panels sharing a name switch together. Use a '+0' texture."""
     b = box((x - width / 2, y - depth / 2, ceiling_z - drop), (x + width / 2, y + depth / 2, ceiling_z),
             trim, comment="ceiling light")
     b.fit("bottom", texture)
-    return detail(b)
+    if not name:
+        return detail(b)
+    # style -3 = "piggyback texlight": the compiler gives this entity's texture light the
+    # switchable style of the real light with the same targetname (sdHLCSG qcsg.cpp).
+    # Only that light entity can toggle the style in-game, hence the anchor light below.
+    panel = Entity("func_wall", brushes=[b], targetname=name, style=-3)
+    anchor = light((x, y, ceiling_z - drop - 8), brightness=25, targetname=name)
+    return [panel, anchor]
 
 
 def light(pos, color=(255, 240, 220), brightness=200, style=None, targetname=None, fade=None):
@@ -163,6 +183,82 @@ def light(pos, color=(255, 240, 220), brightness=200, style=None, targetname=Non
     if fade is not None:
         kv["_fade"] = fade
     return Entity("light", kv=kv)
+
+
+def point(classname, pos, facing=None, **kv):
+    """Any point entity at pos; facing = yaw degrees or compass name."""
+    if facing is not None:
+        kv["angles"] = f"0 {YAW.get(facing, facing)} 0"
+    return Entity(classname, origin=tuple(pos), **kv)
+
+
+# ---------------------------------------------------------------- logic
+
+def lock(name, origin):
+    """A lock for doors and buttons: set their `master=name`. Locked until something fires
+    f"{name}_key" (a button, trigger, keycard pickup...). Returns the two entities."""
+    return [Entity("multisource", targetname=name, origin=tuple(origin)),
+            Entity("trigger_relay", targetname=f"{name}_key", target=name, triggerstate=1,
+                   origin=tuple(origin))]
+
+
+def switch(pos, facing, target, texture="C1A1_SWTCH1", size=(10, 15), depth=2, sound=14,
+           toggle=True, master=None):
+    """Wall switch (func_button) centred on `pos`, a point ON the wall surface, sticking
+    `depth` units out toward `facing` (the side the player stands on). Pressing (+use)
+    fires `target`; sound 14 = light switch click."""
+    fx, fy = DIRS[facing]
+    w, h = size
+    x, y, z = pos
+    if fx:
+        x0, x1 = (x, x + depth) if fx > 0 else (x - depth, x)
+        b = box((x0, y - w / 2, z - h / 2), (x1, y + w / 2, z + h / 2), "FIFTIES_DSK5B", comment="switch")
+    else:
+        y0, y1 = (y, y + depth) if fy > 0 else (y - depth, y)
+        b = box((x - w / 2, y0, z - h / 2), (x + w / 2, y1, z + h / 2), "FIFTIES_DSK5B", comment="switch")
+    b.fit(facing, texture)
+    kv = {"target": target, "sounds": sound, "wait": 1,
+          "spawnflags": 1 | (32 if toggle else 0)}   # 1 = don't move, 32 = toggle
+    if master:
+        kv["master"] = master
+    return Entity("func_button", brushes=[b], kv=kv)
+
+
+# ---------------------------------------------------------------- set dressing
+
+def crate(x, y, z, size=48, texture="CRATE02", height=None):
+    """Crate (func_detail) standing on z, centred on (x, y); one texture copy per face."""
+    h = height or size
+    b = box((x - size / 2, y - size / 2, z), (x + size / 2, y + size / 2, z + h), texture, comment="crate")
+    for side in ("top", "bottom", "north", "south", "east", "west"):
+        b.fit(side)
+    return detail(b)
+
+
+def crystal(base, height=96, radius=14, lean=(0, 0), sides=6, texture="CRYS_2A", seed=0):
+    """Pointed crystal growing from `base` (floor point), leaning by (dx, dy) at the tip.
+    Register the texture with m.texlight() to make it glow."""
+    import random
+    from .geometry import hull
+    rnd = random.Random(seed)
+    bx, by, bz = base
+    pts = []
+    for i in range(sides):
+        a = 2 * math.pi * (i + rnd.uniform(-0.15, 0.15)) / sides
+        r = radius * rnd.uniform(0.85, 1.1)
+        pts.append((round(bx + r * math.cos(a)), round(by + r * math.sin(a)), round(bz - 8)))
+        pts.append((round(bx + lean[0] * 0.7 + r * 0.8 * math.cos(a)),
+                    round(by + lean[1] * 0.7 + r * 0.8 * math.sin(a)), round(bz + height * 0.7)))
+    pts.append((round(bx + lean[0]), round(by + lean[1]), round(bz + height)))
+    return detail(hull(pts, texture, comment="crystal"))
+
+
+def xen_plantlight(pos, name, color=(255, 190, 90), brightness=140, facing=0):
+    """Xen light stalk that retracts when the player gets close, switching off its light.
+    Returns [plant, light]."""
+    plant = point("xen_plantlight", pos, facing, target=name)
+    glow = light((pos[0], pos[1], pos[2] + 56), color=color, brightness=brightness, targetname=name)
+    return [plant, glow]
 
 
 def player_start(pos, facing=0):

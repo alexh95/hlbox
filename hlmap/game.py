@@ -127,7 +127,8 @@ def _camera_entities(cam):
 def _cam_variant(bsp_path, cam, dest, fire=()):
     b = BSP(bsp_path)
     ents = b.entities
-    x, y, z, pitch, yaw = cam
+    x, y, z, pitch, yaw = cam[:5]
+    fire = list(fire) + list(cam[5] if len(cam) > 5 else ())
     extra = []
     for name in fire:
         if name == "@doors":   # open every door (temporarily named so a trigger can reach it)
@@ -139,28 +140,31 @@ def _cam_variant(bsp_path, cam, dest, fire=()):
                         extra.append(e["targetname"])
             continue
         extra.append(name)
-    for i, name in enumerate(dict.fromkeys(extra)):
-        ents.append({"classname": "trigger_auto", "target": name, "triggerstate": "1", "delay": "0.3",
-                     "spawnflags": "1", "origin": f"{x:.1f} {y:.1f} {z:.1f}"})
+    for i, name in enumerate(dict.fromkeys(extra)):   # fired in order, 0.3 s apart
+        # triggerstate 2 = toggle, like pressing a switch (lights ignore "on" when already on)
+        ents.append({"classname": "trigger_auto", "target": name, "triggerstate": "2",
+                     "delay": f"{0.3 * (i + 1):.1f}", "spawnflags": "1", "origin": f"{x:.1f} {y:.1f} {z:.1f}"})
     # park the player just behind the camera so its model stays out of view
     back = (x - math.cos(math.radians(yaw)) * 24, y - math.sin(math.radians(yaw)) * 24, z - 28)
     for e in ents:
         if e.get("classname") == "info_player_start":
             e["origin"] = " ".join(f"{c:.1f}" for c in back)
             e["angles"] = f"0 {yaw} 0"
-    b.entities = ents + _camera_entities(cam)
+    b.entities = ents + _camera_entities(cam[:5])
     b.save(dest)
 
 
 def screenshots(bsp_path, cameras, out_dir, prefix="shot", width=1280, height=720,
-                wait_frames=300, timeout=120, fire=()):
-    """Render in-engine screenshots. cameras: list of (x, y, z_eye, pitch, yaw).
+                wait_frames=300, timeout=120, fire=(), console=()):
+    """Render in-engine screenshots. cameras: list of (x, y, z_eye, pitch, yaw[, fire_list]).
     fire: targetnames to trigger ~0.3s after spawn ('@doors' = open all doors; triggered
-    two-way doors swing away from the camera). Returns (png_paths, console_log_text)."""
+    two-way doors swing away from the camera). console: extra console commands run before
+    the first map (e.g. "developer 2"). Returns (png_paths, console_log_text)."""
     from PIL import Image
 
     if hl_running():
         raise RuntimeError("Half-Life is already running; close it first")
+    timeout = max(timeout, 40 + 12 * len(cameras))
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     maps_dir = config.GAME_DIR / "maps"
@@ -170,6 +174,7 @@ def screenshots(bsp_path, cameras, out_dir, prefix="shot", width=1280, height=72
 
     waits = "wait;" * 10
     cfg = [f'alias hlm_w10 "{waits}"', 'alias hlm_w100 "' + "hlm_w10;" * 10 + '"']
+    cfg += list(console)   # e.g. "developer 2" to log entity firing into the console log
     for i, n in enumerate(names):
         settle = max(1, wait_frames // 100) + (4 if i == 0 else 0)   # first load: let startup toasts fade
         cfg += [f"map {n}"] + ["hlm_w100"] * settle + ["snapshot", f"echo HLMAP_SHOT {n}"]

@@ -7,6 +7,7 @@ in-engine screenshots to check the result. It was built so Claude Code can make 
 end to end, but it works fine by hand too.
 
 ![office map, in game](docs/office.jpg)
+![generated cave turning into Xen, in game](docs/cave.jpg)
 
 ```python
 from hlmap import Map, Level, Material, props
@@ -54,12 +55,21 @@ playing it:
   Valve 220 texture alignment, including "fit texture to face".
 - `hlmap/level.py` is the room builder. It carves air volumes out of solid shells,
   so rooms and doorways can't leak, and it textures each face by the room it faces.
-- `hlmap/props.py` has a table, chair, hinged and sliding doors, ceiling panel
-  lights, lights and the player start.
+- `hlmap/cave.py` builds organic caves. A heightfield of simple rock columns follows a
+  path out of a doorway. It's watertight by construction, its collision is verified,
+  and its materials can change along the way (rock turning into Xen).
+- `hlmap/verify.py` checks the compiled map's collision and visibility against the
+  intended design: holes, invisible walls, reachability and missing faces. `build`
+  won't install a map that fails.
+- `hlmap/props.py` has a table, chair, crates, crystals, hinged and sliding doors,
+  locks, light switches, switchable ceiling panel lights, Xen plant lights and the
+  player start.
 - `hlmap/compile.py` runs CSG/BSP/VIS/RAD with fast, normal and final profiles, and
-  summarizes errors and leaks. A leak path is drawn on the plan preview.
+  summarizes errors, leaks and how much of each engine limit the map uses. A leak path
+  is drawn on the plan preview.
 - `hlmap/game.py` installs maps into `valve/maps`. It takes screenshots by loading
-  temporary copies of the map with a `trigger_camera` at each camera pose. Your
+  temporary copies of the map with a `trigger_camera` at each camera pose. Each camera
+  can first trigger entities: flip light switches, unlock a door, open all doors. Your
   Half-Life video settings are restored afterwards.
 - `hlmap/wad.py` reads WAD3 textures and makes contact sheets.
 - `hlmap/preview.py` draws orthographic plan and section cutaways.

@@ -29,6 +29,7 @@ ENTITY_TINT = {
     "func_water": (60, 120, 220),
 }
 TRIGGER = (230, 90, 230)
+QUIET = {"multisource", "trigger_relay", "trigger_auto", "info_target", "env_global"}
 POINT_COLORS = {
     "info_player_start": (80, 230, 80),
     "info_player_deathmatch": (80, 230, 80),
@@ -38,10 +39,14 @@ POINT_COLORS = {
 }
 
 
+TOOL_TEXTURES = {"ORIGIN", "CLIP", "NULL", "SKIP", "HINT", "AAATRIGGER", "BEVEL", "BEVELHINT",
+                 "SOLIDHINT", "SPLITFACE"}
+
+
 @lru_cache(maxsize=None)
 def tex_color(name):
     """Average colour of a texture (for flat-shaded previews)."""
-    if name.upper() in ("ORIGIN", "CLIP", "NULL", "SKIP", "HINT", "AAATRIGGER", "BEVEL"):
+    if name.upper() in TOOL_TEXTURES:
         return (255, 140, 0)
     try:
         from .wad import default_db
@@ -102,7 +107,7 @@ def render(m, path, view="top", cut=None, px_per_unit=None, max_px=1400, title=N
     level = getattr(m, "level", None)
     if cut is None:
         if view == "top":
-            base = min((r.floor for r in level.rooms), default=0) if level else 0
+            base = level.rooms[0].floor if level and level.rooms else 0
             cut = base + 48
         else:
             axis = 1 if view == "y" else 0
@@ -150,8 +155,10 @@ def render(m, path, view="top", cut=None, px_per_unit=None, max_px=1400, title=N
 
     # far to near: nearest surfaces drawn last
     for dmin, e, b, vs in sorted(beyond, key=lambda x: -x[0]):
-        f = max(b.faces, key=lambda f: dot(f.normal, facing))
-        col = tex_color(f.texture)
+        # colour by the most viewer-facing face that is actually drawn (skip NULL etc.)
+        shown = [f for f in b.faces if f.texture.upper() not in TOOL_TEXTURES] or b.faces
+        f = max(shown, key=lambda f: dot(f.normal, facing))
+        col = tex_color(f.texture) if f.texture.upper() not in TOOL_TEXTURES else (70, 70, 78)
         k = 1.1 - 0.5 * min(1.0, (dmin - cut_depth) / 384)
         col = _shade(col, k)
         tint = ENTITY_TINT.get(e.classname)
@@ -207,7 +214,7 @@ def render(m, path, view="top", cut=None, px_per_unit=None, max_px=1400, title=N
     # room labels
     if level and view == "top":
         for r in level.rooms:
-            if r.floor <= cut <= r.ceiling:
+            if r.floor <= cut <= r.ceiling and "#" not in r.name:
                 c = P((r.mins[0], r.maxs[1]))
                 sz = r.size
                 d.text((c[0] + 6, c[1] + 5), f"{r.name}  {sz[0]:g}x{sz[1]:g}x{sz[2]:g}",
@@ -215,12 +222,16 @@ def render(m, path, view="top", cut=None, px_per_unit=None, max_px=1400, title=N
 
     # point entities
     if show_entities:
+        labelled = set()
         for e in m.entities:
             if e.brushes or e.origin is None or e.classname == "info_texlights":
                 continue
             o = e.origin
             c = P(uv(o))
             col = POINT_COLORS.get(e.classname, (240, 240, 240))
+            if e.classname in QUIET:
+                d.ellipse([c[0] - 2, c[1] - 2, c[0] + 2, c[1] + 2], fill=(150, 150, 160))
+                continue
             r = 5
             d.ellipse([c[0] - r, c[1] - r, c[0] + r, c[1] + r], fill=col, outline=(0, 0, 0))
             ang = e.get("angles")
@@ -232,7 +243,10 @@ def render(m, path, view="top", cut=None, px_per_unit=None, max_px=1400, title=N
             name = e.classname.replace("info_player_", "player_")
             if e.get("targetname"):
                 name += f" '{e['targetname']}'"
-            d.text((c[0] + 8, c[1] + 4), name, fill=col, font=f_small)
+            key = (round(c[0] / 40), round(c[1] / 12), name)
+            if key not in labelled:
+                labelled.add(key)
+                d.text((c[0] + 8, c[1] + 4), name, fill=col, font=f_small)
 
     # leak line
     if pointfile and Path(pointfile).exists():

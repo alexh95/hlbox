@@ -118,6 +118,13 @@ class Map:
             if e.brushes and e.classname in ("func_door_rotating", "func_rotating", "func_pendulum"):
                 if not any(all(f.texture.upper() == "ORIGIN" for f in b.faces) for b in e.brushes):
                     problems.append(f"{e.classname} {e.get('targetname', '')} has no ORIGIN brush")
+        names = {str(e.get("targetname")) for e in self.entities if e.get("targetname")}
+        for e in self.entities:
+            for key in ("target", "killtarget", "master", "zhlt_usestyle"):
+                v = e.get(key)
+                if v and str(v) not in names:
+                    problems.append(f"{e.classname} {key}={v!r} matches no targetname"
+                                    + (" (door/button would NOT be locked)" if key == "master" else ""))
         if not self.find("info_player_start") and not self.find("info_player_deathmatch"):
             problems.append("no info_player_start")
         return problems

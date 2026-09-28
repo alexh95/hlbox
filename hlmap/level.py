@@ -115,6 +115,7 @@ class Room:
     material: Material
     is_opening: bool = False
     parent: "Room | None" = None
+    group: str | None = None     # rooms in the same group may touch/overlap (merged space)
     meta: dict = field(default_factory=dict)
 
     mins = property(lambda s: s.box.mins)
@@ -171,14 +172,16 @@ class Level:
         self.rooms: list[Room] = []
         self.openings: list[Opening] = []
         self.extra_air: list[Room] = []
+        self.features: list = []     # things with .emit(m) and .check(level), e.g. tunnels
 
     # --- description ------------------------------------------------------
-    def room(self, name, mins, maxs, material: Material | None = None, **overrides):
-        """Add a room of empty space. overrides: floor=, wall=, ceiling= texture names."""
+    def room(self, name, mins, maxs, material: Material | None = None, group=None, **overrides):
+        """Add a room of empty space. overrides: floor=, wall=, ceiling= texture names.
+        Rooms must be separated by walls unless they share a `group` (then they merge)."""
         mat = material or self.material
         if overrides:
             mat = mat.with_(**overrides)
-        r = Room(name, AABB(tuple(mins), tuple(maxs)), mat)
+        r = Room(name, AABB(tuple(mins), tuple(maxs)), mat, group=group)
         if not r.box.valid():
             raise ValueError(f"room {name}: mins must be < maxs, got {mins} {maxs}")
         self.rooms.append(r)
@@ -235,12 +238,75 @@ class Level:
         self.openings.append(op)
         return op
 
+    def tunnel(self, name, from_room: Room, side, center, path, mouth=(96, 112), material=None,
+               **opts):
+        """Organic cave leaving `from_room` through a hole in its `side` wall
+        ('north'/'south'/'east'/'west'), centred at `center` along that wall.
+
+        path:   floor-centre control points after the mouth (z = floor height); keep
+                turns gentle (radius above half the cave width).
+        mouth:  hole (width, height); width must be a multiple of `cell` (default 32).
+                The cave starts as exactly this rectangle and flares out over `flare`.
+        material / materials=[(fraction, Material), ...] along the cave, blend=0.1
+        Other options (cave.Cave): cell, width, height, roughness, floor_noise, flare,
+        seed, scale=f(fraction)->size multiplier.
+        Returns the Cave (floor_point(), camera(), frame() for placing things).
+        Define the other rooms first: the cave keeps clear of their air.
+        """
+        from .cave import ROCK, Cave
+        dirs = {"north": (1, +1), "south": (1, -1), "east": (0, +1), "west": (0, -1)}
+        axis, sign = dirs[side]
+        other = 1 - axis
+        face = (from_room.maxs[axis] + self.wall) if sign > 0 else (from_room.mins[axis] - self.wall)
+        mouth_pt = [0, 0, from_room.floor]
+        mouth_pt[axis] = face
+        mouth_pt[other] = center
+        d = [0, 0]
+        d[axis] = sign
+        if "materials" not in opts:
+            opts["materials"] = ((0.0, material or ROCK),)
+        avoid = [r.box for r in self.rooms if r is not from_room]
+        cave = Cave(name, tuple(mouth_pt), tuple(d), mouth, path, avoid=avoid, **opts)
+        # the hole through the wall; the cave's first cell row continues it exactly
+        lo, hi = [0, 0, from_room.floor], [0, 0, from_room.floor + mouth[1]]
+        inner = from_room.maxs[axis] if sign > 0 else from_room.mins[axis]
+        lo[axis], hi[axis] = sorted((inner, face))
+        lo[other], hi[other] = center - mouth[0] / 2, center + mouth[0] / 2
+        self.air(f"{name}-mouth", lo, hi, like=from_room)
+        self.features.append(cave)
+        return cave
+
     # --- queries ------------------------------------------------------------
     def all_air(self):
         return self.rooms + [o.room for o in self.openings] + self.extra_air
 
+    def is_air(self, p, tol=0.0):
+        """True if p is inside intended air (rooms, openings, extra air, caves), with
+        `tol` units of slack."""
+        for r in self.all_air():
+            b = r.box
+            if all(b.mins[k] - tol <= p[k] <= b.maxs[k] + tol for k in range(3)):
+                return True
+        return any(f.contains(p, tol) for f in self.features if hasattr(f, "contains"))
+
+    def checkpoints(self):
+        """[(name, [standing-player origins])] that must be reachable: every room (centre
+        and inset corners) and stretches of every cave."""
+        out = []
+        for r in self.rooms:
+            (x0, y0, z), (x1, y1, _) = r.mins, r.maxs
+            pts = [((x0 + x1) / 2, (y0 + y1) / 2)] + [(x, y) for x in (x0 + 40, x1 - 40) for y in (y0 + 40, y1 - 40)]
+            out.append((f"room {r.name}", [(x, y, z + 37) for x, y in pts]))
+        for f in self.features:
+            if hasattr(f, "checkpoints"):
+                for k, p in enumerate(f.checkpoints()):
+                    out.append((f"{f.name} stretch {k + 1}", [(p[0], p[1], p[2] + 37)]))
+        return out
+
     def is_inside(self, p):
-        return any(r.box.contains_point(p) for r in self.all_air())
+        return (any(r.box.contains_point(p) for r in self.all_air())
+                # +2: things standing exactly on a tunnel floor count as inside
+                or any(f.contains((p[0], p[1], p[2] + 2)) for f in self.features if hasattr(f, "contains")))
 
     def room_at(self, p):
         for r in self.rooms:
@@ -250,6 +316,15 @@ class Level:
 
     def check(self):
         problems = []
+        for i, a in enumerate(self.rooms):
+            for b in self.rooms[i + 1:]:
+                if a.group is not None and a.group == b.group:
+                    continue
+                if all(a.box.mins[k] <= b.box.maxs[k] and b.box.mins[k] <= a.box.maxs[k] for k in range(3)):
+                    problems.append(f"rooms {a.name} and {b.name} touch or overlap (no wall between "
+                                    f"them); separate them by {self.wall} units or give them a group")
+        for f in self.features:
+            problems.extend(f.check(self) if hasattr(f, "check") else [])
         shells = [r.box.expand(self.wall) for r in self.rooms]
         for r in [o.room for o in self.openings] + self.extra_air:
             rest = [r.box]
@@ -311,6 +386,8 @@ class Level:
                 faces.append(f)
             brushes.append(Brush(faces, "level"))
         m.add_world(*brushes)
+        for f in self.features:
+            f.emit(m)
         m.level = self
         return brushes
 

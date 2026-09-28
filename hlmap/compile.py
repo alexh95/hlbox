@@ -31,6 +31,18 @@ class CompileResult:
     leak_entities: list = field(default_factory=list)
     pointfile: Path | None = None
     log: Path | None = None
+    budget: dict = field(default_factory=dict)   # object -> (used, max, percent), last chart
+
+    def budget_report(self, warn=70.0):
+        if not self.budget:
+            return "budget: (no chart)"
+        top = sorted(self.budget.items(), key=lambda kv: -kv[1][2])
+        lines = ["budget (share of engine/compiler limits): " +
+                 ", ".join(f"{k} {v[2]:.1f}%" for k, v in top[:6])]
+        for k, (used, mx, pct) in top:
+            if pct >= warn:
+                lines.append(f"  WARNING: {k} at {pct:.1f}% ({used}/{mx})")
+        return "\n".join(lines)
 
     def summary(self):
         lines = [f"compile {'OK' if self.ok else 'FAILED'}: {self.bsp or ''}"]
@@ -47,7 +59,23 @@ class CompileResult:
         return "\n".join(lines)
 
 
-_NOISE = re.compile(r"^\s*$")
+_CHART = re.compile(r"^\*?\s*(\w+)\s+(?:(\d+)/(\d+)|\[variable\])\s+(\d+)/(\d+)\s+\(\s*([\d.]+)%\)")
+
+
+def _chart(text):
+    """Parse the last 'Object names  Objects/Maxobjs' table in a tool's output."""
+    out = {}
+    for line in text.splitlines():
+        m = _CHART.match(line)
+        if m:
+            name, n, mx, mem, mmax, pct = m.groups()
+            if n is not None:
+                used, cap = int(n), int(mx)
+                pct = 100.0 * used / cap if cap else 0.0
+            else:
+                used, cap, pct = int(mem), int(mmax), float(pct)
+            out[name] = (used, cap, pct)
+    return out
 
 
 def _scan(text, result: CompileResult):
@@ -92,6 +120,7 @@ def compile_map(map_path, profile="normal", steps=("csg", "bsp", "vis", "rad"), 
             print(out)
         n_err = len(res.errors)
         _scan(out, res)
+        res.budget = _chart(out) or res.budget
         if proc.returncode != 0 or len(res.errors) > n_err:
             if proc.returncode != 0 and len(res.errors) == n_err:
                 res.errors.append(f"{step} exited with code {proc.returncode}")
