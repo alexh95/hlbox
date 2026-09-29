@@ -11,12 +11,19 @@ ceiling corner). The builder surrounds each room with a solid shell `wall` units
 thick, merges the shells, carves out all air (rooms + openings) and textures each
 face by the room it faces. Because the solid always encloses the air, the level
 cannot leak unless an opening pokes outside every shell (checked).
+
+Corridors (Level.corridor) run at any angle along a polyline between two rooms: their
+air, walls, floor and ceiling are convex prisms carved with exact CSG (hlmap.csg),
+and a room they pass too close to gets its corner cut parallel to them.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
-from .geometry import Brush, make_face, SIDE_NAMES
+from .csg import Convex, Plane, line_intersection
+from .csg import subtract_all as carve_all
+from .geometry import Brush, Face, SIDE_NAMES, face_axes, make_face, world_axes
 from .wad import default_db
 
 AXES = "xyz"
@@ -117,6 +124,20 @@ class Room:
     parent: "Room | None" = None
     group: str | None = None     # rooms in the same group may touch/overlap (merged space)
     meta: dict = field(default_factory=dict)
+    cuts: list = field(default_factory=list)   # [((a, b), c)]: the air also has a*x + b*y <= c
+
+    def contains(self, p, tol=0.0):
+        """Is p in this room's air (its box, minus any cut corners)?"""
+        b = self.box
+        if not all(b.mins[k] - tol <= p[k] <= b.maxs[k] + tol for k in range(3)):
+            return False
+        return all((a * p[0] + bb * p[1] - c) / math.hypot(a, bb) <= tol for (a, bb), c in self.cuts)
+
+    def convex(self):
+        cv = Convex.box(self.mins, self.maxs)
+        for (a, b), c in self.cuts:
+            cv = cv.clipped(Plane((a, b, 0), c, _line_points(a, b, c)))
+        return cv.tidy() if self.cuts else cv
 
     mins = property(lambda s: s.box.mins)
     maxs = property(lambda s: s.box.maxs)
@@ -173,6 +194,8 @@ class Level:
         self.openings: list[Opening] = []
         self.extra_air: list[Room] = []
         self.features: list = []     # things with .emit(m) and .check(level), e.g. tunnels
+        self.corridors: list = []
+        self.notes: list = []        # things the builder did that you should know about
 
     # --- description ------------------------------------------------------
     def room(self, name, mins, maxs, material: Material | None = None, group=None, **overrides):
@@ -237,6 +260,57 @@ class Level:
         op = Opening(r, a, b, axis, tuple(d))
         self.openings.append(op)
         return op
+
+    def corridor(self, name, path, width=96, height=112, material=None, cut=True, max_cut=0.3):
+        """A corridor along a polyline `path` [(x, y), ...] at any angle, from inside one
+        room to inside another (both ends must be in room air; the rooms' walls get
+        carved where it passes through). Keep points on integers and turns at 45 or 90
+        degrees and every plane stays exact. Floor = the first room's floor.
+
+        cut: other rooms it passes within a wall of get the corner cut off, parallel
+        to it and one wall away (their cut corner becomes solid); a cut that would
+        take more than `max_cut` of a room's floor is an error. Returns the Corridor
+        (floor_point(), frame() for placing things)."""
+        start = self.room_at((path[0][0], path[0][1], self._floor_near(path[0]) + 1))
+        end = self.room_at((path[-1][0], path[-1][1], self._floor_near(path[-1]) + 1))
+        if start is None or end is None:
+            raise ValueError(f"corridor {name}: both ends must be inside rooms")
+        if start.floor != end.floor:
+            raise ValueError(f"corridor {name}: {start.name} and {end.name} have different floors")
+        mat = (material or start.material).with_(floor_align="world", ceiling_align="world")
+        c = Corridor(name, path, width, height, start.floor, self.wall, mat, (start, end))
+        for r in self.rooms:
+            if r in (start, end):
+                continue
+            for seg in c.segments:
+                if not r.convex().overlaps(seg["outer"]):
+                    continue
+                if not cut:
+                    raise ValueError(f"corridor {name} passes through room {r.name}")
+                (a, b), co = seg["cut_left"] if seg["side_of"](r.center) > 0 else seg["cut_right"]
+                before = _floor_area(r.convex(), r.floor)
+                r.cuts.append(((a, b), co))
+                after = _floor_area(r.convex(), r.floor) if r.convex().valid() else 0
+                lost = 1 - after / before
+                if lost > max_cut:
+                    raise ValueError(f"corridor {name}: cutting room {r.name} would take {lost:.0%} of its floor "
+                                     f"(max {max_cut:.0%}); move the corridor")
+                grown = r.box.expand(self.wall)
+                for o in self.openings:
+                    if r not in (o.a, o.b):
+                        continue
+                    (x0, y0, _), (x1, y1, _) = o.room.mins, o.room.maxs
+                    if any(grown.contains_point((x, y, r.floor)) and a * x + b * y > co
+                           for x in (x0, x1) for y in (y0, y1)):
+                        raise ValueError(f"corridor {name}: the cut through {r.name} reaches doorway {o.room.name}")
+                self.notes.append(f"{r.name}: corner cut by corridor {name} ({lost:.0%} of its floor)")
+        self.corridors.append(c)
+        return c
+
+    def _floor_near(self, xy):
+        """Floor of the highest room over (x, y) (stacked rooms: the upper one)."""
+        floors = [r.floor for r in self.rooms if r.mins[0] <= xy[0] <= r.maxs[0] and r.mins[1] <= xy[1] <= r.maxs[1]]
+        return max(floors) if floors else 0
 
     def tunnel(self, name, from_room: Room, side, center, path, mouth=(96, 112), material=None,
                **opts):
@@ -335,12 +409,13 @@ class Level:
         return self.rooms + [o.room for o in self.openings] + self.extra_air
 
     def is_air(self, p, tol=0.0):
-        """True if p is inside intended air (rooms, openings, extra air, caves), with
-        `tol` units of slack."""
+        """True if p is inside intended air (rooms, openings, extra air, corridors, caves),
+        with `tol` units of slack."""
         for r in self.all_air():
-            b = r.box
-            if all(b.mins[k] - tol <= p[k] <= b.maxs[k] + tol for k in range(3)):
+            if r.contains(p, tol):
                 return True
+        if any(c.contains(p, tol) for c in self.corridors):
+            return True
         return any(f.contains(p, tol) for f in self.features if hasattr(f, "contains"))
 
     def checkpoints(self):
@@ -350,7 +425,16 @@ class Level:
         for r in self.rooms:
             (x0, y0, z), (x1, y1, _) = r.mins, r.maxs
             pts = [((x0 + x1) / 2, (y0 + y1) / 2)] + [(x, y) for x in (x0 + 40, x1 - 40) for y in (y0 + 40, y1 - 40)]
+            cx, cy = pts[0]
+            for i, (x, y) in enumerate(pts):         # corners cut off: move toward the middle
+                for _ in range(40):
+                    if r.contains((x, y, z + 1), tol=-24):
+                        break
+                    x, y = x + (cx - x) * 0.1, y + (cy - y) * 0.1
+                pts[i] = (x, y)
             out.append((f"room {r.name}", [(x, y, z + 37) for x, y in pts]))
+        for c in self.corridors:
+            out.append((f"corridor {c.name}", [(x, y, c.z0 + 37) for x, y in c.checkpoints()]))
         for f in self.features:
             if hasattr(f, "checkpoints"):
                 for k, p in enumerate(f.checkpoints()):
@@ -358,13 +442,20 @@ class Level:
         return out
 
     def is_inside(self, p):
-        return (any(r.box.contains_point(p) for r in self.all_air())
+        return (any(r.contains(p) for r in self.all_air()) or any(c.contains(p) for c in self.corridors)
                 # +2: things standing exactly on a tunnel floor count as inside
                 or any(f.contains((p[0], p[1], p[2] + 2)) for f in self.features if hasattr(f, "contains")))
 
     def room_at(self, p):
         for r in self.rooms:
-            if r.box.contains_point(p):
+            if r.contains(p):
+                return r
+        return None
+
+    def in_cut(self, p):
+        """The room whose cut-off corner contains p (solid now), if any."""
+        for r in self.rooms:
+            if r.cuts and r.box.contains_point(p) and not r.contains(p):
                 return r
         return None
 
@@ -379,6 +470,18 @@ class Level:
                                     f"them); separate them by {self.wall} units or give them a group")
         for f in self.features:
             problems.extend(f.check(self) if hasattr(f, "check") else [])
+        for c in self.corridors:
+            for room, corners in zip(c.rooms, c.cap_corners()):
+                for x, y in corners:
+                    for z in (c.z0 + 1, c.z0 + c.height - 1):
+                        if not room.contains((float(x), float(y), z)):
+                            problems.append(f"corridor {c.name}: its end at ({float(x):.0f}, {float(y):.0f}) is not "
+                                            f"inside room {room.name}; extend the path further in")
+            for r in self.rooms:
+                if r in c.rooms:
+                    continue
+                if any(r.convex().overlaps(seg["outer"]) for seg in c.segments):
+                    problems.append(f"corridor {c.name} runs into room {r.name}")
         shells = [r.box.expand(self.wall) for r in self.rooms]
         for r in [o.room for o in self.openings] + self.extra_air:
             rest = [r.box]
@@ -429,7 +532,19 @@ class Level:
         if problems:
             raise ValueError("level problems:\n  " + "\n  ".join(problems))
         brushes = []
+        convex_airs = [seg["air"] for c in self.corridors for seg in c.segments]
+        extra = []                    # solids that go through the exact convex pass
+        for c in self.corridors:
+            extra += c.shell_pieces()
+        for r in self.rooms:          # cut-off corners become solid
+            for (a, b), co in r.cuts:
+                fill = Convex.box(r.mins, r.maxs).clipped(Plane((-a, -b, 0), -co, _line_points(a, b, co)))
+                if fill.valid():
+                    extra.append(fill.tidy())
         for b, specs in self.solids():
+            if convex_airs and any(Convex.box(b.mins, b.maxs).overlaps(ca) for ca in convex_airs):
+                extra.append(Convex.box(b.mins, b.maxs))      # a wall a corridor passes through
+                continue
             fallback = next((s for s in specs.values() if s), ("NULL", 0, 0, 1))
             faces = []
             for n, name in SIDE_NAMES.items():
@@ -439,11 +554,57 @@ class Level:
                 f.u_offset, f.v_offset, f.u_scale, f.v_scale = uo, vo, sc, sc
                 faces.append(f)
             brushes.append(Brush(faces, "level"))
+        if extra:
+            cutters = [r.convex() for r in self.rooms] + [Convex.box(r.mins, r.maxs) for r in
+                                                           [o.room for o in self.openings] + self.extra_air]
+            cutters += convex_airs
+            for piece in carve_all(extra, cutters):
+                brushes.append(self._convex_brush(piece))
         m.add_world(*brushes)
         for f in self.features:
             f.emit(m)
         m.level = self
         return brushes
+
+    def _air_for(self, p):
+        """The Room (or corridor pseudo-room) whose air contains p, for texturing."""
+        for r in self.all_air():
+            if r.contains(p):
+                return r
+        for c in self.corridors:
+            if c.contains(p):
+                return c.as_room
+        return None
+
+    def _convex_brush(self, piece):
+        """A world brush from a convex piece, each face textured by the air it faces."""
+        faces, specs = [], []
+        for pl in piece.planes:
+            poly = piece.face(pl)
+            n = [float(c) for c in pl.n]
+            ln = math.sqrt(sum(c * c for c in n))
+            n = [c / ln for c in n]
+            spec, side = None, "top" if n[2] > 0.7 else "bottom" if n[2] < -0.7 else "wall"
+            if len(poly) >= 3:
+                c = [sum(float(v[k]) for v in poly) / len(poly) for k in range(3)]
+                probes = [c] + [[c[k] + (float(v[k]) - c[k]) * 0.8 for k in range(3)] for v in poly]
+                for q in probes:
+                    air = self._air_for([q[k] + n[k] * 0.5 for k in range(3)])
+                    if air is not None:
+                        spec = _face_spec(air, side)
+                        break
+            specs.append(spec)
+            faces.append((pl, n, side))
+        fallback = next((s for s in specs if s), ("NULL", 0, 0, 1))
+        from .csg import face_points
+        out = []
+        for (pl, n, side), spec in zip(faces, specs):
+            tex, uo, vo, sc = spec or fallback
+            p0, p1, p2 = face_points(piece, pl)
+            axis_aligned = sum(1 for c in n if abs(c) > 1e-9) == 1
+            u, v = world_axes(tuple(n)) if side != "wall" or axis_aligned else face_axes(tuple(n))
+            out.append(Face(p0, p1, p2, tex, u, v, uo, vo, 0.0, sc, sc))
+        return Brush(out, "level (convex)")
 
 
 def _unit(axis, sign=1):
@@ -537,3 +698,161 @@ def _try_merge(c1, c2, axis, lo_name, hi_name):
     mins = list(b1.mins); maxs = list(b1.maxs)
     maxs[axis] = b2.maxs[axis]
     return (AABB(tuple(mins), tuple(maxs)), specs)
+
+
+# ---------------------------------------------------------------- corridors
+
+def _line_points(a, b, c):
+    """Two integer points on the line a*x + b*y = c (a, b, c integers), or rational ones."""
+    from fractions import Fraction as F
+    a, b, c = int(a), int(b), c
+    g = math.gcd(a, b)
+    if isinstance(c, int) or float(c).is_integer():
+        c = int(c)
+        if c % g == 0:
+            x0, y0 = _egcd_point(a, b, c)
+            return ((F(x0), F(y0)), (F(x0 + b // g * 8), F(y0 - a // g * 8)))
+    if a:
+        return ((F(c) / a, F(0)), (F(c - b * 8) / a, F(8)))
+    return ((F(0), F(c) / b), (F(8), F(c - a * 8) / b))
+
+
+def _egcd_point(a, b, c):
+    """An integer solution of a*x + b*y = c (c divisible by gcd(a, b))."""
+    def egcd(x, y):
+        if y == 0:
+            return (x, 1, 0)
+        g, s, t = egcd(y, x % y)
+        return (g, t, s - (x // y) * t)
+    g, s, t = egcd(abs(a), abs(b))
+    s *= 1 if a >= 0 else -1
+    t *= 1 if b >= 0 else -1
+    k = c // g
+    return s * k, t * k
+
+
+def _floor_area(cv, z):
+    pts = [(float(p[0]), float(p[1])) for p in cv.vertices() if float(p[2]) == z]
+    if len(pts) < 3:
+        return 0.0
+    cx = sum(p[0] for p in pts) / len(pts)
+    cy = sum(p[1] for p in pts) / len(pts)
+    pts.sort(key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
+    return abs(sum(pts[i][0] * pts[(i + 1) % len(pts)][1] - pts[(i + 1) % len(pts)][0] * pts[i][1]
+                   for i in range(len(pts)))) / 2
+
+
+class Corridor:
+    """A corridor along a polyline, built from convex prisms (see Level.corridor).
+    Each segment's side lines are integer lines, so segments at 0/45/90 degrees meet
+    at exact points; joints are mitred."""
+
+    def __init__(self, name, path, width, height, z0, wall, material, rooms):
+        self.name, self.path, self.width, self.height = name, [tuple(p) for p in path], width, height
+        self.z0, self.wall, self.material, self.rooms = z0, wall, material, rooms
+        if len(self.path) < 2:
+            raise ValueError(f"corridor {name}: needs at least two points")
+        lines = []
+        for (x0, y0), (x1, y1) in zip(self.path, self.path[1:]):
+            dx, dy = x1 - x0, y1 - y0
+            g = math.gcd(int(dx), int(dy)) or 1
+            dx, dy = dx // g, dy // g
+            nl = (-dy, dx)                                  # left of the direction of travel
+            k = math.hypot(dx, dy)
+            h, w = round(width / 2 * k), round(wall * k)
+            cl = nl[0] * x0 + nl[1] * y0 + h                # left side: nl.p = cl
+            cr = -(nl[0] * x0 + nl[1] * y0) + h             # right side: -nl.p = cr
+            lines.append({"d": (dx, dy), "nl": nl, "left": (nl, cl), "right": ((-nl[0], -nl[1]), cr),
+                          "left_out": (nl, cl + w), "right_out": ((-nl[0], -nl[1]), cr + w),
+                          "from": (x0, y0), "to": (x1, y1)})
+        self.segments = []
+        for i, ln in enumerate(lines):
+            def corner(side, end):
+                other = lines[i - 1] if end == "start" and i > 0 else lines[i + 1] if end == "end" and i + 1 < len(lines) else None
+                if other is None:                           # a square end cap
+                    p = ln["from"] if end == "start" else ln["to"]
+                    cap = (ln["d"], ln["d"][0] * p[0] + ln["d"][1] * p[1])
+                    return line_intersection(ln[side], cap)
+                q = line_intersection(ln[side], other[side])
+                if q is None:
+                    raise ValueError(f"corridor {name}: segments {i} and {i + (1 if end == 'end' else -1)} "
+                                     "are parallel; drop the middle point")
+                return q
+            L0, L1 = corner("left", "start"), corner("left", "end")
+            R0, R1 = corner("right", "start"), corner("right", "end")
+            LO0, LO1 = corner("left_out", "start"), corner("left_out", "end")
+            RO0, RO1 = corner("right_out", "start"), corner("right_out", "end")
+            z0, z1, t = self.z0, self.z0 + height, wall
+            air_poly = [L0, L1, R1, R0]
+            if _area2(air_poly) == 0 or not _convex_poly(air_poly):
+                raise ValueError(f"corridor {name}: segment {i} is too short for its turns")
+            seg = {
+                "air": Convex.prism(air_poly, z0, z1).tidy(),
+                "pieces": [Convex.prism([LO0, LO1, L1, L0], z0, z1), Convex.prism([R0, R1, RO1, RO0], z0, z1),
+                           Convex.prism([LO0, LO1, RO1, RO0], z0 - t, z0), Convex.prism([LO0, LO1, RO1, RO0], z1, z1 + t)],
+                "outer": Convex.prism([LO0, LO1, RO1, RO0], z0 - t, z1 + t),
+                "cut_left": ((-ln["nl"][0], -ln["nl"][1]), -(ln["left_out"][1])),
+                "cut_right": ((ln["nl"][0], ln["nl"][1]), -(ln["right_out"][1])),
+                "side_of": (lambda nl, c: (lambda p: nl[0] * p[0] + nl[1] * p[1] - c))(
+                    ln["nl"], ln["nl"][0] * ln["from"][0] + ln["nl"][1] * ln["from"][1]),
+                "line": ln,
+            }
+            self.segments.append(seg)
+        lo = [min(float(v[k]) for sg in self.segments for v in sg["air"].vertices()) for k in range(3)]
+        hi = [max(float(v[k]) for sg in self.segments for v in sg["air"].vertices()) for k in range(3)]
+        self.as_room = Room(name, AABB(tuple(lo), tuple(hi)), material)
+        self.as_room.contains = lambda p, tol=0.0: self.contains(p, tol)
+
+    def contains(self, p, tol=0.0):
+        return any(s["air"].contains(p, tol) for s in self.segments)
+
+    def shell_pieces(self):
+        return [p for s in self.segments for p in s["pieces"]]
+
+    def cap_corners(self):
+        """The corners of the two open ends (they must lie inside the rooms)."""
+        a, b = self.segments[0]["air"], self.segments[-1]["air"]
+        def near(cv, pt):
+            vs = sorted({(v[0], v[1]) for v in cv.vertices()},
+                        key=lambda v: (float(v[0]) - pt[0]) ** 2 + (float(v[1]) - pt[1]) ** 2)
+            return vs[:2]
+        return near(a, self.path[0]), near(b, self.path[-1])
+
+    def length(self):
+        return sum(math.dist(a, b) for a, b in zip(self.path, self.path[1:]))
+
+    def frame(self, s):
+        """(floor point, direction of travel, left) at fraction s along the centreline."""
+        d = s * self.length()
+        for a, b in zip(self.path, self.path[1:]):
+            L = math.dist(a, b)
+            if d <= L or b == self.path[-1]:
+                t = min(1.0, d / L) if L else 0
+                u = ((b[0] - a[0]) / L, (b[1] - a[1]) / L)
+                return (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, self.z0), u, (-u[1], u[0])
+            d -= L
+
+    def floor_point(self, s, lateral=0.0, above=0):
+        """Floor point at fraction s along the corridor; lateral -1..1 across its width."""
+        (x, y, z), _, left = self.frame(s)
+        o = lateral * (self.width / 2 - 16)
+        return (x + left[0] * o, y + left[1] * o, z + above)
+
+    def checkpoints(self):
+        return [self.floor_point(s)[:2] for s in (0.3, 0.5, 0.7)]
+
+
+def _area2(poly):
+    return sum(poly[i][0] * poly[(i + 1) % len(poly)][1] - poly[(i + 1) % len(poly)][0] * poly[i][1]
+               for i in range(len(poly)))
+
+
+def _convex_poly(poly):
+    signs = set()
+    n = len(poly)
+    for i in range(n):
+        a, b, c = poly[i], poly[(i + 1) % n], poly[(i + 2) % n]
+        cr = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0])
+        if cr:
+            signs.add(cr > 0)
+    return len(signs) <= 1

@@ -205,6 +205,45 @@ def test_blocked_pickup_is_caught():
     assert good and all(good.values()), good
 
 
+def _corridor_level():
+    """a -- a corridor north, 45 degrees north-west, north -- b; room c (no door) is in
+    the way, so its north-east corner gets cut."""
+    m = Map("vcorr")
+    lvl = Level(wall=16)
+    a = lvl.room("a", (0, 0, 0), (512, 96, 128), MAT)
+    lvl.room("b", (96, 432, 0), (416, 640, 144), MAT)
+    c = lvl.room("c", (48, 112, 0), (320, 208, 128), MAT)
+    corr = lvl.corridor("diag", [(400, 48), (400, 176), (240, 336), (240, 500)], width=96, height=112)
+    lvl.build(m)
+    m.add(props.player_start((64, 48, 0)), props.light((256, 48, 100)), props.light((256, 540, 100)),
+          props.light((180, 160, 100)))
+    out = Path(tempfile.mkdtemp()) / "vcorr.map"
+    res = compile_map(m.write(out), profile="fast", steps=("csg", "bsp"))
+    assert res.ok, res.summary()
+    return m, lvl, c, corr, Hulls(res.bsp)
+
+
+def test_diagonal_corridor_is_sealed_and_walkable():
+    from hlmap.verify import progression
+    m, lvl, c, corr, h = _corridor_level()
+    assert c.cuts and "corner cut" in lvl.notes[0]
+    brushes = m.worldspawn.brushes
+    for hull in (0, 1, 3):
+        assert leaks_into_solid(h, lvl.is_air, hull)[0] == [], f"hull {hull} has holes"
+        if hull:
+            assert invisible_walls(h, lvl.is_air, hull, _box_hits(brushes))[1] == 0, f"hull {hull} invisible walls"
+
+    def solid_at(p):
+        return any(all(f.normal[0] * p[0] + f.normal[1] * p[1] + f.normal[2] * p[2] <= f.dist + 0.01
+                       for f in b.faces) for b in brushes)
+    missing, checked, _ = coverage(h, brushes, lvl.is_air, solid_at)
+    assert missing == [] and checked > 50, missing
+    p = progression(h, lvl.checkpoints())
+    # a, b and the corridor are reached; c has no door: reaching it would mean the
+    # corridor broke into it where it cut the corner
+    assert [n for n, _ in p.missing] == ["room c"], p.missing
+
+
 def test_stairs_are_walkable():
     """Level.stairs must leave head room for a 32-wide, 72-tall player all the way down."""
     from hlmap.verify import progression

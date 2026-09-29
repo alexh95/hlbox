@@ -67,10 +67,21 @@ def cmd_build(a):
             o = e.origin
             if o is not None and not e.brushes and e.classname != "info_texlights" and not level.is_inside(o):
                 problems.append(f"{e.classname} at {o} is outside every room (in solid or void)")
+            for br in e.brushes:          # furniture, lights, wall art reaching into a cut-off corner
+                lo, hi = br.bounds()
+                zc = (lo[2] + hi[2]) / 2
+                c = tuple((a_ + b_) / 2 for a_, b_ in zip(lo, hi))
+                r = next((level.in_cut((x, y, zc)) for x in (lo[0] + 1, hi[0] - 1) for y in (lo[1] + 1, hi[1] - 1)
+                          if level.in_cut((x, y, zc))), None)
+                if r is not None:
+                    problems.append(f"{e.classname} {br.comment or ''} at {tuple(round(v) for v in c)} is in the "
+                                    f"cut-off corner of room {r.name} (solid now)")
     if problems:
         print("MAP PROBLEMS:\n  " + "\n  ".join(problems))
         if any("degenerate" in p or "not in any WAD" in p for p in problems):
             sys.exit(1)
+    for note in (getattr(level, "notes", None) or []):
+        print("level:", note)
     d = out_dir(a.map)
     map_path = m.write(d / f"{a.map}.map")
     print(f"wrote {map_path}  ({len(m.worldspawn.brushes)} world brushes, {len(m.entities)} entities)")

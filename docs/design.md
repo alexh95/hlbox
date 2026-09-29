@@ -90,8 +90,24 @@ build/<name>/plan.png   build/<name>/<name>.map  (Valve 220)
 - **Stairs.** `Level.stairs(name, lower, upper, top, down)` connects stacked rooms
   through a slab hole sized for a standing player's head (including their 32-unit
   width), with fitted treads and risers.
-- **Limitation:** rooms are still axis-aligned. There are no slopes, angled walls or
-  multi-level floors; tunnels are the only non-box spaces.
+- **Corridors at any angle.** `Level.corridor(name, path=[(x, y), ...], width, height)`
+  runs a corridor along a polyline from inside one room to inside another.
+  - Each segment's air, walls, floor and ceiling are convex prisms, mitred at the
+    joints. Their side lines are integer lines, so segments at 0, 45 and 90 degrees
+    meet at exact points.
+  - The rooms' walls are carved where it passes through: the box cells it crosses
+    go through the exact convex pass (`hlmap/csg.py`).
+- **Corner cuts.** A room a corridor passes within a wall of (not one it connects)
+  gets its corner cut, parallel to the corridor and one wall away.
+  - The cut corner becomes a solid fill, and `is_air`, `room_at` and `checkpoints`
+    follow the cut.
+  - A cut over `max_cut` of the floor (30%), or one that reaches a doorway, is an
+    error. `build` prints each cut ("storage: corner cut ... 3% of its floor").
+- **Texturing convex pieces:** each face probes a point just in front of it for the
+  air it faces. Floors and ceilings keep world alignment; angled walls get
+  face-aligned axes, so wainscots run unbroken round the bends.
+- **Limitation:** rooms themselves are still boxes (plus cut corners). There are no
+  slopes or ramps; corridors and tunnels are the non-box spaces.
 
 ### 3.3 Entities and props (`hlmap/mapfile.py`, `hlmap/props.py`)
 - **Entities.** `Entity(classname, brushes, kv, **keyvalues)` covers every stock
@@ -223,7 +239,9 @@ against the level's intended air and refuses to install on failure:
   - stairs whose hole is too short (the too-short formula makes the test fail);
   - a power-gated door with a one-shot breaker (a lockout);
   - a route to the breaker with no emergency lights (dark), and the same route lit;
-  - a card on a table behind a pole (the playtest bug), and the same card at the edge.
+  - a card on a table behind a pole (the playtest bug), and the same card at the edge;
+  - a diagonal corridor that cuts a room's corner: sealed in every hull, walkable, and
+    the cut room stays unreachable (the corridor mustn't break into it).
   A clean room must pass. `tests/test_logic.py` checks the logic helpers against the
   simulator without compiling (switch positions through an outage, gates, chaining
   past 16 multi_manager targets, locks needing key and power).
@@ -305,6 +323,12 @@ helpers do, and the verifier runs them:
 ## 4. Geometry roadmap
 
 ### 4.1 Convex geometry core (foundation for everything below)
+**Done:** `hlmap/csg.py`, exact (rational) convex solids with intersection, `subtract`
+into convex fragments, face ordering, redundant-plane removal, and exact .map face
+points. Level corridors and corner cuts use it. A verify test compiles a diagonal
+corridor that cuts a room's corner, with no holes, no invisible walls, every face
+present, and the cut room still closed off. Still to do below: rotation transforms,
+prefabs, and general (sloped) air volumes.
 - **Face polygons ("windings").** Compute each face's polygon by clipping a huge
   starting polygon with all the other planes. This is O(n²) and replaces the
   brute-force vertex search.

@@ -130,6 +130,20 @@ def build():
   the shared wall. Rooms that touch or overlap are an error unless they share a
   `group=` (then they merge into one space). `lvl.air(name, mins, maxs, like=room)` adds
   alcoves and window holes. `doorway(..., sill=40)` makes a window.
+- **Corridors at any angle.** `c = lvl.corridor(name, [(x, y), ...], width=96, height=112,
+  material=...)` runs a corridor along a polyline from inside one room to inside
+  another, carving the walls it passes through.
+  - Keep points on integers and turns at 45 or 90 degrees, so every plane is exact.
+  - Both ends must be deep enough inside their rooms that the square end caps are
+    in room air (`check()` says so otherwise).
+  - `c.floor_point(s, lateral)` and `c.frame(s)` place things along it.
+    `props.ceiling_light(..., angle=)` turns a panel to follow a diagonal.
+  - A room it passes too close to gets its corner cut, parallel to it and one wall
+    away. The corner becomes solid and `build` prints "level: <room>: corner cut...".
+    Move furniture, lights and wall art out of the cut; `build` lists any left there
+    (`lvl.in_cut(p)`).
+  - The pieces are exact convex CSG (`hlmap/csg.py`); `tests/test_verify.py` proves a
+    corridor stays sealed.
 - **Stairs between floors.** `steps, hole = lvl.stairs(name, lower, upper, top=(x, y),
   down="north")` makes a staircase from `upper`'s floor down into `lower`, which must
   sit directly below (`wall` units of slab).

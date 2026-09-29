@@ -55,6 +55,9 @@ playing it:
   Valve 220 texture alignment, including "fit texture to face".
 - `hlmap/level.py` is the room builder. It carves air volumes out of solid shells,
   so rooms and doorways can't leak, and it textures each face by the room it faces.
+  Corridors run at any angle, carved with exact convex CSG (`hlmap/csg.py`). A room
+  in the way gets its corner cut: in the office, a 45° corridor slips past the
+  storage room to a cafeteria.
 - `hlmap/cave.py` builds organic caves. A heightfield of simple rock columns follows a
   path out of a doorway. It's watertight by construction, its collision is verified,
   and its materials can change along the way (rock turning into Xen).

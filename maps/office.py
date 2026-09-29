@@ -2,9 +2,11 @@
 
 Top view (+Y = north), ground floor:
 
-              +--------------------------------+
-              |  conference room               |  table for 8, projector + screen
-              |  (briefing)              [stairs down]
+      cafeteria
+          \\  corridor at 45 degrees (cuts the storage room's corner)
+           \\   +--------------------------------+
+            |  |  conference room               |  table for 8, projector + screen
+            |  |  (briefing)              [stairs down]
     +---------+------[door]------------------+-+--------------+
     | storage |[locked]      hallway          [locked]| records   |  two levels,
     |  (stairs up from basement)       [cave]         | mezzanine |  ladder up
@@ -41,6 +43,8 @@ HALL = Material(floor="FIFTIES_FLR03", wall="FIFTIES_WALL14", ceiling="FIFTIES_C
 STORAGE = Material(floor="C1A1_FLR2B", wall="FIFTIES_WALL12B", ceiling="FIFTIES_CEIL01", ceiling_align="center")
 RECORDS = Material(floor="FIFTIES_FLR02C", wall="FIFTIES_WALL14A", ceiling="FIFTIES_CEIL01", ceiling_align="center")
 BASEMENT = Material(floor="CRETE2_FLR01", wall="CRETE4_WALL01", ceiling="CRETE3_CEIL01")
+CAFETERIA = Material(floor="FIFTIES_FLR5", wall="FIFTIES_W13", ceiling="FIFTIES_CEIL01",
+                     floor_align="min", ceiling_align="center")
 XEN = Material(floor="-0XENO_2WA", wall="-0XENO_2W1", ceiling="-0XENO_2W1")
 
 LIGHT_TEX = "+0~FIFTS_LGHT01"       # office-type rooms
@@ -430,6 +434,7 @@ def build():
     records = lvl.room("records", (656, -176, 0), (1040, 304, 256), RECORDS)
     basement = lvl.room("basement", (0, -96, -176), (448, 352, -16), BASEMENT)
     corridor = lvl.room("basement corridor", (-480, -96, -176), (-16, -16, -16), BASEMENT)
+    cafe = lvl.room("cafeteria", (-592, 320, 0), (-160, 656, 144), CAFETERIA)
 
     conf_door = lvl.doorway(conf, hall, width=64, height=96, center=96)
     west_door = lvl.doorway(hall, storage, width=80, height=96, center=-64)
@@ -438,6 +443,10 @@ def build():
     down_steps, conf_hole = lvl.stairs("conference stairs", basement, conf, top=(408, 48), down="north")
     # comes up at the far (west) end of the storage room, well away from its door
     up_steps, store_hole = lvl.stairs("storage stairs", corridor, storage, top=(-480, -56), down="east")
+    # to the cafeteria: north out of the hall, 45 degrees north-west past the storage
+    # room (whose north-east corner gets cut to make room), then north again
+    walkway = lvl.corridor("cafeteria corridor", [(-88, -64), (-88, 67), (-248, 227), (-248, 400)],
+                           width=96, height=112, material=HALL)
 
     # the cave: a hole in the hall's south wall, a bend into Xen, and a side branch to a
     # radio camp where the records access card lies
@@ -472,7 +481,7 @@ def build():
     for x in (-16, 240, 496):          # hall tiles are centred on the hall
         m.add(props.ceiling_light(x, -64, hall.ceiling, texture=HALL_LIGHT_TEX, name="hall_lights"))
     # outer wall only: +use goes through walls; dead while the power is out
-    m.add(props.switch((-96, -16, 48), "south", grid.group("hall_lights", switched=True), master=grid.live))
+    m.add(props.switch((-96, -112, 48), "north", grid.group("hall_lights", switched=True), master=grid.live))
     for x in (40, 352):
         m.add(props.emergency_light((x, -16, 112), "south"))
     # door plates, a poster and a stock sign
@@ -483,6 +492,7 @@ def build():
           props.sign((-20, -112, 72), "north", texture="SIGN6", w=20, h=25))
 
     conference(m, conf, conf_hole, grid)
+    cafeteria(m, cafe, walkway, grid)
     storage_room(m, storage, store_hole, grid)
     records_room(m, records, grid)
     basement_rooms(m, basement, grid)
@@ -548,6 +558,13 @@ def build():
         "poster": (150, -40, 66, 0, 270),
         "records_sign": (560, -64, 72, -12, 0),
         "basement_stencil": (300, 190, -110, 0, 90),
+        # the diagonal corridor and the cafeteria
+        "corridor": (-88, -100, 64, 0, 90),
+        "corridor_diag": (-88, 10, 64, 0, 135),
+        "corridor_end": (-230, 250, 64, 0, 110),
+        "cafeteria": (-200, 350, 76, 6, 125),
+        "cafeteria_counter": (-380, 470, 64, 2, 90),
+        "storage_corner": (-330, 10, 72, 0, 50),
     }
     return m
 
@@ -604,9 +621,10 @@ def conference(m, conf, hole, grid):
 def storage_room(m, storage, hole, grid):
     x0, y0, z0 = storage.mins
     x1, y1, z1 = storage.maxs
-    for x in (-496, -240):                 # tile centres (room centred at -368, -16)
-        for y in (-96, 64):
-            m.add(props.ceiling_light(x, y, z1, name="storage_lights"))
+    # tile centres (room centred at -368, -16); the north-east one moved clear of the
+    # corner the cafeteria corridor cuts off
+    for x, y in ((-496, -96), (-496, 64), (-240, -96), (-304, 64)):
+        m.add(props.ceiling_light(x, y, z1, name="storage_lights"))
     grid.group("storage_lights")
     m.add(props.sign((-300, y0, 72), "north", texture="SIGN17", w=32, h=40))   # days since last injury
     # stair hole railings (the stairs arrive at the west end, which stays open)
@@ -620,15 +638,75 @@ def storage_room(m, storage, hole, grid):
     for x in (-520, -456, -392):
         m.add(props.detail(props.front_box(x, y1 - 12, z0, 60, 24, 96, "south", "CARDBOX1",
                                            sides="FIFTIES_DSK5B", repeat=(2, 3))))
-    # crate stacks: north-east corner and along the south wall; the middle stays open
-    for x, y, z, size, tex in [(-232, 110, 0, 64, "CRATE02"), (-232, 110, 64, 48, "BCRATE04"),
-                               (-296, 114, 0, 56, "CRATE02B"), (-232, 46, 0, 48, "CRATE19"),
+    # crate stacks: by the cut corner and along the south wall; the middle stays open
+    for x, y, z, size, tex in [(-296, 114, 0, 56, "CRATE02B"), (-296, 114, 56, 40, "BCRATE04"),
+                               (-232, 46, 0, 48, "CRATE19"),
                                (-520, -140, 0, 64, "BCRATE09A"), (-450, -146, 0, 48, "CRATE25"),
                                (-386, -148, 0, 40, "CRATE02"), (-386, -148, 40, 32, "CRATE19")]:
         m.add(props.crate(x, y, z, size=size, texture=tex))
     for x, y, tex in [(-280, -150, "BARREL2"), (-246, -154, "BARREL3")]:
         m.add(props.barrel(x, y, z0, texture=tex))
-    m.add(props.wall_art((x1, 90, 72), "west", "+0FUSEBOX", 24, 48))
+    m.add(props.wall_art((x1, 20, 72), "west", "+0FUSEBOX", 24, 48))
+
+
+def cafeteria(m, cafe, walkway, grid):
+    """The cafeteria at the end of the diagonal corridor."""
+    x0, y0, z0 = cafe.mins
+    x1, y1, z1 = cafe.maxs
+    # lights on the ceiling tile grid (centred on the room) and a switch by the way in
+    for x in (-504, -248):
+        for y in (408, 568):
+            m.add(props.ceiling_light(x, y, z1, name="cafeteria_lights"))
+    m.add(props.switch((-340, y0, 48), "north", grid.group("cafeteria_lights", switched=True), master=grid.live))
+    # the corridor's lights follow it round the bend
+    ceiling = walkway.z0 + walkway.height
+    for s_ in (0.2, 0.5, 0.82):
+        (x, y, _), d, _ = walkway.frame(s_)
+        angle = round(math.degrees(math.atan2(d[1], d[0])))
+        m.add(props.ceiling_light(round(x), round(y), ceiling, texture=HALL_LIGHT_TEX, name="corridor_lights",
+                                  angle=0 if angle % 180 == 90 else angle))
+    grid.group("corridor_lights")
+    m.add(props.sign((-136, 20, 100), "east", "CAFETERIA", 48, 12, "steel"),
+          props.sign((-296, 290, 100), "east", texture="SIGNC1A2_4", w=48, h=24))
+    # serving counter with a menu board over it
+    counter = props.front_box(-400, y1 - 16, z0, 224, 32, 40, "south", "STEEL", sides="STEEL", top="STEEL")
+    m.add(props.detail(counter))
+    m.add(props.barrel(-490, y1 - 18, z0 + 40, texture="STEEL", top="STEEL", r=7, h=22),     # coffee urn
+          props.detail(props.front_box(-310, y1 - 18, z0 + 40, 20, 16, 14, "south", "C1A1_GAD4")),   # till
+          props.flat_prop((-420, y1 - 18, z0 + 40), 28, 20, "PAPER4", thick=4))                # trays
+    m.add_texture("MENUBOARD", menu_texture())
+    m.add(props.sign((-400, y1, 100), "south", image=menu_texture(), w=144, h=72, frame="FIFTIES_DSK1"))
+    # tables for four, clear of the way in (x -296..-200)
+    for x in (-512, -392):
+        for y in (432, 540):
+            m.add(props.table(x, y, z0, width=96, depth=48, height=30, top="FIFTIES_DR1"))
+            for dx in (-24, 24):
+                m.add(props.chair(x + dx, y - 40, z0, facing="north"), props.chair(x + dx, y + 40, z0, facing="south"))
+    m.add(props.vending_machine(x1 - 16, 560, z0, "west"), props.vending_machine(x1 - 16, 500, z0, "west"),
+          props.barrel(x1 - 24, y0 + 40, z0, texture="STEEL", top="BARRELTOP", r=12, h=34),   # bin
+          props.sign((x0, 480, 72), "east", texture="SIGN5", w=24, h=24))       # no smoking
+
+
+def menu_texture():
+    """Today's menu, in chalk."""
+    img = Image.new("RGB", (288, 144), (30, 52, 40))
+    d = ImageDraw.Draw(img)
+    chalk, dim = (236, 236, 226), (170, 186, 170)
+    d.text((144, 18), "TODAY'S MENU", fill=YELLOW, font=font(22), anchor="mm")
+    items = [("mystery loaf", "2.50"), ("soup of the day", "ask"), ("Xen fruit salad", "under review"),
+             ("coffee", "lukewarm")]
+    for i, (dish, price) in enumerate(items):
+        y = 46 + i * 20
+        d.text((14, y), dish, fill=chalk, font=font(14, bold=False), anchor="lm")
+        d.text((274, y), price, fill=chalk, font=font(14), anchor="rm")
+        w = d.textlength(dish, font=font(14, bold=False))
+        for x in range(int(24 + w), int(274 - d.textlength(price, font=font(14)) - 8), 6):
+            d.point((x, y + 4), fill=dim)
+    d.text((144, 130), "please return your tray  \u00b7  no samples in the fridge", fill=dim,
+           font=font(10, bold=False), anchor="mm")
+    b = boxworth().resize((40, 40), Image.NEAREST)
+    img.paste(b, (238, 0), b)
+    return img
 
 
 def records_room(m, r, grid):

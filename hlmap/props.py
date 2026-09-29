@@ -160,16 +160,26 @@ def door_sliding(opening, texture="LAB1_DOOR2A", edge="LAB1_DOOR2B", thickness=8
 # ---------------------------------------------------------------- lights
 
 def ceiling_light(x, y, ceiling_z, width=64, depth=80, texture="+0~FIFTS_LGHT01",
-                  trim="FIFTIES_DSK5B", drop=2, name=None):
+                  trim="FIFTIES_DSK5B", drop=2, name=None, angle=0):
     """Flush fluorescent panel on the ceiling centered at (x, y), emitting via its texture.
     Remember to register the texture: m.texlight(texture, (255, 250, 235), 4000).
 
     name: make it switchable. Returns [func_wall panel, named light]; firing `name`
     (e.g. from switch()) toggles the light style AND flips the panel to its +A (off)
     texture frame. Panels sharing a name switch together. Use a '+0' texture."""
-    b = box((x - width / 2, y - depth / 2, ceiling_z - drop), (x + width / 2, y + depth / 2, ceiling_z),
-            trim, comment="ceiling light")
-    b.fit("bottom", texture)
+    if angle:     # turned (degrees; the panel's depth runs along `angle`), e.g. for a diagonal corridor
+        from .geometry import prism
+        t = math.radians(angle)
+        v = (math.cos(t), math.sin(t))                 # along the depth
+        u = (v[1], -v[0])                              # across (the width)
+        pts = [(round(x + u[0] * a + v[0] * c, 1), round(y + u[1] * a + v[1] * c, 1))
+               for a, c in ((-width / 2, -depth / 2), (width / 2, -depth / 2), (width / 2, depth / 2), (-width / 2, depth / 2))]
+        b = prism(pts, ceiling_z - drop, ceiling_z, trim, comment="ceiling light")
+        b.fit("bottom", texture, u_axis=(u[0], u[1], 0), v_axis=(-v[0], -v[1], 0))
+    else:
+        b = box((x - width / 2, y - depth / 2, ceiling_z - drop), (x + width / 2, y + depth / 2, ceiling_z),
+                trim, comment="ceiling light")
+        b.fit("bottom", texture)
     if not name:
         return detail(b)
     # style -3 = "piggyback texlight": the compiler gives this entity's texture light the
