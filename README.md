@@ -6,7 +6,7 @@ with [SDHLT](https://github.com/seedee/SDHLT), installs it into Half-Life and ca
 in-engine screenshots to check the result. It was built so Claude Code can make maps
 end to end, but it works fine by hand too.
 
-![conference room with a projector showing custom CCC slides, in game](docs/office.jpg)
+![a scientist presenting generated slides in the conference room, in game](docs/office.jpg)
 ![generated cave turning into Xen, in game](docs/cave.jpg)
 
 ```python
@@ -58,14 +58,27 @@ playing it:
 - `hlmap/cave.py` builds organic caves. A heightfield of simple rock columns follows a
   path out of a doorway. It's watertight by construction, its collision is verified,
   and its materials can change along the way (rock turning into Xen).
-- `hlmap/verify.py` checks the compiled map against the intended design: collision
-  holes, invisible walls, missing faces, and on-foot walkability with keys and locked
-  doors (can every area be reached, can you get locked out). `build` won't install a
-  map that fails.
+- `hlmap/verify.py` checks the compiled map against the intended design:
+  - collision holes, invisible walls and missing faces;
+  - on-foot walkability, playing every order of pickups and buttons through a
+    simulation of the entity logic. Can every area be reached? Can any order lock
+    you out?
+  - after every step, whether the way on is lit enough to see (from the compiled
+    lightmaps).
+  `build` won't install a map that fails.
+- `hlmap/scene.py` and `hlmap/voice.py` stage talks. In the office, a scientist
+  presents a 12-slide briefing with voice lines synthesized at build time, subtitles
+  and gestures, timed to the real clip lengths; a power cut stops him mid-sentence.
+- `hlmap/logic.py` builds map state out of stock entities: flags (global state),
+  conditional relays, timed sequences, and building power. In the office, taking the
+  access card trips the breaker: the lights die, red emergency lamps pulse, the
+  projector goes dark, and the records door waits for the basement breaker.
 - `hlmap/props.py` has furniture (tables, chairs, crates, radios, filing cabinets,
   bookshelves, a vending machine, barrels, pipes, wall art), stairs railings and
   ladders, doors with locks and key pickups, light switches and switchable ceiling
-  panels, a projector with toggleable slides, Xen plants and crystals.
+  panels, a projector with toggleable slides, emergency lamps, a breaker lever, Xen
+  plants and crystals. There are also Black Mesa style nameplates, posters, stock
+  signs and decals, and stencilled words made from stock decal letters.
 - `hlmap/wadwrite.py` and `hlmap/art.py` add non-standard textures from any image or
   a pixel-art SVG, embedded in the compiled map.
 - `hlmap/compile.py` runs CSG/BSP/VIS/RAD with fast, normal and final profiles, and
@@ -74,7 +87,9 @@ playing it:
 - `hlmap/game.py` installs maps into `valve/maps`. It takes screenshots by loading
   temporary copies of the map with a `trigger_camera` at each camera pose. Each camera
   can first trigger entities: flip light switches, unlock a door, open all doors. Your
-  Half-Life video settings are restored afterwards.
+  Half-Life video settings are restored afterwards. `playtest` drives the player
+  with scripted input and reads back what fired. `playtest --pickups` walks at every
+  item to confirm the game picks it up.
 - `hlmap/wad.py` reads WAD3 textures and makes contact sheets.
 - `hlmap/preview.py` draws orthographic plan and section cutaways.
 - `CLAUDE.md` has the workflow, scale numbers, texture and lighting notes, and

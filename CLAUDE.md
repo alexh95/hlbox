@@ -6,7 +6,8 @@ screenshots. There is no GUI editor in the loop.
 
 ## Layout
 
-- `hlmap/` is the library. It covers the geometry, the .map writer, the room builder, props, compile, preview and game integration.
+- `hlmap/` is the library. It covers the geometry, the .map writer, the room builder, props, map logic
+  (`logic.py`) and its simulator (`sim.py`), compile, preview, verification and game integration.
 - `maps/<name>.py` holds one map per file. Each defines `build() -> Map` and optionally `CAMERAS`.
 - `build/<name>/` holds the generated `.map`, `.bsp`, logs, `plan.png` and `shots/*.png`. It's disposable.
 - `tools/sdhlt/` has the SDHLT v1.3.0 compilers (`tools/Win64/*.exe`), `sdhlt.wad` (tool textures) and `sdhlt.fgd`.
@@ -29,14 +30,20 @@ python -m hlmap shots <map> [--only NAME]... [--cam "x y z pitch yaw"]... [--fir
 python -m hlmap play <map>             # launch HL into the map for the user
 python -m hlmap tex <pattern> [--sheet]   # find textures; --sheet renders build/sheets/<pattern>.png
 python -m hlmap verify <map>           # collision/visibility checks (build runs this too)
+python -m hlmap playtest <map> --pickups   # in the real game: walk straight at every item, is it picked up?
+python -m hlmap playtest <map> --at "x y feet_z yaw" [--fire NAME] --script "+forward; 60; -forward; 100"
+                                       # scripted play from a start; prints what fired, saves a snapshot
 python -m hlmap info <map>             # BSP stats + entity lump
-python tests/test_verify.py            # the verifier must catch holes, invisible walls, missing faces
+python tests/test_verify.py            # the verifier must catch holes, invisible walls, missing faces,
+                                       # lockouts and dark routes
+python tests/test_logic.py             # logic helpers behave as intended (simulated, no compile)
+python tests/test_office.py            # the office's story: briefing, power cut, welcome back (simulated)
 ```
 
 The verification loop after every change:
 1. `build`. Read the compile summary. Any ERROR or LEAK means the map is broken. The
    budget line shows the share of each engine limit used; it warns at 70%. Then
-   `verify` runs, and a failure blocks the install. It checks four things:
+   `verify` runs, and a failure blocks the install. It checks:
    - **Holes:** empty space in any collision tree (sight/bullets, standing, crouching)
      that reaches into intended solid. That means walk-through walls or see-through
      gaps.
@@ -44,10 +51,25 @@ The verification loop after every change:
    - **Walkability and progression:** every room, cave stretch and `m.checkpoints`
      entry must be reachable ON FOOT: steps of at most 18, jumps of at most 45, falls
      under 600, ladders.
-     - Locked doors stay shut until a reachable pickup or button fires their key, and
-       the walk repeats as locks open.
-     - "locks never opened" plus unreachable rooms means you can get locked out
-       (a key behind its own door).
+     - Every progress-relevant pickup, button and trigger volume is tried in every
+       order. Its effects are simulated through the entity logic (`hlmap/sim.py`:
+       relays, multi_managers, locks, global state, gates, lights). Doors block while
+       locked. The log prints the shortest line of play, with what each step changes.
+     - "locks never opened" plus unreachable rooms means a key behind its own door.
+   - **Lockout:** no order of play may leave an area unreachable for good. For
+     example, a one-shot breaker used before the power fails.
+   - **Darkness:** after every step, the way to the next objective must be lit.
+     There's no flashlight without the HEV suit. The check uses the compiled
+     lightmaps with the light styles as the simulation left them. A floor under 24
+     is dark, and a lit spot helps within 64 units. It reports the units walked
+     unable to see, and more than 192 fails.
+   - **Decals:** every infodecal sits on a surface (the game only looks 5 units
+     out).
+   - **Pickups:** each item is approached straight on, as a player who spots it walks
+     at it. The walk starts from open ground 72-104 units out in each compass
+     direction, with 1-unit steps, 18-unit step-ups and no sliding. If half or more of
+     the approaches stop short, that fails for items with a target (keys) and warns
+     for the rest. `playtest --pickups` repeats the same walks in the game.
    - **Coverage:** every visible face exists in the BSP.
    A clean compile does NOT mean clean collision. The compiler's "ambiguous leafnode"
    warnings once hid walk-through cave walls, and only `verify` (or a playtest) shows
@@ -71,7 +93,9 @@ Cameras are best defined in `build()` as `m.cameras = {"name": (x, y, z, pitch, 
 so they can use computed positions such as `cave.camera(0.4)`. `fire` is a list of
 targetnames to toggle first, in order and 0.3 s apart, like pressing a switch.
 `"@doors"` opens every door and keeps it open, e.g. `["office_lights"]` or
-`["storage_lock_key", "@doors"]`. A locked door stays shut under `@doors`, which
+`["storage_lock_key", "@doors"]`. An entry `("name", seconds)` fires at that time
+instead, which lets a sequence finish before the next step (the snapshot is taken
+about 3 s in). A locked door stays shut under `@doors`, which
 tests the lock. Triggered two-way doors swing in an arbitrary direction; real players
 push them away from themselves. If a fired entity seems to do nothing, rerun with
 `--console "developer 2" --log`. The log then shows "Found: <class>, firing (<name>)"
@@ -172,6 +196,14 @@ def build():
 - **Pickups as keys.** `props.pickup("item_security", pos, fires=["records_lock_key"],
   message=...)`. Items fire their target when picked up and drop onto the surface
   below `pos` at map start.
+  - You pick an item up by touching its 32x32x16 box. A player can't get closer than
+    16 units to a table edge, so an item more than about 12 in from the edge is hard
+    to get, and one 16+ in can't be picked up from that side at all. Put items at the
+    front edge.
+  - Keep poles, lamps and props out of the way in. A pole beside the radio camp's
+    table stopped players walking straight at the card 8 units short.
+  - A medkit is only taken when the player is hurt, and a battery only with the
+    suit.
   - The item models are tiny, so show a stand-in: `props.flat_prop(pos, w, d, tex,
     name="card_prop")`, then `pickup(..., hide=["card_prop"], invisible=True)`. The
     prop disappears when the item is taken (via a trigger_relay `killtarget`).
@@ -182,13 +214,98 @@ def build():
 - **Locks.** `m.add(props.lock("storage_lock", door.center))` then
   `door_rotating(..., master="storage_lock")`. The door rattles (locked_sound 12) and
   won't open until something fires `storage_lock_key`. The lock is a multisource plus a
-  trigger_relay; a multisource with no inputs counts as unlocked.
+  fire-once trigger_relay; a multisource with no inputs counts as unlocked.
+  `props.lock(..., globalstate=grid.flag.state)` also needs that state (e.g. power) on.
 - **Switchable lights.** `ceiling_light(..., name="office_lights")` becomes a func_wall
   panel with `style -3` (a "piggyback" texture light that takes the style of the real
   light with the same name) plus that named light. `props.switch(pos_on_wall,
-  facing, "office_lights")` is a toggle func_button with a click sound. Firing the name
+  facing, "office_lights")` is a func_button with a click sound; each press toggles. Firing the name
   turns the room dark and flips the panel to its `+A` (off) frame.
   `zhlt_usestyle` alone does NOT switch texture lights.
+- **Map state, power, conditions (`hlmap.logic`).** GoldSrc has no variables or ifs.
+  These build them from stock entities, and `verify` simulates them:
+  - `Flag(name)` is a true/false global state (env_global). Fire `.on`, `.off` or
+    `.toggle`. Anything with a `master` can read it via `master=flag.is_on` or
+    `flag.is_off`, and `props.lock(..., globalstate=flag.state)` needs it too.
+  - `gate(name, target, master)` passes a fire only while the master is on.
+    trigger_relay and multi_manager ignore masters, so this is the "if".
+    `when(name, target, [m1, m2, ...])` chains gates, so all the masters must be on
+    (AND), e.g. "power restored AND briefing given AND not talking".
+  - `sequence(name, [(target, delay), ...])` is a multi_manager. Repeats are allowed,
+    and more than 16 steps are chained (the engine's limit).
+  - `Circuit("power")` is building power:
+    - `group(lights, switched=True)` puts a named light group on the circuit and
+      returns the name its switch fires. Use `props.switch(..., master=grid.live)` so
+      switches are dead during an outage.
+    - `emergency(lights)` adds named lights that start dark and run while the power
+      is out.
+    - `on_fail`/`on_restore` add effects.
+    - Fire `grid.fail` (e.g. from a pickup) and `grid.restore` (e.g. a breaker
+      `props.lever(..., grid.restore, master=grid.dead)`).
+    - Switched-off rooms stay off through a failure and restore.
+  - Everything the power touches must be named: ceiling panels via
+    `ceiling_light(..., name=)`, bulbs via `light(..., targetname=)`. A named light
+    gets its own style from the compiler, so give flicker as
+    `pattern=logic.STYLE_FLUORESCENT`, not `style=10`.
+  - `props.emergency_light(pos, facing[, stand=floor_z])` is a red lamp that starts
+    dark (its func_wall shows the `+A` frame) and pulses when fired.
+  - Hide or show things with `env_render` (renderamt only: `spawnflags=13`) on a named
+    brush entity. The projector beam is `projector(..., name=)`.
+  - `props.hud_message` shows `game_text` on screen, and `props.sound_effect` plays
+    an `ambient_generic` once.
+- **Talks and voice lines (`hlmap.scene.Talk`, `hlmap.voice`).**
+  - `talk = scene.Talk(m, "talk", head=(x, y, z), actor="presenter")`, then
+    `talk.line(subtitle, say=spoken_if_different, gesture="converse1", fire=[...])`
+    for each line, and optionally `talk.interrupt(...)`. Add it with
+    `m.add(talk.entities())` and start it by firing `talk.start`, e.g. from
+    `props.trigger(mins, maxs, talk.start, master=...)`.
+  - Each line is synthesized at build time with Windows' voices (`david`, `zira`;
+    `rate` -10..10). Clips are cached in `build/<map>/voice/` by their text, so only
+    changed lines are redone.
+  - Each line plays from an ambient_generic at `head`, with a game_text subtitle
+    (channel 4, wrapped) for as long as it lasts. `fire` cues and the actor's
+    `gesture` start with it, and the next line follows after `gap`. The timeline
+    comes from the real clip lengths (`talk.duration`).
+  - `talk.abort` (only while running) stops it and says the interruption.
+    `talk.on_start` targets fire as it starts, `talk.on_end` on finish or abort.
+    `talk.running` is a Flag. Set these before `talk.entities()`.
+  - Story state: use Flags ("briefing given", "power restored") and one room-wide
+    `trigger_multiple` feeding `when(...)` branches. That's how the office picks
+    between the briefing and the two welcome-backs. Test such branches with the
+    simulator (tests/test_office.py): `World.touch(trigger)` respects its master,
+    and `until=` stops mid-sequence.
+  - Spell names out for the voice: `say="H L box"`.
+  - Lips don't move. Stock Half-Life only lip-syncs lines from its sentences.txt,
+    which a map can't extend, so gestures (scripted_sequence animations) carry the
+    performance.
+  - Gag NPCs that share a talk (`spawnflags` 2, no stock chatter) and make
+    scientists pre-disaster (256, they won't follow). Gesture names come from the
+    model; for scientists, `talkleft`, `converse1/2`, `pondering`, `wave`, `yes`,
+    `no`, `checktie`, `eye_wipe`, `quicklook` and `startle` work.
+- **Custom sounds.** `m.add_sound("hlbox/<map>/name.wav", wav_path)` ships any PCM
+  mono WAV (8/16-bit; 11, 22 or 44 kHz; `check()` validates it). `build` installs it
+  to `valve/sound/...` and writes `maps/<map>.res`. All of it is tracked in the
+  manifest, and files the map no longer uses are removed. Sounds can't go inside
+  the BSP the way textures can.
+- **Slideshows.** `props.slideshow("slides", lo, hi, facing, [texture, ...])` gives
+  a screen with any number of slides.
+  - Fire `slides_next` to advance (it wraps), or `slides_step{k}` to go from slide k
+    to k+1.
+  - `props.slideshow_front(lo, hi, facing)` is the plane to aim a projector or a
+    cover at.
+  - `art.deck_slide(title, n, total)`, `art.bullets` and `art.waveform` draw slides
+    in one style.
+- **Signs and decals.**
+  - `props.sign(pos, facing, "RECORDS\nAUTHORIZED PERSONNEL", w, h, style)` draws a
+    riveted Black Mesa plate (`art.plate`: steel, red, brass, warning, white). The
+    texture travels with the entity, so there's no `add_texture` call.
+  - `props.sign(..., image=img)` makes a poster, and `props.sign(..., texture="SIGN74")`
+    uses a stock sign. Look at `python -m hlmap tex SIGN --sheet` first; there are
+    warnings, restrooms and arrows.
+  - `props.decal("{OIL1", pos)` places a stock decal (decals.wad) within 5 units of
+    a surface. With `name=`, it appears only when fired (e.g. a scorch mark).
+  - `props.stencil("BASEMENT", pos, facing)` spells words from stock decal letters
+    (yellow). The only 16-unit digits are black.
 - **Where switches go.** Half-Life's `+use` takes anything within 64 units of the
   player that they're facing, and walls don't block it. Never put a switch on a wall
   shared with another room. Keep usable things at least 128 apart. `build` warns about
@@ -263,6 +380,23 @@ def build():
 - A lightmap cell is 16 units, so a door jamb inside a 16-unit wall picks up a little
   light from the other side. That's normal Half-Life behaviour.
 - `+use` reaches through walls (64 units, no line-of-sight test); see "Where switches go".
+- A toggle-mode func_button (spawnflags 32) skips its master check on every second
+  press. `props.switch` is non-toggle by default; keep it that way with a master.
+- A multisource input toggles on EVERY fire, so a key fired twice would relock.
+  `props.lock` keys fire once. A trigger_relay without `triggerstate` sends "off".
+- Rendermode 2 (texture) brush entities render fullbright, ignoring their lightmap.
+  Use rendermode 4 for something that should look lit when shown.
+- A func_wall keyvalue `frame 1` starts it on its `+A` texture.
+- The first map of a Half-Life session spawns before `skill.cfg` has been read (its
+  settings only exist once a server runs). Every NPC then gets 0 health ("GetSkillCVar
+  Got a zero" in the console) and gets stuck after its first scripted_sequence;
+  healthkits give 0 too. `play`, `shots` and `playtest` load the map once, run
+  `exec skill.cfg`, then load it again. Loading from the menu or a second `map` is
+  fine.
+- A scripted_sequence on an NPC that's busy with another one waits and retries every
+  second. Keep gestures shorter than the lines they go with.
+- In a `game_text` message, a literal `\n` is a line break (the engine turns it into
+  one). Lines aren't wrapped for you, and scene.Talk wraps them at 64 characters.
 - Collision is only trusted after `verify` passes. If you change a geometry
   generator, run `python tests/test_verify.py` and add a verify-based test for it.
 - A func_door_rotating needs an ORIGIN brush at the hinge (props.door_rotating adds one).

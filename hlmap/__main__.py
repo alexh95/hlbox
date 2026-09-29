@@ -87,7 +87,9 @@ def cmd_build(a):
         sys.exit("verify failed: not installing (use --no-verify to override)")
     if not a.no_install:
         from . import game
-        print("installed:", game.install(res.bsp, a.map))
+        files = m.content_files(d)
+        print("installed:", str(game.install(res.bsp, a.map, files=files))
+              + (f" (+{len(files)} files: sounds, {a.map}.res)" if files else ""))
     if a.shots:
         a.cam, a.fire, a.only, a.console, a.log = None, None, None, None, False
         cmd_shots(a)
@@ -145,9 +147,61 @@ def cmd_shots(a):
         print(f"WARNING: expected {len(cams)} screenshots, got {len(pngs)}")
 
 
+def cmd_playtest(a):
+    """Play the map in the real game from a scripted start (see game.playtest), or with
+    --pickups walk straight at every item from the directions verify uses and check the
+    game picks it up."""
+    from . import game
+    bsp = config.BUILD_DIR / a.map / f"{a.map}.bsp"
+    if not bsp.exists():
+        sys.exit(f"{bsp} not found; run build first")
+    d = out_dir(a.map) / "playtest"
+    if a.pickups:
+        from .verify import Hulls, Walker, _placed, item_rest, pickup_approaches
+        h = Hulls(bsp)
+        ents = h.entities
+        w = Walker(h, [_placed(h.models(), e) for e in ents if e.get("classname") == "func_ladder"])
+        start = next(e for e in ents if e.get("classname") == "info_player_start")
+        comp = w.flood([w.settle(tuple(float(c) for c in start["origin"].split()))])   # doors open
+        tests, expect = [], {}
+        for e in ents:
+            if e.get("classname", "").startswith(("item_", "weapon_", "ammo_")) and e.get("origin"):
+                o = tuple(float(c) for c in e["origin"].split())
+                for sector, p, touched, _ in pickup_approaches(h, comp, item_rest(h, o)):
+                    label = f"{e['classname']} at {tuple(round(c) for c in o)} from {sector}"
+                    tests.append((label, (p[0], p[1], p[2] - 36), o))
+                    expect[label] = touched
+        if not tests:
+            sys.exit("no items with open ground around them")
+        got, log = game.playtest_pickups(bsp, tests, d)
+        (d / "console.log").write_text(log, encoding="utf-8")
+        agree = 0
+        for label, picked in got.items():
+            same = picked == expect[label]
+            agree += same
+            print(f"{'ok  ' if same else 'DIFF'} {label}: game {'picked it up' if picked else 'did NOT pick it up'}"
+                  f"{'' if same else ' (verify expected the opposite)'}")
+        print(f"{agree} of {len(got)} approaches agree with verify's model")
+        return
+    if not a.at:
+        sys.exit('pass --pickups, or --at "x y feet_z yaw" with --do steps')
+    start = tuple(float(c) for c in a.at.split())
+    steps = list(a.do or []) + [x.strip() for x in (a.script or "").split(";") if x.strip()]
+    script = [int(s) if s.isdigit() else s for s in steps]
+    pngs, log = game.playtest(bsp, start, script, d, fire=a.fire or ())
+    (d / "console.log").write_text(log, encoding="utf-8")
+    after = log[log.find("HLMAP_PLAY_START"):] if "HLMAP_PLAY_START" in log else ""
+    for line in after.splitlines():
+        if line.startswith(("Firing:", "Found:")) or "error" in line.lower():
+            print("  console:", line)
+    for p in pngs:
+        print(f"shot {p}")
+
+
 def run_verify(m, bsp_path, coverage_check=True):
     """Collision/visibility checks of a compiled BSP. Returns True if everything passed."""
-    from .verify import HULL_NAMES, Hulls, coverage, invisible_walls, leaks_into_solid, progression
+    from .verify import (DARK_LIMIT, HULL_NAMES, FloorLight, Hulls, coverage, invisible_walls, item_rest,
+                         leaks_into_solid, pickup_approaches, progression)
     level = getattr(m, "level", None)
     if level is None:
         print("verify: skipped (map has no Level to compare against)")
@@ -214,20 +268,83 @@ def run_verify(m, bsp_path, coverage_check=True):
             print(f"verify ok   hull {hull} ({HULL_NAMES[hull]}): no invisible walls")
     checkpoints = level.checkpoints() + [(name, [(p[0], p[1], p[2] + 37)])
                                          for name, p in getattr(m, "checkpoints", [])]
-    missing, log, never, reached = progression(h, checkpoints)
-    for line in log:
-        print(f"verify      progression: {line}")
-    if missing:
+    light = FloorLight(h.bsp) if h.bsp.lumps["lighting"] else None
+    prog = progression(h, checkpoints, light=light)
+    for i, line in enumerate(prog.log, 1):
+        print(f"verify      progression {i}. {line}")
+    for wmsg in prog.warnings:
+        print(f"verify WARN logic: {wmsg}")
+    if prog.missing:
         ok = False
-        print(f"verify FAIL walkability: {len(missing)} places a player can't get to on foot "
+        print(f"verify FAIL walkability: {len(prog.missing)} places a player can't get to on foot "
               f"(steps <= 18, jumps <= 45, ladders, locked doors):")
-        for name, pts in missing[:10]:
+        for name, pts in prog.missing[:10]:
             print(f"    {name} near {tuple(round(c) for c in pts[0])}")
-        if never:
-            print(f"    locks never opened: {', '.join(never)}")
+        if prog.never:
+            print(f"    locks never opened: {', '.join(prog.never)}")
     else:
         print(f"verify ok   walkability: all {len(checkpoints)} checkpoints reachable on foot "
-              f"({len(reached)} positions{', locks opened: ' + str(len(log)) if log else ''})")
+              f"({len(prog.reached)} positions, {prog.states} states of play"
+              f"{', truncated' if prog.truncated else ''})")
+    if prog.softlocks:
+        ok = False
+        print(f"verify FAIL lockout: {len(prog.softlocks)} lines of play leave areas unreachable for good, e.g.:")
+        for path, lost in prog.softlocks[:3]:
+            print(f"    after: {' / '.join(path) or '(start)'}")
+            print(f"      lost: {', '.join(lost)}")
+    elif len(prog.log) > 0:
+        print(f"verify ok   lockout: no order of play locks the player out ({prog.states} states)")
+    if light is not None and prog.darkness:
+        worst = max(prog.darkness, key=lambda d: d[2])
+        dark = [d for d in prog.darkness if d[2] > DARK_LIMIT]
+        if dark:
+            ok = False
+            print(f"verify FAIL darkness: the way forward crosses more than {DARK_LIMIT} units the player "
+                  f"can't see in (no flashlight without the HEV suit):")
+            for path, goal, cost in dark[:3]:
+                print(f"    after: {' / '.join(path) or '(start)'}")
+                print(f"      to {goal}: {cost} units in the dark")
+        else:
+            print(f"verify ok   darkness: every way forward is lit (worst {worst[2]} units in the dark, "
+                  f"after {len(worst[0])} step{'s' if len(worst[0]) != 1 else ''}, to {worst[1].split(' -> ')[0]})")
+    items = [e for e in h.entities if e.get("classname", "").startswith(("item_", "weapon_", "ammo_"))
+             and e.get("origin")]
+    for e in items:
+        # walk straight at it from the open ground around it, as a player who spots it does
+        rest = item_rest(h, tuple(float(c) for c in e["origin"].split()))
+        tries = pickup_approaches(h, prog.reached, rest)
+        good = [t for t in tries if t[2]]
+        bad = [t for t in tries if not t[2]]
+        what = f"{e['classname']} at {tuple(round(c) for c in rest)}" + (f" -> {e['target']}" if e.get("target") else "")
+        if not tries:
+            print(f"verify WARN pickup: {what}: no open ground within 72-104 units to approach it from")
+        elif len(bad) >= len(good):
+            if e.get("target"):
+                ok = False
+            print(f"verify {'FAIL' if e.get('target') else 'WARN'} pickup: {what}: walking straight at it works "
+                  f"from {len(good)} of {len(tries)} directions:")
+            for sector, start, _, blocked in bad:
+                print(f"    from {sector} {tuple(round(c) for c in start)}: stopped "
+                      + (f"by solid at {blocked}" if blocked else "short of it (too far from the edge)"))
+        else:
+            print(f"verify ok   pickup: {what}: reached walking straight at it from "
+                  f"{', '.join(t[0] for t in good)}" + (f" (not {', '.join(t[0] for t in bad)})" if bad else ""))
+    decals = [e for e in h.entities if e.get("classname") == "infodecal" and e.get("origin")]
+    if decals:
+        # the game traces +-5 units from a decal's origin; nothing solid there = no decal
+        floating = []
+        for e in decals:
+            o = tuple(float(c) for c in e["origin"].split())
+            if not any(h.contents(0, tuple(o[k] + (s if k == axis else 0) for k in range(3))) == -2
+                       for axis in range(3) for s in (-4, 4)):
+                floating.append((e.get("texture"), tuple(round(c) for c in o)))
+        if floating:
+            ok = False
+            print(f"verify FAIL decals: {len(floating)} of {len(decals)} are not on a surface (they won't show):")
+            for tex, o in floating[:6]:
+                print(f"    {tex} at {o}")
+        else:
+            print(f"verify ok   decals: all {len(decals)} sit on a surface")
     if coverage_check:
         missing, checked, total = coverage(h, world_brushes, level.is_air, solid_at)
         if missing:
@@ -334,6 +451,16 @@ def main(argv=None):
     t.add_argument("--sheet", action="store_true")
     t.add_argument("--thumb", type=int, default=96)
     t.set_defaults(fn=cmd_tex)
+
+    pt = sub.add_parser("playtest", help="play the map in the real game from a scripted start")
+    pt.add_argument("map")
+    pt.add_argument("--pickups", action="store_true", help="walk straight at every item; check it's picked up")
+    pt.add_argument("--at", help='"x y feet_z yaw" player start')
+    pt.add_argument("--fire", action="append", help="targetname to trigger first (as for shots)")
+    pt.add_argument("--do", action="append", help='a console command ("+forward") or frames to wait ("60"); '
+                    'use --do=-forward for commands starting with -')
+    pt.add_argument("--script", help='steps separated by ";", e.g. "+forward; 150; -forward; 300"')
+    pt.set_defaults(fn=cmd_playtest)
 
     ve = sub.add_parser("verify")
     ve.add_argument("map")

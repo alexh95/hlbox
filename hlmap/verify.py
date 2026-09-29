@@ -465,90 +465,391 @@ def _placed(models, e):
     return tuple(lo[k] + o[k] for k in range(3)), tuple(hi[k] + o[k] for k in range(3))
 
 
-def _entity_graph(ents):
-    """targetname -> list of targetnames it fires (through relays and multi_managers)."""
-    fires = {}
-    for e in ents:
-        name = e.get("targetname")
-        if not name:
+# ---------------------------------------------------------------- picking things up
+
+ITEM_BOX = ((-16, -16, 0), (16, 16, 16))   # every item's touch box (HLSDK CItem::Spawn)
+SECTORS = ["east", "north-east", "north", "north-west", "west", "south-west", "south", "south-east"]
+
+
+def item_rest(hulls, origin):
+    """Where an item comes to rest: items drop onto the surface below at spawn."""
+    x, y, z = origin
+    corners = [(0, 0), (-15, -15), (15, -15), (-15, 15), (15, 15)]
+    for dz in range(0, 2048):
+        if any(hulls.contents(0, (x + cx, y + cy, z - dz - 1)) == -2 for cx, cy in corners):
+            return (x, y, z - dz)
+    return origin
+
+
+def touches_item(p, item):
+    """Does a standing player at origin p touch an item resting at `item`? (Boxes
+    overlap; the engine pads both by 1 unit.)"""
+    (lx, ly, lz), (hx, hy, hz) = ITEM_BOX
+    return (item[0] + lx - 1 <= p[0] + HALF[0] and p[0] - HALF[0] <= item[0] + hx + 1 and
+            item[1] + ly - 1 <= p[1] + HALF[1] and p[1] - HALF[1] <= item[1] + hy + 1 and
+            item[2] + lz - 1 <= p[2] + HALF[2] and p[2] - HALF[2] <= item[2] + hz + 1)
+
+
+def straight_walk(hulls, start, target, stop=lambda p: False, max_len=400):
+    """Walk from `start` (a standing origin) straight toward target's x, y as a player
+    holding forward does: 1-unit steps, stepping up to 18, falling, no sliding along
+    what blocks. Returns (stopped by `stop`, end position, blocked-at or None)."""
+    x, y, z = start
+    dx, dy = target[0] - x, target[1] - y
+    dist = math.hypot(dx, dy)
+    if dist < 1:
+        return stop((x, y, z)), (x, y, z), None
+    ux, uy = dx / dist, dy / dist
+    solid = lambda q: hulls.contents(1, q) != -1
+    for i in range(1, int(min(dist, max_len)) + 1):
+        if stop((x, y, z)):
+            return True, (x, y, z), None
+        nx, ny = start[0] + ux * i, start[1] + uy * i
+        if solid((nx, ny, z)):
+            if solid((x, y, z + STEP_HEIGHT)) or solid((nx, ny, z + STEP_HEIGHT)):
+                return False, (x, y, z), (round(nx + ux * HALF[0]), round(ny + uy * HALF[1]), round(z))
+            z += STEP_HEIGHT
+        x, y = nx, ny
+        for _ in range(64):                       # settle onto the ground
+            if solid((x, y, z - 1)):
+                break
+            z -= 1
+    return stop((x, y, z)), (x, y, z), None
+
+
+def pickup_approaches(hulls, comp, item, near=72, far=104, clear=40):
+    """Walk straight at an item from the open ground around it, as a player who has
+    spotted it does: in each of 8 compass sectors, the reachable position `near`..`far`
+    units away (same floor level) whose way is clear to within `clear` units of the
+    item. Returns [(sector, start, touched, blocked_at)]; sectors with no such
+    position (walls, the far side of the table) are left out."""
+    best = {}
+    for p in comp:
+        d = math.hypot(p[0] - item[0], p[1] - item[1])
+        if not near <= d <= far or not -48 <= p[2] - HALF[2] - item[2] <= 2:   # standing below/level
             continue
-        out = []
-        if e.get("classname") == "multi_manager":
-            out = [k for k in e if k not in ("classname", "targetname", "origin", "wait", "spawnflags")]
-        elif e.get("target"):
-            out = [e["target"]]
-        fires.setdefault(name, []).extend(out)
-    return fires
+        sector = round(math.degrees(math.atan2(p[1] - item[1], p[0] - item[0])) / 45) % 8
+        best.setdefault(sector, []).append((abs(d - (near + far) / 2), p))
+    out = []
+    for sector, cands in sorted(best.items()):
+        for _, p in sorted(cands)[:12]:
+            near_item = lambda q: math.hypot(q[0] - item[0], q[1] - item[1]) <= clear
+            ok, _, _ = straight_walk(hulls, p, item, near_item)
+            if not ok:
+                continue
+            touched, end, blocked = straight_walk(hulls, p, item, lambda q: touches_item(q, item))
+            out.append((SECTORS[sector], p, touched, blocked))
+            break
+    return out
 
 
-def _closure(names, fires):
-    seen, todo = set(), list(names)
-    while todo:
-        n = todo.pop()
-        if n in seen:
-            continue
-        seen.add(n)
-        todo.extend(fires.get(n, ()))
-    return seen
+class FloorLight:
+    """How brightly lit the walkable surfaces are, from the compiled lightmaps.
+
+    Every upward-facing world face contributes its lightmap samples (one per 16
+    texels, up to four light styles each). at() gives the brightest sample under a
+    standing player's feet for a given set of light style levels (World.style_levels),
+    so the same map can be judged with the power on and off. Values are lightmap
+    units, max over R/G/B (a red emergency light counts): about 0-255."""
+
+    def __init__(self, bsp):
+        L = bsp.lumps
+        verts = [struct.unpack_from("<3f", L["vertices"], i * 12) for i in range(len(L["vertices"]) // 12)]
+        edges = [struct.unpack_from("<2H", L["edges"], i * 4) for i in range(len(L["edges"]) // 4)]
+        surf = struct.unpack_from(f"<{len(L['surfedges']) // 4}i", L["surfedges"])
+        texinfo = [struct.unpack_from("<8f", L["texinfo"], i * 40) for i in range(len(L["texinfo"]) // 40)]
+        light = L["lighting"]
+        m = struct.unpack_from("<9f4i3i", L["models"], 0)
+        self.cells = {}
+        self.samples = 0
+        for fi in range(m[14], m[14] + m[15]):
+            plane, side, fe, ne, ti, s0, s1, s2, s3, lofs = struct.unpack_from("<HHiHH4Bi", L["faces"], fi * 20)
+            nx, ny, nz, d, _ = struct.unpack_from("<3ffi", L["planes"], plane * 20)
+            if side:
+                nx, ny, nz, d = -nx, -ny, -nz, -d
+            if nz < 0.7 or lofs < 0:
+                continue
+            styles = [s for s in (s0, s1, s2, s3) if s != 255]
+            if not styles:
+                continue
+            poly = [verts[edges[e][0]] if e >= 0 else verts[edges[-e][1]] for e in surf[fe:fe + ne]]
+            S, T = texinfo[ti][0:4], texinfo[ti][4:8]
+            ss = [p[0] * S[0] + p[1] * S[1] + p[2] * S[2] + S[3] for p in poly]
+            ts = [p[0] * T[0] + p[1] * T[1] + p[2] * T[2] + T[3] for p in poly]
+            bs, bt = math.floor(min(ss) / 16), math.floor(min(ts) / 16)
+            w = math.ceil(max(ss) / 16) - bs + 1
+            h = math.ceil(max(ts) / 16) - bt + 1
+            n = (nx, ny, nz)
+            tn, ns, st = cross(T[:3], n), cross(n, S[:3]), cross(S[:3], T[:3])
+            det = dot(S[:3], tn)
+            if abs(det) < 1e-9:
+                continue
+            lo = [min(p[k] for p in poly) - 8 for k in range(3)]
+            hi = [max(p[k] for p in poly) + 8 for k in range(3)]
+            size = w * h
+            for j in range(h):
+                for i in range(w):
+                    a, b = (bs + i) * 16 - S[3], (bt + j) * 16 - T[3]
+                    p = tuple((a * tn[k] + b * ns[k] + d * st[k]) / det for k in range(3))
+                    if not all(lo[k] <= p[k] <= hi[k] for k in range(3)):
+                        continue
+                    vals = []
+                    for k, style in enumerate(styles):
+                        o = lofs + (k * size + j * w + i) * 3
+                        if o + 3 <= len(light):
+                            vals.append((style, max(light[o], light[o + 1], light[o + 2])))
+                    self.cells.setdefault((int(p[0] // 16), int(p[1] // 16)), []).append((p, vals))
+                    self.samples += 1
+
+    def at(self, pos, levels, standing=True):
+        """Brightness of the floor under a player origin (standing) or a floor point."""
+        x, y, z = pos
+        feet = z - HALF[2] if standing else z
+        best = 0.0
+        cx, cy = int(x // 16), int(y // 16)
+        for ix in (cx - 1, cx, cx + 1):
+            for iy in (cy - 1, cy, cy + 1):
+                for p, vals in self.cells.get((ix, iy), ()):
+                    if abs(p[0] - x) <= 16 and abs(p[1] - y) <= 16 and -20 <= feet - p[2] <= 4:
+                        best = max(best, sum(levels.get(s, 1.0) * v for s, v in vals))
+        return best
 
 
-def progression(hulls, checkpoints, map_entities=(), radius=24):
-    """Walk the map from the player start, collecting pickups and pressing buttons that
-    are within reach, opening locked doors as their locks get triggered, until nothing
-    changes. Returns (unreached checkpoints, unlock log, locks never opened, reached)."""
+LIT = 24            # floor brightness a player can see by (lightmap units)
+SEE = 64            # ...and how far such a lit spot helps (units, horizontally)
+DARK_LIMIT = 192    # most darkness a way forward may cross (units walked unable to see)
+
+
+class Progress:
+    """Result of progression(): see its docstring."""
+
+    def __init__(self):
+        self.missing, self.log, self.never, self.reached = [], [], [], set()
+        self.softlocks = []      # (path of steps, checkpoints that can no longer be reached)
+        self.darkness = []       # (path, next objective, units of darkness on the best way there)
+        self.warnings = []
+        self.states = 0
+        self.truncated = False
+
+    def __iter__(self):          # (missing, log, never, reached), the old tuple form
+        return iter((self.missing, self.log, self.never, self.reached))
+
+
+def _describe(ents, i, models):
+    e = ents[i]
+    c = e.get("classname", "")
+    if e.get("origin") and not e.get("model"):
+        at = tuple(round(float(v)) for v in e["origin"].split())
+    else:
+        lo, hi = _placed(models, e)
+        at = tuple(round((a + b) / 2) for a, b in zip(lo, hi))
+    verb = "pick up" if c.startswith(("item_", "weapon_", "ammo_")) else "touch" if c.startswith("trigger_") else "press"
+    return f"{verb} {c} at {at} -> {e.get('target')}"
+
+
+def progression(hulls, checkpoints, radius=24, light=None, max_states=300):
+    """Play the map's logic on foot. From the player start, every progress-relevant
+    thing the player can reach (pickups, buttons, trigger volumes) is tried in every
+    order, with its effects simulated through the entity logic (hlmap/sim.py: relays,
+    multi_managers, locks, global state, gates...). Doors block while locked.
+
+    Returns a Progress:
+      missing    checkpoints no order of play reaches
+      log        the shortest line of play that reaches everything, step by step
+      never      locks never opened
+      softlocks  lines of play after which some area can never be reached again
+      darkness   (with `light`, a FloorLight) for each state along the way: how much
+                 darkness the best way to the next objective crosses. There is no
+                 flashlight without the HEV suit, so dark stretches are real.
+    """
+    from .sim import BUTTONS, DOORS, ITEMS, World
+    res = Progress()
     ents = hulls.entities
     models = hulls.models()
-    fires = _entity_graph(ents)
+    world0 = World(ents).start()
+    res.warnings += world0.warnings
     ladders = [_placed(models, e) for e in ents if e.get("classname") == "func_ladder"]
     w = Walker(hulls, ladders)
-    doors = []   # (lock name, blocker box in origin space, door name)
-    for e in ents:
-        if e.get("classname", "").startswith("func_door") and e.get("master") and e.get("model", "").startswith("*"):
+    doors = []
+    for i, e in enumerate(ents):
+        if e.get("classname") in DOORS and (e.get("master") or e.get("targetname")) and e.get("model", "").startswith("*"):
             lo, hi = _placed(models, e)
-            blo = tuple(lo[k] - HALF[k] for k in range(3))
-            bhi = tuple(hi[k] + HALF[k] for k in range(3))
-            doors.append((e["master"], (blo, bhi), e.get("targetname") or e["model"]))
-    triggers = []   # (kind, reach test, target)
-    for e in ents:
+            doors.append((i, (tuple(lo[k] - HALF[k] for k in range(3)), tuple(hi[k] + HALF[k] for k in range(3)))))
+    actions = []    # (entity, method, reach test)
+    for i, e in enumerate(ents):
         cls = e.get("classname", "")
         if not e.get("target"):
             continue
-        if cls.startswith(("item_", "weapon_", "ammo_")) and e.get("origin"):
+        if cls.startswith(ITEMS) and e.get("origin"):
             o = tuple(float(c) for c in e["origin"].split())
-            triggers.append((f"{cls} at {tuple(round(c) for c in o)}",
-                             lambda p, o=o: abs(p[0] - o[0]) <= 32 and abs(p[1] - o[1]) <= 32 and -72 <= p[2] - o[2] <= 72,
-                             e["target"]))
-        elif cls in ("func_button", "func_rot_button") and e.get("model", "").startswith("*"):
+            actions.append((i, "pickup", lambda p, o=o: abs(p[0] - o[0]) <= 32 and abs(p[1] - o[1]) <= 32
+                            and -72 <= p[2] - o[2] <= 72))
+        elif cls in BUTTONS and e.get("model", "").startswith("*"):
             lo, hi = _placed(models, e)
-            triggers.append((f"{cls} at {tuple(round((a + b) / 2) for a, b in zip(lo, hi))}",
-                             lambda p, lo=lo, hi=hi: sum(max(0, lo[k] - p[k], p[k] - hi[k]) ** 2 for k in range(3)) <= 64 * 64,
-                             e["target"]))
-    opened, log = set(), []
-    start = next(e for e in ents if e.get("classname") == "info_player_start")
-    seeds = {w.settle(tuple(float(c) for c in start["origin"].split()))}
-    reached = set()
-    while True:
-        w.blockers = [box for lock, box, _ in doors if lock not in opened]
-        reached = w.flood(list(seeds | reached))
-        new = set()
-        for desc, reach, target in triggers:
-            locks = {n for n in _closure([target], fires) if any(n == d[0] for d in doors)} - opened - new
-            if locks and any(reach(p) for p in reached):
-                new |= locks
-                log.append(f"{', '.join(sorted(locks))} opened by {desc}")
-        if not new:
-            break
-        opened |= new
-    grid = {}
-    for p in reached:
-        grid.setdefault((int(p[0] // 64), int(p[1] // 64)), []).append(p)
+            actions.append((i, "press", lambda p, lo=lo, hi=hi:
+                            sum(max(0, lo[k] - p[k], p[k] - hi[k]) ** 2 for k in range(3)) <= 64 * 64))
+        elif cls in ("trigger_once", "trigger_multiple") and e.get("model", "").startswith("*"):
+            lo, hi = _placed(models, e)
+            actions.append((i, "touch", lambda p, lo=lo, hi=hi:
+                            all(lo[k] - HALF[k] < p[k] < hi[k] + HALF[k] for k in range(3))))
+    rel = world0.relevance([i for i, _ in doors])
+    actions = [a for a in actions if a[0] in rel[0]]
 
-    def near(c):
-        # a checkpoint that falls inside furniture counts as reached from next to it
-        r = radius if hulls.contents(1, tuple(round(v) for v in c)) == -1 else 64
-        gx, gy = int(c[0] // 64), int(c[1] // 64)
-        return any(abs(p[0] - c[0]) <= r and abs(p[1] - c[1]) <= r and abs(p[2] - c[2]) <= 48
-                   for ix in (gx - 1, gx, gx + 1) for iy in (gy - 1, gy, gy + 1) for p in grid.get((ix, iy), ()))
-    missing = [(name, pts) for name, pts in checkpoints if not any(near(c) for c in pts)]
-    never = sorted({lock for lock, _, _ in doors} - opened)
-    return missing, log, never, reached
+    cache = {}
+
+    def flood(world, pos):
+        blocked = tuple(i for i, _ in doors if not world.door_passable(i))
+        for comp in cache.get(blocked, ()):
+            if pos in comp:
+                return comp, blocked
+        w.blockers = [b for i, b in doors if i in blocked]
+        comp = frozenset(w.flood([pos]))
+        cache.setdefault(blocked, []).append(comp)
+        return comp, blocked
+
+    def lock_name(i):
+        return ents[i].get("master") or ents[i].get("targetname") or f"door {i}"
+
+    start = next(e for e in ents if e.get("classname") == "info_player_start")
+    pos0 = w.settle(tuple(float(c) for c in start["origin"].split()))
+    nodes, order = {}, []
+    queue = deque([(world0, pos0, [], None)])
+    while queue:
+        world, pos, path, via = queue.popleft()
+        comp, blocked = flood(world, pos)
+        key = (world.key(rel), min(comp))
+        if via:
+            nodes[via[0]]["children"].append((via[1], key))
+        if key in nodes:
+            continue
+        if len(nodes) >= max_states:
+            res.truncated = True
+            continue
+        node = {"world": world, "comp": comp, "blocked": blocked, "entry": pos, "path": path, "children": []}
+        nodes[key] = node
+        order.append(key)
+        base = world.key(rel)
+        for a in actions:
+            i, method, reach = a
+            if not world.available(i):
+                continue
+            spot = next((p for p in comp if reach(p)), None)
+            if spot is None:
+                continue
+            w2 = world.copy()
+            getattr(w2, method)(i)
+            if w2.key(rel) == base:
+                continue
+            change = w2.describe_change(world)
+            for d, _ in doors:
+                was, now = world.door_passable(d), w2.door_passable(d)
+                if was != now:
+                    change.append(f"{lock_name(d)} {'unlocked' if now else 'LOCKED'}")
+            res.warnings += [x for x in w2.warnings if x not in res.warnings]
+            step = _describe(ents, i, models) + (f": {'; '.join(change)}" if change else "")
+            queue.append((w2, spot, path + [step], (key, a)))
+    res.states = len(nodes)
+
+    # which checkpoints each state reaches
+    def covers(comp):
+        grid = {}
+        for p in comp:
+            grid.setdefault((int(p[0] // 64), int(p[1] // 64)), []).append(p)
+
+        def near(c):
+            # a checkpoint that falls inside furniture counts as reached from next to it
+            r = radius if hulls.contents(1, tuple(round(v) for v in c)) == -1 else 64
+            gx, gy = int(c[0] // 64), int(c[1] // 64)
+            return any(abs(p[0] - c[0]) <= r and abs(p[1] - c[1]) <= r and abs(p[2] - c[2]) <= 48
+                       for ix in (gx - 1, gx, gx + 1) for iy in (gy - 1, gy, gy + 1) for p in grid.get((ix, iy), ()))
+        return frozenset(k for k, (_, pts) in enumerate(checkpoints) if any(near(c) for c in pts))
+
+    cov = {}
+    for k in order:          # states sharing a reachable area share coverage
+        comp = nodes[k]["comp"]
+        cov[k] = next((cov[j] for j in cov if nodes[j]["comp"] is comp), None) or covers(comp)
+    reachable = frozenset().union(*cov.values()) if cov else frozenset()
+    res.reached = set().union(*(nodes[k]["comp"] for k in order))
+    res.missing = [checkpoints[k] for k in range(len(checkpoints)) if k not in reachable]
+    opened = {d for k in order for d, _ in doors if d not in nodes[k]["blocked"]}
+    res.never = sorted({lock_name(d) for d, _ in doors if d not in opened})
+
+    goals = {k for k in order if cov[k] == reachable}
+    if not goals:
+        res.warnings.append("no single state of play reaches every area (areas that close behind you?)")
+        goals = {max(order, key=lambda k: len(cov[k]))}
+    finish = set(goals)
+    changed = True
+    while changed:
+        changed = False
+        for k in order:
+            if k not in finish and any(c in finish for _, c in nodes[k]["children"]):
+                finish.add(k)
+                changed = True
+    for k in order:
+        if k not in finish:
+            lost = sorted(checkpoints[c][0] for c in reachable - cov[k])
+            res.softlocks.append((nodes[k]["path"], lost))
+    res.log = nodes[next(k for k in order if k in goals)]["path"]
+
+    if light is not None:
+        seeable_cache = {}
+        for k in order:
+            if k not in finish or k in goals:
+                continue
+            node = nodes[k]
+            useful = [(a, c) for a, c in node["children"] if c in finish]
+            if not useful:
+                continue
+            levels = node["world"].style_levels()
+            sig = (tuple(sorted(levels.items())), id(node["comp"]))
+            if sig not in seeable_cache:
+                seeable_cache[sig] = _seeable(node["comp"], light, levels)
+            seeable = seeable_cache[sig]
+            w.blockers = [b for i, b in doors if i in node["blocked"]]
+            best_cost, best_a = None, None
+            for a, _ in useful:
+                cost = _dark_walk(w, node["comp"], seeable, node["entry"], a[2])
+                if cost is not None and (best_cost is None or cost < best_cost):
+                    best_cost, best_a = cost, a
+            if best_a is not None:
+                res.darkness.append((node["path"], _describe(ents, best_a[0], models), best_cost))
+    return res
+
+
+def _seeable(comp, light, levels):
+    """Positions from which the player can see where they are going: a lit floor
+    (>= LIT) within SEE units."""
+    buckets = {}
+    for p in comp:
+        if light.at(p, levels) >= LIT:
+            buckets.setdefault((int(p[0] // SEE), int(p[1] // SEE)), []).append(p)
+    out = set()
+    for p in comp:
+        bx, by = int(p[0] // SEE), int(p[1] // SEE)
+        if any(abs(q[0] - p[0]) <= SEE and abs(q[1] - p[1]) <= SEE and abs(q[2] - p[2]) <= 72
+               for ix in (bx - 1, bx, bx + 1) for iy in (by - 1, by, by + 1) for q in buckets.get((ix, iy), ())):
+            out.add(p)
+    return out
+
+
+def _dark_walk(walker, comp, seeable, start, reach):
+    """Fewest units walked without being able to see, on the way from start to a
+    position where reach(p) (0-1 BFS over the walk graph)."""
+    dist = {start: 0}
+    dq = deque([start])
+    while dq:
+        p = dq.popleft()
+        d = dist[p]
+        if d > dist.get(p, d):
+            continue
+        if reach(p):
+            return d
+        for q in walker._moves(p):
+            if q not in comp:
+                continue
+            step = 0 if q in seeable else walker.step
+            if d + step < dist.get(q, 1 << 30):
+                dist[q] = d + step
+                (dq.appendleft if step == 0 else dq.append)(q)
+    return None

@@ -105,13 +105,104 @@ def _two_rooms(key_in_first):
 
 
 def test_key_in_reach_opens_the_door():
-    missing, log, never, _ = _two_rooms(key_in_first=True)
-    assert missing == [] and never == [] and log
+    p = _two_rooms(key_in_first=True)
+    assert p.missing == [] and p.never == [] and p.log and p.softlocks == []
 
 
 def test_key_behind_its_own_door_is_a_softlock():
-    missing, log, never, _ = _two_rooms(key_in_first=False)
-    assert never == ["lk"] and [n for n, _ in missing] == ["room b"]
+    p = _two_rooms(key_in_first=False)
+    assert p.never == ["lk"] and [n for n, _ in p.missing] == ["room b"]
+
+
+def _power_rooms(one_shot_breaker=False, emergency=False, rad=False):
+    """a (start, card) | b (locked: card AND power) ; a - corridor - c (breaker).
+    Taking the card trips the power (lights out); the breaker in c restores it."""
+    from hlmap import logic
+    from hlmap.verify import FloorLight, progression
+    m = Map("vpower")
+    lvl = Level(wall=16)
+    a = lvl.room("a", (0, 0, 0), (256, 256, 128), MAT)
+    b = lvl.room("b", (272, 0, 0), (528, 256, 128), MAT)
+    cor = lvl.room("corridor", (-528, 96, 0), (-16, 160, 128), MAT)
+    c = lvl.room("c", (-800, 0, 0), (-544, 256, 128), MAT)
+    door = lvl.doorway(a, b, width=64, height=96)
+    lvl.doorway(a, cor, width=64, height=96, center=128)
+    lvl.doorway(cor, c, width=64, height=96, center=128)
+    lvl.build(m)
+    grid = logic.Circuit("power")
+    m.add(props.lock("lk", door.center, globalstate=grid.flag.state), props.door_rotating(door, master="lk"))
+    m.add(props.pickup("item_security", (200, 200, 16), fires=["lk_key", grid.fail], sound=None))
+    if one_shot_breaker:     # sets the power on directly and can only be used once
+        m.add(props.switch((-800, 128, 48), "east", grid.flag.on, wait=-1))
+    else:                    # the real thing: only works while the power is out
+        m.add(props.switch((-800, 128, 48), "east", grid.restore, master=grid.dead))
+    for name, pts in (("a_lights", [(128, 128, 100)]), ("cor_lights", [(-400, 128, 100), (-150, 128, 100)]),
+                      ("c_lights", [(-672, 128, 100)])):
+        m.add([props.light(p, targetname=name) for p in pts])
+        grid.group(name)
+    if emergency:
+        m.add([props.light(p, (255, 40, 20), 90, targetname="em", spawnflags=1)
+               for p in ((128, 128, 100), (-270, 128, 100), (-672, 128, 100))])
+        grid.emergency("em")
+    m.add(grid.entities(), props.light((400, 128, 100)), props.player_start((64, 64, 0)))
+    out = Path(tempfile.mkdtemp()) / "vpower.map"
+    res = compile_map(m.write(out), profile="fast", steps=("csg", "bsp", "vis", "rad") if rad else ("csg", "bsp"))
+    assert res.ok, res.summary()
+    h = Hulls(res.bsp)
+    return progression(h, lvl.checkpoints(), light=FloorLight(h.bsp) if rad else None)
+
+
+def test_power_sequence_is_followed():
+    p = _power_rooms()
+    assert p.missing == [] and p.softlocks == [] and not p.warnings, (p.missing, p.softlocks, p.warnings)
+    assert len(p.log) == 2 and "power off" in p.log[0] and "lk unlocked" in p.log[1], p.log
+
+
+def test_breaker_used_before_the_outage_is_a_lockout():
+    p = _power_rooms(one_shot_breaker=True)
+    assert p.missing == []                       # the right order still reaches everything...
+    assert p.softlocks, "pressing the one-shot breaker first must be reported"
+    path, lost = p.softlocks[0]
+    assert "power_on" in path[0] and lost == ["room b"], p.softlocks
+
+
+def test_dark_way_to_the_breaker_is_caught():
+    from hlmap.verify import DARK_LIMIT
+    dark = _power_rooms(rad=True)
+    lit = _power_rooms(emergency=True, rad=True)
+    worst = lambda p: max(cost for _, _, cost in p.darkness)
+    assert worst(dark) > DARK_LIMIT, dark.darkness      # 500+ units of pitch-black corridor
+    assert worst(lit) <= DARK_LIMIT, lit.darkness
+
+
+def _item_on_table(inset, pole):
+    """A card on a table (east edge at x 280), `inset` units in from the edge, with or
+    without a thin pole just off the table next to it (the office's radio-camp bug:
+    walking straight at the card, the player stopped at the pole, out of reach)."""
+    from hlmap.verify import Walker, item_rest, pickup_approaches
+    m = Map("vitem")
+    lvl = Level(wall=16)
+    lvl.room("room", (0, 0, 0), (512, 256, 128), MAT)
+    lvl.build(m)
+    m.add(props.table(256, 128, 0, width=48, depth=96, height=38))
+    if pole:
+        m.add(props.detail(box((287, 139, 0), (291, 143, 90), "FIFTIES_DSK5B")))
+    item = (280 - inset, 128, 46)
+    m.add(props.point("item_security", item), props.player_start((420, 128, 0)), props.light((256, 128, 100)))
+    out = Path(tempfile.mkdtemp()) / "vitem.map"
+    res = compile_map(m.write(out), profile="fast", steps=("csg", "bsp"))
+    assert res.ok, res.summary()
+    h = Hulls(res.bsp)
+    w = Walker(h)
+    comp = w.flood([w.settle((420, 128, 37))])
+    return {sector: touched for sector, _, touched, _ in pickup_approaches(h, comp, item_rest(h, item))}
+
+
+def test_blocked_pickup_is_caught():
+    bad = _item_on_table(inset=12, pole=True)
+    assert bad["east"] is False, bad                   # stopped by the pole, like in the game
+    good = _item_on_table(inset=6, pole=False)
+    assert good and all(good.values()), good
 
 
 def test_stairs_are_walkable():
@@ -127,8 +218,8 @@ def test_stairs_are_walkable():
     out = Path(tempfile.mkdtemp()) / "vstairs.map"
     res = compile_map(m.write(out), profile="fast", steps=("csg", "bsp"))
     assert res.ok, res.summary()
-    missing, _, _, _ = progression(Hulls(res.bsp), lvl.checkpoints())
-    assert missing == [], missing
+    p = progression(Hulls(res.bsp), lvl.checkpoints())
+    assert p.missing == [], p.missing
 
 
 if __name__ == "__main__":

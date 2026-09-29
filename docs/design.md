@@ -111,8 +111,20 @@ build/<name>/plan.png   build/<name>/<name>.map  (Valve 220)
   - `ceiling_light`: a flush panel that emits light through its texture. With `name=`
     it becomes switchable: a func_wall with `style -3`, a "piggyback" texture light
     that follows a named light's switchable style.
-  - `switch`: a toggling func_button.
-  - `lock`: a multisource plus a trigger_relay "key"; doors use it as their `master`.
+  - `switch`: a func_button (optionally dead without its `master`).
+  - `lock`: a multisource plus a fire-once trigger_relay "key"; doors use it as their
+    `master`. With `globalstate=` it also needs a global state (e.g. power).
+  - `lever`: a handle that slides up when used (a moving func_button).
+  - `emergency_light`: a lamp that starts dark and pulses when fired, on the wall or
+    on a pole.
+  - `sign`: nameplates (`art.plate`), posters (any image) or stock signs. Its texture
+    travels with the entity (`Entity.textures`).
+  - `decal` and `stencil`: stock decals (infodecal), and words spelled from decal
+    letters.
+  - `hud_message` and `sound_effect`: `game_text` and a one-shot `ambient_generic`.
+  - `slideshow`: any number of slides (one func_wall_toggle each), with a relay that
+    `trigger_changetarget` re-aims at every step.
+  - `trigger`: a trigger_once or trigger_multiple volume, optionally with a master.
   - `crate`, `crystal` and `xen_plantlight`.
   - `light`, `point`, `player_start` and `yaw_towards`.
   - Doors block light while compiling (`zhlt_lightflags 2`).
@@ -166,19 +178,55 @@ against the level's intended air and refuses to install on failure:
   where the player's box is inside air and touches no intended brush. The box is
   tested against brush planes pushed out by the box, as the compiler does.
 - **Walkability and progression.** From the start, the player walks on foot (steps
-  up to 18, jumps up to 45, falls under 600, `func_ladder` volumes). Locked doors
-  block until a reachable pickup or button fires their key, through relays and
-  multi_managers; the walk repeats as locks open. Every room, cave stretch and
-  `m.checkpoints` entry must be reached. Locks that never open are reported, which is
-  how you'd get locked out of progress.
+  up to 18, jumps up to 45, falls under 600, `func_ladder` volumes). Every
+  progress-relevant action is tried in every order: pickups, buttons and trigger
+  volumes within reach. Each one's effects are simulated through the entity logic
+  (§3.10). Doors block while locked.
+  - Relevance is a static backward slice from the doors: whatever can change a lock,
+    a global state it reads, or whether such a chain can run. Light switches and
+    slide remotes don't multiply the states.
+  - Every room, cave stretch and `m.checkpoints` entry must be reached, and the
+    shortest line of play is logged with what each step changes.
+- **Lockout.** Every state of play must still be able to reach the state that sees
+  everything. Otherwise the line of play leading there is reported (e.g. a one-shot
+  breaker used before the outage, which locks a power-dependent door for good).
+- **Darkness.** There's no flashlight without the HEV suit. For every state on the
+  way, the way to the next useful objective must be visible.
+  - `FloorLight` reads every upward face's lightmap samples per light style.
+  - The simulated light states give each style's level (patterns averaged).
+  - A position is seeable within 64 units of a floor at 24 or more (max of R, G, B,
+    so red emergency light counts).
+  - A 0-1 search finds the fewest units walked unseeing. Over 192 fails.
+  - Calibration on the office: lit rooms read 110-220, a switched-off hall 6-8,
+    dim cave stretches 40-80. Without its emergency lamps, the route from the
+    card to the breaker crossed 1,688 dark units.
+- **Decals.** Every infodecal must have solid within 4 units (the game traces 5
+  units from it), or it silently doesn't appear.
+- **Pickups.** Every item is walked at straight, as a player who has spotted it does.
+  - The walk starts from each compass direction where there is open ground 72-104
+    units out, clear to within 40 units of the item.
+  - It moves in 1-unit steps, with 18-unit step-ups and gravity, and doesn't slide
+    along obstacles.
+  - It succeeds if the player's box touches the item's 32x32x16 box where the item
+    comes to rest.
+  - If half or more of the approaches stop short, a keyed item fails.
+  - Playtest origin: the access card could be reached, but walking straight at it
+    stopped 8 units short at a lamp pole. The loose reach test and the grid walk
+    both passed it. `playtest --pickups` agreed with the model on all 6 approaches
+    after the fix, and on the failing one before it.
 - **Coverage.** Every generated face with real air in front has a matching face in
   the BSP. That catches polygons the compiler deleted, which you'd see through.
 - **Self-tests.** `tests/test_verify.py` compiles rooms with known defects and checks
   each one is caught:
   - holes, invisible walls and missing faces;
   - a key locked behind its own door;
-  - stairs whose hole is too short (the too-short formula makes the test fail).
-  A clean room must pass.
+  - stairs whose hole is too short (the too-short formula makes the test fail);
+  - a power-gated door with a one-shot breaker (a lockout);
+  - a route to the breaker with no emergency lights (dark), and the same route lit;
+  - a card on a table behind a pole (the playtest bug), and the same card at the edge.
+  A clean room must pass. `tests/test_logic.py` checks the logic helpers against the
+  simulator without compiling (switch positions through an outage, gates, chaining
+  past 16 multi_manager targets, locks needing key and power).
 - **Gameplay lint** (`checks.py`):
   - `use_reach` flags usable entities that can be `+use`d from more than one room
     (`+use` reaches 64 units through walls), and pairs close enough to be confused.
@@ -187,8 +235,10 @@ against the level's intended air and refuses to install on failure:
     blocked, even though the 44-unit path around it was walkable.
 
 ### 3.9 Game integration (`hlmap/game.py`)
-- **Install.** Maps go to `valve/maps/`. The tool refuses to overwrite files it didn't
-  install, using a manifest in `build/installed.json`.
+- **Install.** Maps go to `valve/maps/`, with their sounds and `.res`. The tool refuses
+  to overwrite files it didn't install, using a manifest in `build/installed.json`
+  (map names and file paths). It removes this map's earlier files that it no longer
+  uses.
 - **Play.** `play` launches Half-Life straight into a map.
 - **Screenshots** (`shots`):
   1. For each camera, write a temporary copy of the BSP with extra entities: a
@@ -201,14 +251,56 @@ against the level's intended air and refuses to install on failure:
   5. Delete all temporary files and restore the registry video settings.
   - Cameras can be named, and defined in `build()` as `m.cameras`. `--only` retakes
     a subset.
-  - Each camera can toggle entities first (`fire`), in order and 0.3 s apart. `@doors`
-    opens every door and keeps it open.
+  - Each camera can toggle entities first (`fire`), in order and 0.3 s apart, or at
+    a given time (`("name", seconds)`). `@doors` opens every door and keeps it open.
   - `--console "developer 2" --log` saves the game console, which shows every entity
     that received a trigger.
+- **Playtests** (`playtest`): the same temporary-map mechanism, without a camera.
+  - The player spawns at a scripted pose, targets can be fired first, then a script
+    of console commands and frame waits runs (`+forward`, `+use`, ...).
+  - With `developer 2`, the console log shows everything that fired. That's how a
+    pickup or a button press is confirmed.
+  - `--pickups` walks at every item from the verifier's approach positions, one map
+    load each. The item is swapped for an item_security, which has the same touch
+    box but no "does the player need it" rule. It then reports whether the game
+    agrees with the static model.
 - **Limitations:**
   - Needs a desktop session and takes over the screen for about 15 s.
-  - Can't test collision or gameplay.
+  - Movement is scripted input, not a bot. It checks specific walks, not whole
+    playthroughs.
   - Timing is frame-based, not event-based.
+
+### 3.10 Map logic and state (`hlmap/logic.py`, `hlmap/sim.py`)
+GoldSrc has no variables or conditions, but stock entities can build them. These
+helpers do, and the verifier runs them:
+- **`Flag`** is a boolean in the engine's global state table. It's a pair of
+  env_globals (the state and its inverse), so both "on" and "off" can be masters
+  through a multisource with `globalstate`. Global states survive level changes.
+- **`gate`** is a conditional relay: a game_counter with limit 1, reset on fire, and
+  a `master`. trigger_relay and multi_manager have no master support. **`when`**
+  chains gates for AND conditions.
+- **`sequence`** is a multi_manager with repeated targets (`name#1`), chained past
+  the engine's 16-target limit.
+- **`Circuit`** is building power:
+  - Each switched light group has a Flag for its switch position.
+  - Failure and restore toggle a group through a gate on that flag, so a group
+    switched off stays off.
+  - Unswitched groups toggle directly. Emergency groups start dark.
+  - Both events are gated on the power flag, so neither can run twice.
+  - Switches get `master=grid.live`, so positions can't change during an outage.
+- **Simulator** (`sim.World`): the state that matters for play, from the compiled
+  entity lump.
+  - State covered: global states, multisource inputs (with HLSDK's quirks: inputs
+    toggle, a non-member flips the last input), lights (ShouldToggle), func_wall
+    frames, game_counters, env_render, removed entities (items, fire-once relays,
+    killtargets), pressed buttons (toggle buttons skip the master on release) and
+    opened doors.
+  - Events run in time order (delays, multi_manager timings).
+  - `style_levels()` gives every light style's brightness in the current state,
+    which feeds the darkness check.
+- **In-engine check:** the office's `power_restored` camera switches the conference
+  lights off, fails the power, then resets the breaker. In the game, the conference
+  stays dark while the projector comes back, matching the simulation.
 
 ## 4. Geometry roadmap
 
@@ -324,11 +416,13 @@ Quality and budget measures:
 - **Logic helpers** for common patterns:
   - A button that opens a door.
   - A locked door with a key or keycard, using `multisource` or `env_global` as the
-    lock. Done: `props.lock` (a multisource plus a trigger_relay key), and
-    `props.pickup` (e.g. the access card, `item_security`) that fires the key. The
-    progression check proves the key is reachable before its door.
+    lock. Done: `props.lock` (a multisource plus a fire-once key, optionally needing a
+    global state), and `props.pickup` (e.g. the access card, `item_security`) that
+    fires the key. The progression check proves the key is reachable before its door.
   - One-shot and repeatable triggers.
-  - Timed sequences with `multi_manager`.
+  - Timed sequences with `multi_manager`. Done: `logic.sequence`.
+  - Map state and conditions. Done: `logic.Flag`, `logic.gate`, and `logic.Circuit`
+    for power failures (§3.10).
   - Hurt, push and teleport volumes.
 - **NPCs and items.**
   - Scientists, security guards and monsters placed on the floor with checks.
@@ -338,20 +432,26 @@ Quality and budget measures:
   `trigger_changelevel` plus `info_landmark` pairs placed consistently in both maps.
 - **Narrative and screen effects (all stock):**
   - `game_text` for on-screen notes, triggered by a button on a note or sign.
-  - `env_fade`, `env_shake` and `ambient_generic`.
+    Done: `props.hud_message`.
+  - `env_fade`, `env_shake` and `ambient_generic`. Done: `props.sound_effect`; the
+    office's power failure uses env_shake.
+  - Signage. Done: `props.sign` (generated plates, posters, stock signs), and
+    `props.decal`/`props.stencil` (stock decals, triggered decals).
   - `trigger_camera` cutscenes, reusing the screenshot camera code.
 
 ## 6. Custom content within a map-only scope
 
-Custom assets must ship next to the map. Where they live is an open decision (§10.1).
+Textures ship inside the BSP. Other assets ship next to it, in namespaced folders
+inside `valve/` that the install manifest tracks (§10.1, option a).
 
 - **Textures. Done.**
   - `Map.add_texture(name, image)` goes to `wadwrite.py`, which quantizes to 256
     colours, builds the four mip levels and rounds sizes to multiples of 16.
   - `-wadinclude` embeds the result in the BSP. Toggle pairs (`+0`/`+A`) and
     transparent (`{`) textures work.
-  - `art.py` rasterizes pixel-art SVGs and composes slides. Example: the conference
-    projector's CCC slides from `assets/ccc_mascot.svg`.
+  - `art.py` rasterizes pixel-art SVGs, draws sign plates and composes slides. Example:
+    the office briefing's 12 slides, Boxworth the crate mascot, Gerald the Employee of
+    the Month and the hall's safety poster, all drawn in code.
 - **Models.**
   - Generate the mesh file and model script from Python (procedural props) or export
     from Blender. Compile to `.mdl` with Valve's model compiler.
@@ -359,14 +459,34 @@ Custom assets must ship next to the map. Where they live is an open decision (§
     unrotated box.
   - Optionally bake model shadows (`zhlt_studioshadow 1`).
   - Needs Valve's model compiler, which is a separate download.
-- **Sounds.**
-  - Convert to mono PCM WAV (8 or 16-bit; 11, 22 or 44 kHz), with loop points for
-    ambient loops.
-  - Play them with `ambient_generic`.
-  - Build-time text-to-speech: voice each scripted line while building (Windows'
-    built-in voices, or a local neural TTS), write the WAV plus a `game_text` subtitle,
-    and trigger both together.
-  - Use generic or original voices only; don't imitate the original voice actors.
+- **Sounds. Done.**
+  - `Map.add_sound(name, wav)` takes a mono PCM WAV (8 or 16-bit; 11, 22 or 44 kHz),
+    which `check()` validates. It installs to `valve/sound/<name>` and is listed in
+    `maps/<map>.res`.
+  - Play them with `ambient_generic` (`props.sound_effect`). Ambient loops need
+    loop points; without them, a "looped" sound plays once.
+- **Voice. Done** (`hlmap/voice.py`, `hlmap/scene.py`).
+  - Build-time text-to-speech with Windows' built-in voices (System.Speech: David,
+    Zira), written as 22 kHz 16-bit mono.
+  - Clips are trimmed, normalized and cached by text and settings.
+  - `scene.Talk` turns lines into a timeline from the real clip lengths: the voice
+    at the speaker's head, a `game_text` subtitle, cues and gestures, an abort that
+    says an interruption, and a `running` flag.
+  - Generic voices only; no imitating the original voice actors.
+  - Limitation: no lip-sync. Stock Half-Life lip-syncs only `sentences.txt` lines,
+    which only a mod can add to.
+  - The office briefing has 12 slides and 13 lines, 142 s in all. Walking back in
+    after restoring the power gets one of two welcome-backs, depending on whether
+    the briefing was given. That's chosen by `logic.when` on three Flags, and
+    `tests/test_office.py` simulates each path. In-game playtests
+    confirmed the whole run: all 12 lines, 11 slide steps and 9 gestures, with the
+    remote unlocking at the end. A power cut 12 s in stopped it after line 2 with the
+    interruption. The build checks gesture names and lengths against the model's
+    sequences (`hlmap/model.py`).
+  - Found in playtests: the first map of a Half-Life session spawns its NPCs before
+    `skill.cfg` is read, so they get 0 health and stop taking scripted sequences
+    after one. `play`, `shots` and `playtest` load the map, read `skill.cfg`, then
+    load it again.
 - **Sprites.** A `.spr` writer for `env_sprite` and `env_glow` (glows, signs, effects).
 - **Distribution.** A `.res` file listing custom content, and a zip of the map with
   its assets.
@@ -428,7 +548,8 @@ Notes for if that changes:
 
 ## 10. Open decisions
 
-1. **Where custom assets go** (textures are solved: embedded in the BSP).
+1. **Where custom assets go.** Decided: option (a) for sounds (textures are embedded
+   in the BSP).
    - Option (a): namespaced folders inside `valve/` (`models/hlbox/`, `sound/hlbox/`),
      tracked by the install manifest so they can be removed cleanly.
    - Option (b): `valve_addon/`, which is only read when the player enables custom

@@ -36,6 +36,7 @@ class Entity:
         self.kv: dict[str, object] = {}
         self.kv.update(kv or {})
         self.kv.update(kwargs)
+        self.textures: dict = {}   # custom textures this entity brings (Map.add registers them)
 
     def __getitem__(self, k): return self.kv[k]
     def __setitem__(self, k, v): self.kv[k] = v
@@ -62,6 +63,20 @@ class Entity:
         return f"<Entity {self.classname} {self.kv.get('targetname', '')} brushes={len(self.brushes)}>"
 
 
+def prepare_texture(name, image):
+    """Make `image` (PIL image or path) usable as texture `name` right away (fit(),
+    alignment); returns the prepared image to embed. Names: max 15 characters."""
+    from PIL import Image
+    from .wad import default_db
+    from .wadwrite import _prepare
+    if len(name) > 15:
+        raise ValueError(f"texture name {name!r} is longer than 15 characters")
+    img = image if isinstance(image, Image.Image) else Image.open(image)
+    img = _prepare(img.convert("RGBA"))
+    default_db().register(name, img)
+    return img
+
+
 class Map:
     def __init__(self, name="untitled", **world_kv):
         self.name = name
@@ -70,6 +85,8 @@ class Map:
         self.entities: list[Entity] = []
         self.texlights: dict[str, str] = {}   # texture -> "r g b intensity" (info_texlights)
         self.custom_textures: dict = {}       # name -> PIL image, written to <map>_custom.wad
+        self.custom_sounds: dict = {}         # "hlbox/<map>/x.wav" (under valve/sound) -> source WAV
+        self.notes: list = []                 # problems found while building (reported by check())
 
     # --- building -------------------------------------------------------
     def add_world(self, *brushes):
@@ -78,10 +95,9 @@ class Map:
 
     def add(self, *entities):
         for e in entities:
-            if isinstance(e, (list, tuple)):
-                self.entities.extend(e)
-            else:
-                self.entities.append(e)
+            for ent in (e if isinstance(e, (list, tuple)) else [e]):
+                self.entities.append(ent)
+                self.custom_textures.update(getattr(ent, "textures", None) or {})
         return entities[0] if len(entities) == 1 else entities
 
     def texlight(self, texture, rgb=(255, 255, 255), intensity=1000):
@@ -92,16 +108,24 @@ class Map:
         """Add a non-standard texture (PIL image or image path). It is usable right away
         (fit(), alignment) and gets embedded in the BSP, so the map needs no extra files.
         Names: max 15 chars; '+0'/'+A' prefixes make toggling pairs, '{' transparent."""
-        from PIL import Image
-        from .wad import default_db
-        from .wadwrite import _prepare
-        if len(name) > 15:
-            raise ValueError(f"texture name {name!r} is longer than 15 characters")
-        img = image if isinstance(image, Image.Image) else Image.open(image)
-        img = _prepare(img.convert("RGBA"))
-        self.custom_textures[name] = img
-        default_db().register(name, img)
+        self.custom_textures[name] = prepare_texture(name, image)
         return name
+
+    def add_sound(self, name, source):
+        """Ship a WAV with the map: `name` is its path under valve/sound (e.g.
+        "hlbox/office/talk01.wav", what ambient_generic's `message` names); `source`
+        is the file. It is installed next to the map and listed in <map>.res."""
+        name = str(name).replace("\\", "/")
+        self.custom_sounds[name] = Path(source)
+        return name
+
+    def content_files(self, build_dir):
+        """Files the map needs besides its BSP, {path under valve/: built file}."""
+        build_dir = Path(build_dir)
+        files = {f"sound/{n}": build_dir / "sound" / n for n in self.custom_sounds}
+        if files:
+            files[f"maps/{self.name}.res"] = build_dir / f"{self.name}.res"
+        return files
 
     def all_entities(self):
         return [self.worldspawn] + self.entities
@@ -119,7 +143,7 @@ class Map:
         """Return a list of problems that would break compiling or playing."""
         from .wad import default_db
         db = default_db()
-        problems = []
+        problems = list(self.notes)
         for t in self.textures_used():
             if t not in db:
                 problems.append(f"texture not in any WAD: {t}")
@@ -141,6 +165,17 @@ class Map:
                 if v and str(v) not in names:
                     problems.append(f"{e.classname} {key}={v!r} matches no targetname"
                                     + (" (door/button would NOT be locked)" if key == "master" else ""))
+        for e in self.find("infodecal"):
+            if str(e.get("texture")) not in db:
+                problems.append(f"infodecal texture {e.get('texture')!r} is not in decals.wad")
+        from .voice import check_wav
+        for n, src in self.custom_sounds.items():
+            if len(n) > 60:
+                problems.append(f"sound name {n!r} is longer than 60 characters")
+            if not Path(src).exists():
+                problems.append(f"sound {n}: {src} does not exist")
+            else:
+                problems += [f"sound {n}: {p}" for p in check_wav(src)]
         if not self.find("info_player_start") and not self.find("info_player_deathmatch"):
             problems.append("no info_player_start")
         return problems
@@ -190,4 +225,13 @@ class Map:
             for name in self.custom_textures:
                 default_db().get(name).wad = str(wad)
         path.write_text(self.to_text(), encoding="latin-1")
+        if self.custom_sounds:          # copies next to the build, and the resource list
+            import shutil
+            for n, src in self.custom_sounds.items():
+                dest = path.parent / "sound" / n
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(src, dest)
+            res = ["// custom content for " + self.name + " (written by hlmap)"]
+            res += [f"sound/{n}" for n in sorted(self.custom_sounds)]
+            path.with_name(f"{self.name}.res").write_text("\n".join(res) + "\n", encoding="latin-1")
         return path

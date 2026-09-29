@@ -180,9 +180,11 @@ def ceiling_light(x, y, ceiling_z, width=64, depth=80, texture="+0~FIFTS_LGHT01"
     return [panel, anchor]
 
 
-def light(pos, color=(255, 240, 220), brightness=200, style=None, targetname=None, fade=None):
-    """Point light. brightness ~150-300 for a room."""
-    kv = {"origin": pos, "_light": f"{color[0]} {color[1]} {color[2]} {brightness}"}
+def light(pos, color=(255, 240, 220), brightness=200, style=None, targetname=None, fade=None, **extra):
+    """Point light. brightness ~150-300 for a room. A named light is switchable (the
+    compiler gives each name its own light style); extras: spawnflags=1 (starts dark),
+    pattern="mmnmmo..." (its look while on, 'a' dark .. 'm' normal .. 'z' double)."""
+    kv = {"origin": pos, "_light": f"{color[0]} {color[1]} {color[2]} {brightness}", **extra}
     if style is not None:
         kv["style"] = style
     if targetname:
@@ -201,19 +203,25 @@ def point(classname, pos, facing=None, **kv):
 
 # ---------------------------------------------------------------- logic
 
-def lock(name, origin):
+def lock(name, origin, globalstate=None):
     """A lock for doors and buttons: set their `master=name`. Locked until something fires
-    f"{name}_key" (a button, trigger, keycard pickup...). Returns the two entities."""
-    return [Entity("multisource", targetname=name, origin=tuple(origin)),
+    f"{name}_key" (a button, trigger, keycard pickup...); the key works once, so firing
+    it again can't relock (a multisource input toggles on every fire).
+    globalstate: also require that global state (a logic.Flag's .state, e.g. power).
+    Returns the two entities."""
+    kv = {"globalstate": globalstate} if globalstate else {}
+    return [Entity("multisource", targetname=name, origin=tuple(origin), **kv),
             Entity("trigger_relay", targetname=f"{name}_key", target=name, triggerstate=1,
-                   origin=tuple(origin))]
+                   spawnflags=1, origin=tuple(origin))]   # 1 = fire once
 
 
 def switch(pos, facing, target, texture="C1A1_SWTCH1", size=(10, 15), depth=2, sound=14,
-           toggle=True, master=None):
+           toggle=False, master=None, wait=1, **kv):
     """Wall switch (func_button) centred on `pos`, a point ON the wall surface, sticking
     `depth` units out toward `facing` (the side the player stands on). Pressing (+use)
-    fires `target`; sound 14 = light switch click."""
+    fires `target` (toggle); sound 14 = light switch click. With `master` it only works
+    while the master is on (it still clicks). Leave toggle=False with a master: a
+    toggle-mode button skips the master check on every second press (HLSDK)."""
     fx, fy = DIRS[facing]
     w, h = size
     x, y, z = pos
@@ -224,8 +232,8 @@ def switch(pos, facing, target, texture="C1A1_SWTCH1", size=(10, 15), depth=2, s
         y0, y1 = (y, y + depth) if fy > 0 else (y - depth, y)
         b = box((x - w / 2, y0, z - h / 2), (x + w / 2, y1, z + h / 2), "FIFTIES_DSK5B", comment="switch")
     b.fit(facing, texture)
-    kv = {"target": target, "sounds": sound, "wait": 1,
-          "spawnflags": 1 | (32 if toggle else 0)}   # 1 = don't move, 32 = toggle
+    kv = {"target": target, "sounds": sound, "wait": wait,
+          "spawnflags": 1 | (32 if toggle else 0), **kv}   # 1 = don't move, 32 = toggle
     if master:
         kv["master"] = master
     return Entity("func_button", brushes=[b], kv=kv)
@@ -400,10 +408,11 @@ def pipe(start, end, size=8, texture="GENERIC029"):
 # ---------------------------------------------------------------- projector & slides
 
 def projector(lens, screen_lo, screen_hi, ceiling_z=None, body="FIFTIES_DSK5B", lens_tex="FLATBED_LITE1",
-              beam_tex="+0~WHITE", beam_alpha=28):
+              beam_tex="+0~WHITE", beam_alpha=28, name=None):
     """Ceiling projector with its lens at `lens`, throwing a visible see-through light
     cone onto the vertical screen rectangle screen_lo..screen_hi.
-    Returns [body (func_detail), beam (additive func_illusionary)]."""
+    Returns [body (func_detail), beam (additive func_illusionary)]. With `name` the beam
+    is named, so an env_render can hide it (renderamt 0) and bring it back."""
     from .geometry import hull
     lx, ly, lz = lens
     sc = tuple((a + b) / 2 for a, b in zip(screen_lo, screen_hi))
@@ -434,7 +443,8 @@ def projector(lens, screen_lo, screen_hi, ceiling_z=None, body="FIFTIES_DSK5B", 
         for c in (-3, 3):
             near.append((round(lx + fx * 2 + (a if fy else 0)), round(ly + fy * 2 + (a if fx else 0)), round(lz + c)))
     beam = hull(near + [tuple(round(v) for v in p) for p in far], beam_tex, comment="projector beam")
-    return [detail(*parts), Entity("func_illusionary", brushes=[beam], rendermode=5, renderamt=beam_alpha)]
+    kv = {"targetname": name} if name else {}
+    return [detail(*parts), Entity("func_illusionary", brushes=[beam], rendermode=5, renderamt=beam_alpha, **kv)]
 
 
 def screen(lo, hi, facing, slide_tex, name=None, frame="FIFTIES_DSK5B"):
@@ -464,16 +474,29 @@ def pickup(classname, pos, fires=(), message=None, sound="buttons/bell1.wav", na
         ents.append(Entity("trigger_relay", targetname=f"{name}_hide{k}", killtarget=h, origin=tuple(pos)))
         mm[f"{name}_hide{k}"] = 0
     if message:
-        ents.append(Entity("game_text", targetname=f"{name}_msg", origin=tuple(pos), message=message,
-                           x=-1, y=0.72, effect=0, color="255 220 0", color2="255 255 255",
-                           fadein=0.05, fadeout=0.6, holdtime=3.5, channel=2, spawnflags=1))
+        ents.append(hud_message(f"{name}_msg", pos, message))
         mm[f"{name}_msg"] = 0
     if sound:
-        ents.append(Entity("ambient_generic", targetname=f"{name}_snd", origin=tuple(pos), message=sound,
-                           health=10, pitch=100, spawnflags=1 | 16 | 32))
+        ents.append(sound_effect(f"{name}_snd", pos, sound, everywhere=True))
         mm[f"{name}_snd"] = 0
     ents.append(Entity("multi_manager", targetname=name, origin=tuple(pos), kv=mm))
     return ents
+
+
+def hud_message(name, pos, text, color=(255, 220, 0), y=0.72, channel=2, hold=3.5):
+    """On-screen text shown to the player when `name` is fired (game_text; y 0 = top,
+    1 = bottom; messages on different channels can show at once)."""
+    return Entity("game_text", targetname=name, origin=tuple(pos), message=text, x=-1, y=y, effect=0,
+                  color=color, color2="255 255 255", fadein=0.05, fadeout=0.6, holdtime=hold,
+                  channel=channel, spawnflags=1)   # 1 = all players
+
+
+def sound_effect(name, pos, wav, volume=10, everywhere=False, radius="medium"):
+    """A sound played once each time `name` is fired (ambient_generic, not looping).
+    wav is relative to valve/sound, e.g. 'buttons/spark1.wav'."""
+    flags = 16 | 32 | (1 if everywhere else {"small": 2, "medium": 4, "large": 8}[radius])
+    return Entity("ambient_generic", targetname=name, origin=tuple(pos), message=wav, health=volume,
+                  pitch=100, spawnflags=flags)   # 16 = start silent, 32 = not looped
 
 
 def flat_prop(pos, w, d, texture, name=None, thick=1, sides="FIFTIES_DSK5B"):
@@ -485,3 +508,182 @@ def flat_prop(pos, w, d, texture, name=None, thick=1, sides="FIFTIES_DSK5B"):
     if name:
         return Entity("func_wall", brushes=[b], targetname=name)
     return detail(b)
+
+
+# ---------------------------------------------------------------- emergency lights, levers
+
+EMERGENCY_PULSE = "klmnopqrrqponmlk"     # slow pulse that never goes dark
+
+
+def emergency_light(pos, facing, name="emergency", color=(255, 36, 20), brightness=90,
+                    pattern=EMERGENCY_PULSE, lamp="+0~LIGHT6A", stand=None):
+    """A battery emergency lamp, dark until `name` is fired (e.g. by a logic.Circuit
+    power failure): then its light pulses and its lamp shows lit.
+    pos: point ON the wall; the lamp sticks out toward `facing`. stand=floor_z instead
+    puts the lamp on a pole standing on the floor under pos (e.g. in a cave).
+    Returns [lamp func_wall (starts on its +A 'off' frame), light, (pole)]."""
+    fx, fy = DIRS[facing]
+    x, y, z = pos
+    w, h, d = 16, 10, 8
+    if stand is not None:                # centred on pos
+        x, y = x - fx * d / 2, y - fy * d / 2
+    if fx:
+        b = box((min(x, x + fx * d), y - w / 2, z - h / 2), (max(x, x + fx * d), y + w / 2, z + h / 2),
+                "FIFTIES_DSK5B", comment="emergency lamp")
+    else:
+        b = box((x - w / 2, min(y, y + fy * d), z - h / 2), (x + w / 2, max(y, y + fy * d), z + h / 2),
+                "FIFTIES_DSK5B", comment="emergency lamp")
+    b.fit(facing, lamp)
+    b.fit("bottom", lamp)
+    parts = [Entity("func_wall", brushes=[b], targetname=name, frame=1),
+             light((x + fx * (d + 12), y + fy * (d + 12), z - 6), color, brightness, targetname=name,
+                   spawnflags=1, pattern=pattern)]
+    if stand is not None:
+        cx, cy = x + fx * d / 2, y + fy * d / 2
+        parts.append(detail(box((cx - 2, cy - 2, stand + 2), (cx + 2, cy + 2, z - h / 2), "FIFTIES_DSK5B", comment="pole"),
+                            box((cx - 10, cy - 10, stand), (cx + 10, cy + 10, stand + 2), "FIFTIES_DSK5B", comment="foot")))
+    return parts
+
+
+def lever(pos, facing, target, master=None, texture="BRKHANDLE", size=(12, 16), depth=8, travel=16,
+          sound=21, wait=2, **kv):
+    """A handle that slides up when used and springs back after `wait` s (a func_button
+    moving up; sound 21 = lever clunk). pos = centre of its base ON the wall; the
+    handle sticks out toward `facing`. With `master` it only works while the master is
+    on; locked, it stays put and just clunks."""
+    fx, fy = DIRS[facing]
+    w, h = size
+    x, y, z = pos
+    if fx:
+        b = box((min(x, x + fx * depth), y - w / 2, z), (max(x, x + fx * depth), y + w / 2, z + h), texture)
+    else:
+        b = box((x - w / 2, min(y, y + fy * depth), z), (x + w / 2, max(y, y + fy * depth), z + h), texture)
+    b.comment = "lever"
+    kv = {"target": target, "sounds": sound, "wait": wait, "speed": 60, "lip": h - travel,
+          "angles": "0 -1 0", "spawnflags": 0, **kv}      # angles 0 -1 0 = moves up
+    if master:
+        kv["master"] = master
+    return Entity("func_button", brushes=[b], kv=kv)
+
+
+# ---------------------------------------------------------------- signs & decals
+
+def _texname(prefix, text, *salt):
+    import hashlib
+    import re
+    clean = re.sub(r"[^A-Z0-9]", "", str(text).upper())[:15 - len(prefix) - 4]
+    digest = hashlib.md5(repr((text,) + salt).encode()).hexdigest()[:4].upper()
+    return f"{prefix}{clean}{digest}"
+
+
+def sign(pos, facing, text=None, w=48, h=16, style="steel", image=None, texture=None, depth=1,
+         frame="FIFTIES_DSK5B"):
+    """A wall sign centred on `pos` (a point ON the wall), facing into the room.
+    text: a nameplate drawn in one of Black Mesa's plate styles (art.plate: 'steel',
+    'red', 'brass', 'warning', 'white'; '\n' for more lines), or image: any picture
+    (poster, photo you may use). The generated texture travels with the entity and is
+    embedded when the map is written; texture= names a stock or existing one instead."""
+    from .art import plate
+    from .mapfile import prepare_texture
+    tex = texture
+    textures = {}
+    if tex is None:
+        img = image if image is not None else plate(text, (w, h), style)
+        tex = _texname("SG_", text if text else "IMG", style, w, h, id(image) if image is not None else 0)
+        textures[tex] = prepare_texture(tex, img)
+    ent = wall_art(pos, facing, tex, w, h, depth=depth, frame=frame)
+    ent.textures = textures
+    return ent
+
+
+def decal(texture, pos, name=None):
+    """A stock decal (decals.wad: '{SCORCH1', '{OIL1', '{CRACK2', '{ARROW_L', '{PSTRIPE4',
+    ...) on the surface within a few units of `pos` (the engine traces +-5 units from
+    it). With `name` it appears only when fired (e.g. a scorch mark after a blast)."""
+    kv = {"texture": texture}
+    if name:
+        kv["targetname"] = name
+    return point("infodecal", pos, **kv)
+
+
+STENCIL = {**{chr(c): f"{{CAPS{chr(c)}" for c in range(65, 91)}, **{str(d): f"{{SMALL#S{d}" for d in range(10)}}
+
+
+def stencil(text, pos, facing, size=16, gap=-3):
+    """Stencilled lettering from stock decals only, 16 units tall, centred on `pos` on
+    a wall facing `facing`; needs no custom texture. Letters ({CAPSA-Z) are yellow
+    stencil paint; digits ({SMALL#S0-9, the only ones that size) come out black.
+    The glyphs have blank margins, hence the negative gap."""
+    fx, fy = DIRS[facing]
+    rx, ry = -fy, fx                      # the viewer's right, looking at the wall
+    chars = [c for c in text.upper()]
+    widths = [size if c in STENCIL else size // 2 for c in chars]
+    total = sum(widths) + gap * (len(chars) - 1)
+    x, y, z = pos
+    off = -total / 2
+    out = []
+    for c, wd in zip(chars, widths):
+        mid = off + wd / 2
+        if c in STENCIL:
+            out.append(decal(STENCIL[c], (round(x + rx * mid + fx), round(y + ry * mid + fy), z)))
+        off += wd + gap
+    return out
+
+
+# ---------------------------------------------------------------- slideshows & triggers
+
+def slideshow(name, lo, hi, facing, textures, frame="FIFTIES_DSK5B"):
+    """A screen (lo..hi, a thin box on a wall) that steps through any number of slides.
+    Each slide is a func_wall_toggle plate on the screen's front (only the current one
+    is shown). Fire f"{name}_next" to advance (wrapping round), or f"{name}_step{k}" to
+    go from slide k to k+1. f"{name}_next" is a relay whose target a
+    trigger_changetarget rewrites at every step, so it always knows the current slide.
+    Returns the entities; slideshow_front(lo, hi, facing) is where the slides' faces are."""
+    fx, fy = DIRS[facing]
+    (x0, y0, z0), (x1, y1, z1) = lo, hi
+    ents = [detail(box(lo, hi, frame, comment="screen"))]
+    n = len(textures)
+    for k, tex in enumerate(textures, 1):
+        if fy:
+            y = y0 if fy < 0 else y1
+            b = box((x0, min(y, y + fy), z0), (x1, max(y, y + fy), z1), frame, comment=f"slide {k}")
+        else:
+            x = x0 if fx < 0 else x1
+            b = box((min(x, x + fx), y0, z0), (max(x, x + fx), y1, z1), frame, comment=f"slide {k}")
+        b.fit(facing, tex)
+        ents.append(Entity("func_wall_toggle", brushes=[b], targetname=f"{name}_{k}",
+                           spawnflags=0 if k == 1 else 1))           # 1 = starts hidden
+    o = tuple((a + b) / 2 for a, b in zip(lo, hi))
+    ents.append(Entity("trigger_relay", targetname=f"{name}_next", target=f"{name}_step1", triggerstate=2, origin=o))
+    for k in range(1, n + 1):
+        nxt = k % n + 1
+        ents.append(Entity("multi_manager", targetname=f"{name}_step{k}", origin=o,
+                           kv={f"{name}_{k}": 0, f"{name}_{nxt}": 0, f"{name}_to{nxt}": 0}))
+        ents.append(Entity("trigger_changetarget", targetname=f"{name}_to{nxt}", target=f"{name}_next",
+                           m_iszNewTarget=f"{name}_step{nxt}", origin=o))
+    return ents
+
+
+def slideshow_front(lo, hi, facing):
+    """(lo, hi) of the plane the slides show on: what a projector or a cover targets."""
+    fx, fy = DIRS[facing]
+    lo, hi = list(lo), list(hi)
+    if fy:
+        y = (lo[1] - 1) if fy < 0 else (hi[1] + 1)
+        lo[1] = hi[1] = y
+    else:
+        x = (lo[0] - 1) if fx < 0 else (hi[0] + 1)
+        lo[0] = hi[0] = x
+    return tuple(lo), tuple(hi)
+
+
+def trigger(mins, maxs, target, once=True, master=None, **kv):
+    """An invisible volume that fires `target` when the player walks in (trigger_once,
+    or trigger_multiple with once=False). With `master`, only while the master is on;
+    a trigger_once that is locked stays armed."""
+    kv = {"target": target, **kv}
+    if master:
+        kv["master"] = master
+    return Entity("trigger_once" if once else "trigger_multiple",
+                  brushes=[box(mins, maxs, "AAATRIGGER", comment="trigger")], kv=kv)
+
