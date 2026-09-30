@@ -58,6 +58,11 @@ playing it:
   Corridors run at any angle, carved with exact convex CSG (`hlmap/csg.py`). A room
   in the way gets its corner cut: in the office, a 45° corridor slips past the
   storage room to a cafeteria.
+- `hlmap/terrain.py` builds open terrain for outdoor areas under a sky: hills and
+  lawns as watertight triangle columns (GoldSrc has no displacements). The office's
+  cafeteria opens onto a patio and a staff car park with brush-built cars and painted
+  bays. There are crossed-plane trees, lamp posts, and a road to a tunnel past a
+  security booth whose button raises and lowers a boom barrier.
 - `hlmap/cave.py` builds organic caves. A heightfield of simple rock columns follows a
   path out of a doorway. It's watertight by construction, its collision is verified,
   and its materials can change along the way (rock turning into Xen).

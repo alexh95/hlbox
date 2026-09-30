@@ -2,6 +2,9 @@
 
 Top view (+Y = north), ground floor:
 
+            hills . . . trees . . . hills
+      parking lot (cars)  ==== road ==== [booth][barrier] ==== tunnel portal
+      patio / sidewalk / facade  (outside, under a desert sky)
       cafeteria
           \\  corridor at 45 degrees (cuts the storage room's corner)
            \\   +--------------------------------+
@@ -35,6 +38,7 @@ from PIL import Image, ImageDraw
 
 from hlmap.art import DECK, bullets, deck_slide, font, plate, slide, waveform
 from hlmap.cave import ROCK
+from hlmap.geometry import cylinder
 
 CONFERENCE = Material(floor="FIFTIES_FLR02C", wall="FIFTIES_WALL14U", ceiling="FIFTIES_CEIL01",
                       ceiling_align="center")
@@ -45,6 +49,30 @@ RECORDS = Material(floor="FIFTIES_FLR02C", wall="FIFTIES_WALL14A", ceiling="FIFT
 BASEMENT = Material(floor="CRETE2_FLR01", wall="CRETE4_WALL01", ceiling="CRETE3_CEIL01")
 CAFETERIA = Material(floor="FIFTIES_FLR5", wall="FIFTIES_W13", ceiling="FIFTIES_CEIL01",
                      floor_align="min", ceiling_align="center")
+# outside: the bare floor is asphalt; walls and ceiling are sky (terrain hides the base)
+OUTSIDE = Material(floor="OUT_PAVE1", wall="sky", ceiling="sky")
+GRID = 128                               # the terrain grid, from the outdoor room's corner
+FRONT = (-1088, 672, 448, 928)           # flat rectangles (grid-aligned): along the facade
+LOT = (-1344, 928, 64, 1568)             # the parking lot
+ROAD = (64, 1056, 1216, 1440)            # the access road east to the tunnel
+BOOTH_PAD = (448, 1312, 832, 1568)
+
+
+def _smooth(v, a, b):
+    t = max(0.0, min(1.0, (v - a) / (b - a)))
+    return t * t * (3 - 2 * t)
+
+
+def ground_height(x, y):
+    """Terrain around the lot: a rolling lawn, hills rising at the edges of the site."""
+    lawn = 18 + 8 * math.sin(x / 300 + 1.3) * math.cos(y / 260) + 5 * math.sin(x / 97 + y / 131)
+    # hill feet wander and their heights vary, so they read as land, not embankments
+    north = _smooth(y + 130 * math.sin(x / 260) + 60 * math.sin(x / 97 + 1), 1700, 2250) * (360 + 70 * math.sin(x / 190))
+    west = _smooth(-x + 90 * math.sin(y / 210), 1250, 1560) * (280 + 50 * math.sin(y / 150 + 2))
+    east = _smooth(x + 80 * math.sin(y / 170), 860, 1180) * (260 + 40 * math.sin(y / 130))
+    sw = _smooth(-x, 1088, 1350) * (1 - _smooth(y, 800, 1050)) * 260
+    se = _smooth(x, 448, 700) * (1 - _smooth(y, 900, 1056)) * 240
+    return max(lawn, north, west, east, sw, se) + 4 * math.sin(x / 57) * math.cos(y / 71)
 XEN = Material(floor="-0XENO_2WA", wall="-0XENO_2W1", ceiling="-0XENO_2W1")
 
 LIGHT_TEX = "+0~FIFTS_LGHT01"       # office-type rooms
@@ -424,7 +452,7 @@ def breaker_textures():
 
 
 def build():
-    m = Map("office")
+    m = Map("office", skyname="desert")
     lvl = Level(wall=16)
 
     # --- rooms --------------------------------------------------------------------------
@@ -435,6 +463,11 @@ def build():
     basement = lvl.room("basement", (0, -96, -176), (448, 352, -16), BASEMENT)
     corridor = lvl.room("basement corridor", (-480, -96, -176), (-16, -16, -16), BASEMENT)
     cafe = lvl.room("cafeteria", (-592, 320, 0), (-160, 656, 144), CAFETERIA)
+    # outside, north of the building: reached through the cafeteria's patio door
+    outside = lvl.room("outside", (-1600, 672, 0), (1216, 2336, 768), OUTSIDE,
+                       checkpoints=[(-232, 740), (-700, 1250), (400, 1250), (656, 1470), (-600, 1690), (1000, 1250)])
+    patio_door = lvl.doorway(cafe, outside, width=64, height=96, center=-232)
+    grounds = lvl.terrain("grounds", outside, ground_height, cell=GRID, flat=[FRONT, LOT, ROAD, BOOTH_PAD])
 
     conf_door = lvl.doorway(conf, hall, width=64, height=96, center=96)
     west_door = lvl.doorway(hall, storage, width=80, height=96, center=-64)
@@ -470,6 +503,7 @@ def build():
 
     # --- doors & locks ----------------------------------------------------------------------
     m.add(props.door_rotating(conf_door, hinge="right"))
+    m.add(props.door_rotating(patio_door, hinge="left", texture="FIFTIES_DR1K"))
     m.add(props.lock("storage_lock", west_door.center),
           props.lock("records_lock", east_door.center, globalstate=grid.flag.state))   # card AND power
     for door, name in ((west_door, "storage_lock"), (east_door, "records_lock")):
@@ -493,6 +527,7 @@ def build():
 
     conference(m, conf, conf_hole, grid)
     cafeteria(m, cafe, walkway, grid)
+    outdoors(m, outside, grounds)
     storage_room(m, storage, store_hole, grid)
     records_room(m, records, grid)
     basement_rooms(m, basement, grid)
@@ -565,6 +600,15 @@ def build():
         "cafeteria": (-200, 350, 76, 6, 125),
         "cafeteria_counter": (-380, 470, 64, 2, 90),
         "storage_corner": (-330, 10, 72, 0, 50),
+        # outside
+        "outside_door": (-232, 730, 80, 6, 95),
+        "parking": (-1250, 960, 200, 16, 32),
+        "booth_barrier": (380, 1180, 90, 4, 22),
+        "barrier_up": (380, 1180, 90, 4, 22, ["barrier"]),
+        "booth_inside": (700, 1500, 70, 14, 215),
+        "tunnel": (760, 1250, 80, 0, 0),
+        "hills": (-300, 1560, 110, -4, 80),
+        "facade": (-420, 1320, 110, 4, 280),
     }
     return m
 
@@ -685,6 +729,110 @@ def cafeteria(m, cafe, walkway, grid):
     m.add(props.vending_machine(x1 - 16, 560, z0, "west"), props.vending_machine(x1 - 16, 500, z0, "west"),
           props.barrel(x1 - 24, y0 + 40, z0, texture="STEEL", top="BARRELTOP", r=12, h=34),   # bin
           props.sign((x0, 480, 72), "east", texture="SIGN5", w=24, h=24))       # no smoking
+
+
+def outdoors(m, outside, grounds):
+    """The site north of the building: patio, parking lot, access road with a security
+    booth and a boom barrier, a tunnel portal, trees and hills under a desert sky."""
+    from hlmap.art import paint
+    gz = lambda x, y: grounds.surface(x, y) or 0
+    # the sun, and the sky's blue fill light
+    m.add(props.point("light_environment", (0, 1500, 600), pitch=-50, angles="0 210 0",
+                      kv={"_light": "255 236 204 260", "_diffuse_light": "140 160 196 70"}))
+    # the building's face: a wall with windows and a parapet, the patio door through it
+    wall, door_x = "OUT_WALL1A", (-264, -200)
+    m.add_world(box((-1100, 672, 0), (door_x[0], 688, 224), wall, comment="facade"),       # part of the wall
+                box((door_x[1], 672, 0), (420, 688, 224), wall, comment="facade"),
+                box((door_x[0], 672, 96), (door_x[1], 688, 224), wall, comment="facade over the door"))
+    m.add(props.detail(box((-1108, 672, 224), (428, 698, 240), "OUT_CON", comment="parapet")))
+    for x in range(-1040, 400, 160):
+        if not -360 < x < -100:
+            m.add(props.wall_art((x, 688, 136), "north", "GLASS_DARK", 96, 64, depth=3, frame="OUT_GALV1"))
+    m.add(props.sign((-232, 688, 124), "north", "CAFETERIA  \u00b7  PATIO", 80, 14, "steel"),
+          props.sign((-700, 688, 196), "north", "ADMINISTRATION", 208, 30, "steel"))
+    # sidewalk along the building, and the patio in front of the door
+    walk = "OUT_WLK"
+    m.add(props.detail(box((-1088, 688, 0), (448, 800, 8), walk, comment="sidewalk"),
+                       box((-560, 800, 0), (-80, 912, 8), walk, comment="patio")))
+    for x, (dx0, dx1) in ((-1060, (-1060, -620)), (0, (0, 420))):
+        m.add(props.detail(box((dx0, 792, 8), (dx1, 800, 36), "OUT_SHRB1", comment="hedge")))
+    for x in (-480, -320, -160):
+        m.add(props.table(x, 856, 8, width=72, depth=40, height=28, top="FIFTIES_DR1"),
+              props.detail(box((x - 36, 822, 8), (x + 36, 832, 24), "FIFTIES_DR1", comment="bench"),
+                           box((x - 36, 880, 8), (x + 36, 890, 24), "FIFTIES_DR1", comment="bench")),
+              props.umbrella(x, 856, 36, radius=56, height=70, texture="STRIPES4" if x != -320 else "STRIPES1"))
+    # the parking lot: painted bays, cars, lamps, a reserved spot
+    m.add_texture("PAINTW", paint((228, 228, 220), gloss=False, noise=10))
+    m.add_texture("PAINTY", paint((232, 196, 40), gloss=False, noise=10))
+    m.add(props.bay_lines(-1328, 16, 944, 1136), props.bay_lines(-1328, 16, 1368, 1560))
+    bay = lambda k: -1280 + 96 * k
+    for k, color in ((1, "red"), (3, "white"), (4, "blue"), (7, "silver"), (10, "green"), (12, "yellow")):
+        m.add(props.car(bay(k), 1044, 0, "south", color))
+    for k, color in ((0, "black"), (2, "brown"), (5, "white"), (8, "red"), (11, "silver")):
+        m.add(props.car(bay(k), 1460, 0, "north", color))
+    m.add(props.sign((bay(13), 944, 60), "north", "RESERVED\nEMPLOYEE OF THE MONTH", 56, 24, "white"),
+          props.detail(box((bay(13) - 2, 940, 0), (bay(13) + 2, 944, 48), "OUT_GALV1", comment="sign post")),
+          props.detail(cylinder((bay(13), 1040), 14, 0, 20, sides=8, tex="C1A1_FLR1", comment="pot")))
+    m.add(props.tree((bay(13), 1040, 18), height=88, width=72, seed=7))       # Gerald's cousin
+    for x in (-1200, -700, -200):
+        m.add(props.lamp_post(x, 1600, gz(x, 1600), "south", brightness=110))
+    m.add(props.lamp_post(300, 1460, 0, "south", brightness=110))
+    m.add(props.sign((100, 1060, 70), "west", "STAFF PARKING", 64, 16, "white"),
+          props.detail(box((98, 1056, 0), (102, 1064, 62), "OUT_GALV1", comment="sign post")))
+    # the road east: centre dashes and edge lines
+    dashes = [box((x, 1246, 0), (x + 48, 1250, 1), "PAINTY", comment="road dash") for x in range(96, 1100, 96)]
+    edges = [box((64, y - 2, 0), (1120, y + 2, 1), "PAINTW", comment="road edge") for y in (1150, 1346)]
+    m.add(props.Entity("func_illusionary", brushes=dashes + edges))
+    # the security booth, and the barrier it works
+    booth(m)
+    m.add(props.boom_barrier((560, 1360, 0), "south", length=200, name="barrier", reverse=True))
+    m.add(props.sign((548, 1376, 72), "east", texture="SIGN2", w=28, h=28),        # STOP
+          props.detail(box((546, 1372, 0), (550, 1380, 58), "OUT_GALV1", comment="sign post")))
+    # the road leaves through a tunnel into the hill
+    m.add(props.detail(box((1120, 1056, 0), (1152, 1120, 192), "OUT_CON", comment="portal"),
+                       box((1120, 1376, 0), (1152, 1440, 192), "OUT_CON", comment="portal"),
+                       box((1120, 1120, 160), (1152, 1376, 192), "OUT_CON", comment="portal lintel"),
+                       box((1120, 1056, 192), (1216, 1440, 330), "-0OUT_GRND2B", comment="hill over the tunnel"),
+                       box((1152, 1056, 0), (1216, 1120, 192), "-0OUT_GRND2B", comment="hill"),
+                       box((1152, 1376, 0), (1216, 1440, 192), "-0OUT_GRND2B", comment="hill")))
+    m.add(props.Entity("func_wall", brushes=[box((1150, 1120, 0), (1152, 1376, 160), "BLACK", comment="tunnel dark")]))
+    m.add(props.sign((1120, 1248, 176), "west", "SECTOR ACCESS", 128, 20, "warning"))
+    # trees on the lawns and hills, cacti on the dry south-east slope
+    for k, (x, y) in enumerate([(-1250, 1690), (-1000, 1720), (-760, 1680), (-520, 1710), (-280, 1690), (-40, 1720),
+                                (220, 1690), (-620, 860), (-20, 870), (-1460, 1250), (900, 1620), (-1180, 820)]):
+        kind = "pine" if k % 3 == 2 else "broad"
+        leaf = (50, 90, 60) if kind == "pine" else (72, 108, 50)
+        m.add(props.tree((x, y, gz(x, y)), height=232 + 24 * (k % 3), width=176, seed=k, kind=kind, leaf=leaf))
+    for k, (x, y) in enumerate([(700, 860), (840, 940), (980, 820)]):
+        m.add(props.cactus(x, y, gz(x, y), height=88 + 16 * k, seed=k))
+
+
+def booth(m):
+    """The security booth by the barrier: glass to the road, a desk with the button."""
+    x0, y0, x1, y1, h, t = 592, 1392, 720, 1520, 112, 8
+    wall = "OUT_WALL7"
+    parts = [box((x0, y0, 0), (x1, y0 + t, 48), wall), box((x0, y0, 96), (x1, y0 + t, h), wall),        # south: window band
+             box((x0, y0, 48), (x0 + 16, y0 + t, 96), wall), box((x1 - 16, y0, 48), (x1, y0 + t, 96), wall),
+             box((x1 - t, y0, 0), (x1, y1, 48), wall), box((x1 - t, y0, 96), (x1, y1, h), wall),        # east: window band
+             box((x1 - t, y1 - 16, 48), (x1, y1, 96), wall),
+             box((x0, y1 - t, 0), (x1, y1, h), wall),                                                   # north
+             box((x0, y0, 0), (x0 + t, y0 + 32, h), wall), box((x0, y0 + 96, 0), (x0 + t, y1, h), wall),  # west, door
+             box((x0, y0 + 32, 96), (x0 + t, y0 + 96, h), wall),
+             box((x0 - 8, y0 - 8, h), (x1 + 8, y1 + 8, h + 8), "OUT_ROOF1")]
+    for b in parts:
+        b.comment = "booth"
+    m.add(props.detail(*parts))
+    glass = [box((x0 + 16, y0 + 3, 48), (x1 - 16, y0 + 5, 96), "GLASS_MED", comment="booth window"),
+             box((x1 - 5, y0 + t, 48), (x1 - 3, y1 - 16, 96), "GLASS_MED", comment="booth window")]
+    m.add(props.Entity("func_wall", brushes=glass, rendermode=2, renderamt=90))
+    m.add(props.table(664, 1420, 0, width=96, depth=28, height=30, top="FIFTIES_DSK5B", legs="FIFTIES_DSK5B"),
+          props.chair(664, 1462, 0, facing="south"),
+          props.detail(props.front_box(700, 1416, 30, 20, 14, 16, "south", "FIFTIES_MON3")))
+    button = box((636, 1412, 30), (648, 1424, 33), "FIFTIES_DSK5B", comment="barrier button")
+    button.fit("top", "+0BUTTON2")
+    m.add(props.Entity("func_button", brushes=[button], target="barrier", sounds=14, wait=1, spawnflags=1))
+    m.add(props.sign((656, y0, 104), "south", "SECURITY", 64, 14, "steel"),
+          props.light((656, 1456, 100), color=(255, 240, 210), brightness=90))
 
 
 def menu_texture():

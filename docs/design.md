@@ -216,6 +216,10 @@ against the level's intended air and refuses to install on failure:
   - Calibration on the office: lit rooms read 110-220, a switched-off hall 6-8,
     dim cave stretches 40-80. Without its emergency lamps, the route from the
     card to the breaker crossed 1,688 dark units.
+- **Performance.** Floods are incremental: when a door opens, the earlier flood is
+  kept and only grown from that door, so a big outdoor area doesn't cost a full
+  re-flood per state of play. The office has 84k positions and 12 states in about
+  1.5 minutes.
 - **Decals.** Every infodecal must have solid within 4 units (the game traces 5
   units from it), or it silently doesn't appear.
 - **Pickups.** Every item is walked at straight, as a player who has spotted it does.
@@ -231,7 +235,9 @@ against the level's intended air and refuses to install on failure:
     both passed it. `playtest --pickups` agreed with the model on all 6 approaches
     after the fix, and on the failing one before it.
 - **Coverage.** Every generated face with real air in front has a matching face in
-  the BSP. That catches polygons the compiler deleted, which you'd see through.
+  the BSP. That catches polygons the compiler deleted, which you'd see through. It
+  probes each face's centre and points toward its corners, half a unit out, so a thin
+  sign covering the centre doesn't hide the rest.
 - **Self-tests.** `tests/test_verify.py` compiles rooms with known defects and checks
   each one is caught:
   - holes, invisible walls and missing faces;
@@ -241,7 +247,9 @@ against the level's intended air and refuses to install on failure:
   - a route to the breaker with no emergency lights (dark), and the same route lit;
   - a card on a table behind a pole (the playtest bug), and the same card at the edge;
   - a diagonal corridor that cuts a room's corner: sealed in every hull, walkable, and
-    the cut room stays unreachable (the corridor mustn't break into it).
+    the cut room stays unreachable (the corridor mustn't break into it);
+  - terrain under a sky, with a flat pad and a slope: sealed, walkable, and every face
+    present.
   A clean room must pass. `tests/test_logic.py` checks the logic helpers against the
   simulator without compiling (switch positions through an outage, gates, chaining
   past 16 multi_manager targets, locks needing key and power).
@@ -362,6 +370,14 @@ backing, and a two-storey room with a mezzanine (the records room in
   ladder brush).
 
 ### 4.3 Terrain and caves
+**Done:** open terrain (`hlmap/terrain.py`, `Level.terrain`). It's a heightfield of
+triangle columns (the cave's watertight construction) rising from an outdoor room's
+floor, with flat rectangles left as bare floor for roads and lots, and grass or dry
+ground chosen by slope. `is_air` excludes the ground, room checkpoints sit on it, and
+a verify test compiles a terrain with a flat pad and a slope (sealed in every hull,
+walkable). The office's outdoor site uses about 350 columns on a 128 grid. That
+doubled clipnodes (to ~41%) and world leaves (to ~38%), comfortably under the limits.
+
 **Status:** caves are implemented as a heightfield (`hlmap/cave.py`, used by
 `maps/office.py`). All verification checks pass: no holes in any hull, no invisible
 walls, full reachability, full face coverage.
@@ -516,8 +532,8 @@ inside `valve/` that the install manifest tracks (§10.1, option a).
   its assets.
 
 ## 7. Lighting roadmap
-- **More light types:** `light_spot` (a cone with pitch) and `light_environment` with
-  sky brushes and `skyname` for outdoor areas.
+- **More light types:** `light_spot` (a cone with pitch). Done: `light_environment` with
+  sky brushes and `skyname` for outdoor areas (the office's desert site).
 - **Switchable lights.** Done. A named light gets its own light style from the
   compiler, so buttons can turn it on and off. Texture lights follow it when their
   brush entity has `style -3` and the same targetname (sdHLCSG `qcsg.cpp`); the entity

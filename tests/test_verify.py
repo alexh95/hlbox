@@ -244,6 +244,39 @@ def test_diagonal_corridor_is_sealed_and_walkable():
     assert [n for n, _ in p.missing] == ["room c"], p.missing
 
 
+def test_terrain_is_sealed_and_walkable():
+    """Outdoor terrain (a heightfield of triangle columns under a sky): no holes in any
+    hull, no invisible walls, every face present, and a gentle slope is walkable."""
+    import math
+    from hlmap.verify import progression
+    m = Map("vterrain", skyname="desert")
+    lvl = Level(wall=16)
+    out = lvl.room("out", (0, 0, 0), (1024, 1024, 512),
+                   Material("OUT_PAVE1", "sky", "sky"), checkpoints=[(200, 200), (512, 700)])
+    ground = lvl.terrain("ground", out, lambda x, y: 16 + max(0, y - 512) * 0.4 + 12 * math.sin(x / 90),
+                         cell=128, flat=[(0, 0, 512, 384)])
+    lvl.build(m)
+    m.add(props.player_start((128, 128, 0)), props.light((512, 512, 400)))
+    path = Path(tempfile.mkdtemp()) / "vterrain.map"
+    res = compile_map(m.write(path), profile="fast", steps=("csg", "bsp"))
+    assert res.ok, res.summary()
+    h = Hulls(res.bsp)
+    brushes = m.worldspawn.brushes
+    for hull in (0, 1, 3):
+        assert leaks_into_solid(h, lvl.is_air, hull)[0] == [], f"hull {hull} has holes"
+        if hull:
+            assert invisible_walls(h, lvl.is_air, hull, _box_hits(brushes))[1] == 0, f"hull {hull} invisible walls"
+
+    def solid_at(p):
+        return any(all(f.normal[0] * p[0] + f.normal[1] * p[1] + f.normal[2] * p[2] <= f.dist + 0.01
+                       for f in b.faces) for b in brushes)
+    missing, checked, _ = coverage(h, brushes, lvl.is_air, solid_at)
+    assert missing == [] and checked > 50, missing
+    assert ground.surface(512, 700) > 60                     # the checkpoint is up the slope
+    p = progression(h, lvl.checkpoints())
+    assert p.missing == [], p.missing
+
+
 def test_stairs_are_walkable():
     """Level.stairs must leave head room for a 32-wide, 72-tall player all the way down."""
     from hlmap.verify import progression

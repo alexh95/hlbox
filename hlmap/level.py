@@ -198,13 +198,16 @@ class Level:
         self.notes: list = []        # things the builder did that you should know about
 
     # --- description ------------------------------------------------------
-    def room(self, name, mins, maxs, material: Material | None = None, group=None, **overrides):
+    def room(self, name, mins, maxs, material: Material | None = None, group=None, checkpoints=None, **overrides):
         """Add a room of empty space. overrides: floor=, wall=, ceiling= texture names.
-        Rooms must be separated by walls unless they share a `group` (then they merge)."""
+        Rooms must be separated by walls unless they share a `group` (then they merge).
+        checkpoints: [(x, y), ...] places in it that must be reachable on foot (default:
+        the centre and inset corners; give them for rooms with terrain)."""
         mat = material or self.material
         if overrides:
             mat = mat.with_(**overrides)
-        r = Room(name, AABB(tuple(mins), tuple(maxs)), mat, group=group)
+        r = Room(name, AABB(tuple(mins), tuple(maxs)), mat, group=group,
+                 meta={"checkpoints": list(checkpoints)} if checkpoints else {})
         if not r.box.valid():
             raise ValueError(f"room {name}: mins must be < maxs, got {mins} {maxs}")
         self.rooms.append(r)
@@ -306,6 +309,14 @@ class Level:
                 self.notes.append(f"{r.name}: corner cut by corridor {name} ({lost:.0%} of its floor)")
         self.corridors.append(c)
         return c
+
+    def terrain(self, name, room, height, **opts):
+        """Hills and lawns in an (outdoor) room: a heightfield of brush columns rising
+        from its floor; see hlmap.terrain.Terrain. Returns the Terrain (surface(x, y))."""
+        from .terrain import Terrain
+        t = Terrain(name, room, height, **opts)
+        self.features.append(t)
+        return t
 
     def _floor_near(self, xy):
         """Floor of the highest room over (x, y) (stacked rooms: the upper one)."""
@@ -411,6 +422,8 @@ class Level:
     def is_air(self, p, tol=0.0):
         """True if p is inside intended air (rooms, openings, extra air, corridors, caves),
         with `tol` units of slack."""
+        if any(f.in_ground(p, tol) for f in self.features if hasattr(f, "in_ground")):
+            return False              # inside terrain
         for r in self.all_air():
             if r.contains(p, tol):
                 return True
@@ -424,6 +437,14 @@ class Level:
         out = []
         for r in self.rooms:
             (x0, y0, z), (x1, y1, _) = r.mins, r.maxs
+            if r.meta.get("checkpoints"):
+                pts = []
+                for x, y in r.meta["checkpoints"]:
+                    zs = [f.surface(x, y) for f in self.features if hasattr(f, "surface")]
+                    top = max([z] + [s for s in zs if s is not None])
+                    pts.append((x, y, top + 37))
+                out.append((f"room {r.name}", pts))
+                continue
             pts = [((x0 + x1) / 2, (y0 + y1) / 2)] + [(x, y) for x in (x0 + 40, x1 - 40) for y in (y0 + 40, y1 - 40)]
             cx, cy = pts[0]
             for i, (x, y) in enumerate(pts):         # corners cut off: move toward the middle
@@ -442,6 +463,8 @@ class Level:
         return out
 
     def is_inside(self, p):
+        if any(f.in_ground(p, -2) for f in self.features if hasattr(f, "in_ground")):
+            return False
         return (any(r.contains(p) for r in self.all_air()) or any(c.contains(p) for c in self.corridors)
                 # +2: things standing exactly on a tunnel floor count as inside
                 or any(f.contains((p[0], p[1], p[2] + 2)) for f in self.features if hasattr(f, "contains")))

@@ -228,3 +228,74 @@ def waveform(d, samples, box, color, bars=90):
         x = x0 + i * step
         d.rectangle((x, mid - a * half, x + step * 0.6, mid + a * half), fill=color)
 
+
+# ---------------------------------------------------------------- outdoor textures
+
+def tree(seed=0, size=(256, 256), leaf=(70, 110, 52), kind="broad"):
+    """A painted tree with a transparent background, for crossed '{' planes
+    (props.tree). kind: 'broad' (round canopy) or 'pine' (a tall cone)."""
+    import random
+    rnd = random.Random(seed)
+    w, h = size
+    img = Image.new("RGBA", size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    bark = (86, 62, 40, 255)
+    d.polygon([(w * 0.46, h), (w * 0.54, h), (w * 0.52, h * 0.35), (w * 0.48, h * 0.35)], fill=bark)
+    if kind == "pine":
+        for k in range(7):                            # stacked, narrowing tiers
+            y = h * (0.92 - k * 0.12)
+            half = w * (0.44 - k * 0.055)
+            d.polygon([(w / 2 - half, y), (w / 2 + half, y), (w / 2, y - h * 0.24)],
+                      fill=tuple(max(0, c - 10 + rnd.randint(-8, 8)) for c in leaf) + (255,))
+    else:
+        for _ in range(9):                            # branches
+            y = h * rnd.uniform(0.35, 0.6)
+            d.line((w / 2, y, w / 2 + rnd.uniform(-0.3, 0.3) * w, y - h * rnd.uniform(0.1, 0.25)), fill=bark, width=3)
+        for k in range(150):                          # leaf clumps, darker underneath
+            r = rnd.uniform(w * 0.04, w * 0.085)
+            cx = min(w - r - 2, max(r + 2, w / 2 + rnd.gauss(0, w * 0.15)))
+            cy = min(h * 0.62, max(r + 2, h * 0.34 + rnd.gauss(0, h * 0.12)))
+            shade = rnd.uniform(-28, 30) - (cy / h - 0.3) * 60
+            col = tuple(max(0, min(255, int(c + shade))) for c in leaf) + (255,)
+            d.ellipse((cx - r, cy - r * 0.85, cx + r, cy + r * 0.85), fill=col)
+    px = img.load()                                   # speckle
+    for _ in range(w * h // 6):
+        x, y = rnd.randrange(w), rnd.randrange(h)
+        r, g, b, a = px[x, y]
+        if a:
+            n = rnd.randint(-14, 14)
+            px[x, y] = (max(0, min(255, r + n)), max(0, min(255, g + n)), max(0, min(255, b + n)), a)
+    return img
+
+
+def paint(color, size=(64, 64), gloss=True, noise=6, seed=0):
+    """A painted surface (car body, road marking): flat colour, a soft highlight
+    band and a little grit."""
+    import random
+    rnd = random.Random(seed)
+    w, h = size
+    img = Image.new("RGB", size)
+    px = img.load()
+    for y in range(h):
+        t = y / max(1, h - 1)
+        k = 1.0 + (0.18 * max(0.0, 1 - abs(t - 0.3) * 4) if gloss else 0) - 0.12 * t
+        for x in range(w):
+            n = rnd.randint(-noise, noise)
+            px[x, y] = tuple(max(0, min(255, int(c * k) + n)) for c in color)
+    return img
+
+
+def bark(size=(64, 128), seed=0):
+    import random
+    rnd = random.Random(seed)
+    w, h = size
+    img = Image.new("RGB", size, (82, 60, 40))
+    d = ImageDraw.Draw(img)
+    for _ in range(40):                               # vertical furrows
+        x = rnd.randrange(w)
+        d.line((x, 0, x + rnd.randint(-3, 3), h), fill=(52, 38, 26), width=rnd.choice((1, 2)))
+    for _ in range(300):
+        x, y = rnd.randrange(w), rnd.randrange(h)
+        d.point((x, y), fill=(110 + rnd.randint(-20, 20), 84 + rnd.randint(-15, 15), 58))
+    return img
+

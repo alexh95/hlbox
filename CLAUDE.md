@@ -144,6 +144,39 @@ def build():
     (`lvl.in_cut(p)`).
   - The pieces are exact convex CSG (`hlmap/csg.py`); `tests/test_verify.py` proves a
     corridor stays sealed.
+- **Outdoors.** Make an ordinary room whose walls and ceiling are sky:
+  `Material(floor="OUT_PAVE1", wall="sky", ceiling="sky")`. Set
+  `Map(name, skyname="desert")` (stock skies: desert, 2desert, morning, dusk, cliff,
+  night, ...), and add a `light_environment` (`pitch`, `angles`, `_light`,
+  `_diffuse_light`) for the sun.
+  - `lvl.terrain(name, room, height=f(x, y), cell=128, flat=[(x0, y0, x1, y1), ...])`
+    raises hills and lawns from the room floor. GoldSrc has no displacements (that's
+    Source), so this is a heightfield of triangle columns: the cave's watertight
+    construction, open to the sky.
+  - `flat` rectangles (roads, lots) stay bare floor, so the room's floor texture
+    shows there. Put them on the terrain grid for straight edges.
+  - Heights are above the floor. Raise hills at the room's edges so the sky walls'
+    bases stay hidden.
+  - `terrain.surface(x, y)` gives the ground height for placing things. Rooms with
+    terrain need explicit `checkpoints=[(x, y), ...]`, which are lifted onto the
+    ground.
+  - `verify` treats the ground as solid (`is_air` excludes it), and
+    `tests/test_verify.py` proves terrain stays sealed.
+  - Connect it like any room: `lvl.doorway(inside_room, outside, ...)`. Build the
+    building's face as world brushes along that wall (windows are `wall_art` with
+    `GLASS_DARK`), and keep sky above its roofline.
+- **Outdoor props.**
+  - `tree(base, height, width, seed, kind="broad"|"pine")`: two crossed see-through
+    planes with a generated `{` texture (rendermode 4), plus a solid trunk.
+  - `car(x, y, z, facing, color)`: brushes with a paint texture.
+  - `boom_barrier(pivot, facing, length, name)`: a toggling func_door_rotating;
+    fire `name`, e.g. from a button. `reverse=True` if it swings down into the road.
+  - Also `lamp_post`, `umbrella`, `cactus`, and `bay_lines(x0, x1, y0, y1)`
+    (painted lines, non-solid; make the paint with `art.paint`).
+  - Stock outdoor textures: OUT_PAVE1/2 asphalt, -0OUT_GRSS1 grass, -0OUT_GRND2B
+    dry ground, OUT_WLK paving, OUT_WALL1A / OUT_WALL7 block walls, OUT_ROOF1,
+    OUT_SHRB1 hedge, OUT_CAC1 cactus, STRIPES1/4 hazard stripes, {CHAINLINK and
+    {FENCE fences, {GATE, {GRASS1/2 tufts, GLASS_DARK/MED, TIRES/TRK_TIRE, BLACK.
 - **Stairs between floors.** `steps, hole = lvl.stairs(name, lower, upper, top=(x, y),
   down="north")` makes a staircase from `upper`'s floor down into `lower`, which must
   sit directly below (`wall` units of slab).
@@ -381,8 +414,9 @@ def build():
   corridors. Use a different light texture when you need a different brightness.
 - **Profiles.** The `fast` profile has no bounce, so ceilings come out black. Judge
   lighting from `normal` or `final` builds only.
-- **Outdoors.** Add a `light_environment` entity and use `sky` ceilings. Set the
-  worldspawn `skyname` (e.g. `Map("x", skyname="desert")`).
+- **Outdoors.** See "Outdoors" under Writing a map: sky walls and ceiling, a
+  `light_environment` sun with `_diffuse_light` sky fill, and `skyname` on the Map.
+  Outdoor lamps don't need the power circuit.
 
 ## Gotchas
 
@@ -401,6 +435,11 @@ def build():
 - Rendermode 2 (texture) brush entities render fullbright, ignoring their lightmap.
   Use rendermode 4 for something that should look lit when shown.
 - A func_wall keyvalue `frame 1` starts it on its `+A` texture.
+- A func_door_rotating turns about Z by default. `spawnflags` 64 turns it about the
+  x axis (roll: an arm lying north-south), 128 about the y axis. The way it swings
+  depends on the axis; flag 2 reverses it. Check with a `shots` camera that fires it.
+- A `{` texture on a brush entity is only see-through with `rendermode 4`
+  (`renderamt 255`).
 - The first map of a Half-Life session spawns before `skill.cfg` has been read (its
   settings only exist once a server runs). Every NPC then gets 0 health ("GetSkillCVar
   Got a zero" in the console) and gets stuck after its first scripted_sequence;

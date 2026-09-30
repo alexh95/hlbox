@@ -80,6 +80,8 @@ def doorway_clearance(m, level, depth=64):
             zmin[a], zmax[a] = sorted((face, face + sign * depth))
             zmin[o], zmax[o] = lo[o] - 8, hi[o] + 8
             for name, blo, bhi in blockers:
+                if bhi[2] <= lo[2] + 18 and not name.startswith("stair hole"):
+                    continue              # a step up (sidewalk, low slab), not in the way
                 if all(blo[k] < zmax[k] and zmin[k] < bhi[k] for k in range(3)) and blo[2] < lo[2] + 8:
                     problems.append(f"{name} blocks the way to doorway {op.room.name} "
                                     f"(within {depth} units on the {room.name} side)")

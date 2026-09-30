@@ -697,3 +697,159 @@ def trigger(mins, maxs, target, once=True, master=None, **kv):
     return Entity("trigger_once" if once else "trigger_multiple",
                   brushes=[box(mins, maxs, "AAATRIGGER", comment="trigger")], kv=kv)
 
+
+# ---------------------------------------------------------------- outdoors
+
+def _textured(ent, textures):
+    ent.textures = textures
+    return ent
+
+
+def tree(base, height=256, width=192, seed=0, kind="broad", leaf=(70, 110, 52), trunk_r=8):
+    """A tree the Half-Life way: two crossed see-through planes carrying a painted tree
+    (a generated '{' texture, alpha-tested with rendermode 4), plus a solid trunk to
+    bump into. base = (x, y, ground_z). Returns [canopy func_illusionary, trunk]."""
+    from .art import bark, tree as tree_image
+    from .geometry import cylinder
+    from .mapfile import prepare_texture
+    x, y, z = base
+    tex = "{TREE%d%s" % (seed % 10, kind[0].upper())
+    btex = "BARK1"
+    textures = {tex: prepare_texture(tex, tree_image(seed, kind=kind, leaf=leaf)), btex: prepare_texture(btex, bark())}
+    a = box((x - width / 2, y - 0.5, z), (x + width / 2, y + 0.5, z + height), "NULL", comment="tree plane")
+    a.fit("south", tex)
+    a.fit("north", tex, flip_u=True)
+    b = box((x - 0.5, y - width / 2, z), (x + 0.5, y + width / 2, z + height), "NULL", comment="tree plane")
+    b.fit("east", tex)
+    b.fit("west", tex, flip_u=True)
+    canopy = _textured(Entity("func_illusionary", brushes=[a, b], rendermode=4, renderamt=255), textures)
+    trunk = detail(cylinder((x, y), trunk_r, z - 8, z + height * 0.4, sides=8, tex=btex, comment="trunk"))
+    return [canopy, _textured(trunk, {btex: textures[btex]})]
+
+
+CAR_COLORS = {"red": (168, 30, 28), "blue": (36, 70, 150), "white": (226, 228, 230), "silver": (160, 166, 172),
+              "green": (40, 110, 60), "yellow": (226, 186, 40), "black": (34, 36, 40), "brown": (110, 72, 44)}
+
+
+def car(x, y, z, facing="north", color="red", length=176, width=72):
+    """A parked car built from brushes (func_detail): body, glass cabin, wheels,
+    bumpers, head- and taillights. (x, y) is its centre on the ground at z; `facing`
+    is where the front points."""
+    from .art import paint
+    from .geometry import hull
+    from .mapfile import prepare_texture
+    fx, fy = DIRS[facing]
+    lx, ly = -fy, fx
+    tex = f"CAR_{color.upper()}"[:15]
+    textures = {tex: prepare_texture(tex, paint(CAR_COLORS.get(color, (120, 120, 120)), seed=len(color)))}
+    L, W = length / 2, width / 2
+
+    def at(a, s_, h):
+        return (x + a * fx + s_ * lx, y + a * fy + s_ * ly, z + h)
+
+    def part(a0, a1, s0, s1, h0, h1, t):
+        c = [at(a, s_, 0) for a in (a0, a1) for s_ in (s0, s1)]
+        lo = (min(q[0] for q in c), min(q[1] for q in c), z + h0)
+        hi = (max(q[0] for q in c), max(q[1] for q in c), z + h1)
+        return box(lo, hi, t)
+
+    parts = [part(-L, L, -W, W, 10, 34, tex)]
+    parts[0].comment = "car body"
+    cab = hull([at(a, s_, 34) for a in (-L + 36, L - 52) for s_ in (-W + 3, W - 3)] +
+               [at(a, s_, 56) for a in (-L + 50, L - 74) for s_ in (-W + 7, W - 7)], "GLASS_DARK", comment="car cabin")
+    for f in cab.faces:
+        if f.normal[2] > 0.95:
+            f.texture = tex                            # the roof
+    parts.append(cab)
+    for a in (-L + 32, L - 32):                        # wheels: axles across the car
+        for s_ in (-W + 5, W - 5):
+            pts = []
+            for k in range(10):
+                t = 2 * math.pi * k / 10
+                for ds in (-5, 5):
+                    pts.append(at(a + 13 * math.cos(t), s_ + ds, 13 + 13 * math.sin(t)))
+            wheel = hull(pts, "TIRES", comment="wheel")
+            for f in wheel.faces:
+                if abs(f.normal[0] * lx + f.normal[1] * ly) > 0.95:
+                    f.texture = "TRK_TIRE"
+            parts.append(wheel)
+    parts += [part(L, L + 4, -W + 2, W - 2, 10, 20, "OUT_GALV1"), part(-L - 4, -L, -W + 2, W - 2, 10, 20, "OUT_GALV1")]
+    for s0, s1 in ((-W + 6, -W + 18), (W - 18, W - 6)):
+        parts.append(part(L, L + 1, s0, s1, 24, 30, "GLASS_BRIGHT"))       # headlights
+        parts.append(part(-L - 1, -L, s0, s1, 24, 30, "+0~LIGHT6A"))       # taillights
+    return _textured(detail(*parts), textures)
+
+
+def boom_barrier(pivot, facing, length=192, name="barrier", height=36, raised_by=85, reverse=False):
+    """A car-park boom gate: a striped arm (func_door_rotating, toggled by firing
+    `name`, e.g. from a button) hinged on a post at pivot = (x, y, ground_z) and lying
+    across the road toward `facing`. Firing it raises the arm; firing again lowers it.
+    reverse=True if it swings the wrong way (down) in the game."""
+    fx, fy = DIRS[facing]
+    x, y, z = pivot
+    zc = z + height
+    if fx:
+        arm = box((min(x, x + fx * length), y - 4, zc - 4), (max(x, x + fx * length), y + 4, zc + 4), "STRIPES4")
+    else:
+        arm = box((x - 4, min(y, y + fy * length), zc - 4), (x + 4, max(y, y + fy * length), zc + 4), "STRIPES4")
+    arm.comment = "barrier arm"
+    origin = box((x - 4, y - 4, zc - 4), (x + 4, y + 4, zc + 4), "ORIGIN", comment="barrier hinge")
+    # arm along y: roll about x (flag 64); along x: pitch about y (flag 128); 32 = toggle
+    flags = 32 | (64 if fy else 128) | (2 if reverse else 0)
+    door = Entity("func_door_rotating", brushes=[arm, origin], targetname=name, spawnflags=flags,
+                  distance=raised_by, speed=45, wait=-1, movesnd=5, stopsnd=2, dmg=0)
+    post = detail(box((x - 8, y - 8, z), (x + 8, y + 8, zc + 14), "STRIPES1", comment="barrier post"))
+    rest = (x + fx * (length - 6), y + fy * (length - 6))
+    rest_post = detail(box((rest[0] - 3, rest[1] - 3, z), (rest[0] + 3, rest[1] + 3, zc - 4), "OUT_GALV1",
+                           comment="arm rest"))
+    return [post, door, rest_post]
+
+
+def lamp_post(x, y, z, facing="north", height=224, brightness=140, color=(255, 214, 160), name=None):
+    """A street lamp: pole, arm reaching toward `facing`, lamp head and its light."""
+    from .geometry import cylinder
+    fx, fy = DIRS[facing]
+    hx, hy = x + fx * 36, y + fy * 36
+    pole = cylinder((x, y), 4, z, z + height, sides=8, tex="OUT_GALV1", comment="lamp pole")
+    arm = box((min(x, hx) - 2, min(y, hy) - 2, z + height - 6), (max(x, hx) + 2, max(y, hy) + 2, z + height),
+              "OUT_GALV1", comment="lamp arm")
+    head = box((hx - 10, hy - 10, z + height - 12), (hx + 10, hy + 10, z + height - 4), "OUT_GALV1", comment="lamp head")
+    head.fit("bottom", "+0~LIGHT3A")
+    return [detail(pole, arm, head), light((hx, hy, z + height - 24), color, brightness, targetname=name)]
+
+
+def umbrella(x, y, z, radius=64, height=96, texture="STRIPES4"):
+    """A patio umbrella: a pole and a shallow cone of a canopy."""
+    from .geometry import cylinder, hull
+    pts = [(x + radius * math.cos(2 * math.pi * k / 8), y + radius * math.sin(2 * math.pi * k / 8), z + height)
+           for k in range(8)]
+    canopy = hull(pts + [(x, y, z + height + 20)], texture, comment="umbrella")
+    return detail(cylinder((x, y), 2, z, z + height + 18, sides=6, tex="OUT_GALV1", comment="umbrella pole"), canopy)
+
+
+def cactus(x, y, z, height=96, seed=0):
+    """A saguaro-ish cactus: a trunk and one or two arms."""
+    import random
+    from .geometry import cylinder
+    rnd = random.Random(seed)
+    parts = [cylinder((x, y), 8, z - 4, z + height, sides=8, tex="OUT_CAC1", comment="cactus")]
+    for side in rnd.sample((-1, 1), rnd.choice((1, 2))):
+        h = height * rnd.uniform(0.35, 0.6)
+        ax = x + side * 20
+        parts.append(box((min(x, ax), y - 5, z + h), (max(x, ax), y + 5, z + h + 10), "OUT_CAC1", comment="cactus arm"))
+        parts.append(cylinder((ax, y), 5, z + h, z + h + rnd.uniform(24, 40), sides=6, tex="OUT_CAC1",
+                              comment="cactus arm"))
+    return detail(*parts)
+
+
+def bay_lines(x0, x1, y0, y1, bay=96, width=4, texture="PAINTW", z=0):
+    """Parking bay lines painted on the ground (non-solid): one every `bay` units from
+    x0 to x1, each running y0..y1. Make the texture first, e.g.
+    m.add_texture("PAINTW", art.paint((230, 230, 222), gloss=False))."""
+    lines = []
+    x = x0
+    while x <= x1 + 0.5:
+        lines.append(box((x - width / 2, y0, z), (x + width / 2, y1, z + 1), texture, comment="bay line"))
+        x += bay
+    return Entity("func_illusionary", brushes=lines)
+

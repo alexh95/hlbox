@@ -327,21 +327,30 @@ def coverage(hulls, brushes, is_air, solid_at, limit=20):
                 continue
             n, d = f.normal, f.dist
             c = tuple(sum(p[k] for p in poly) / len(poly) for k in range(3))
-            front = add(c, mul(n, 2))
-            # visible = real air in front: not a zero-thickness taper, not inside other brushes
-            if not all(is_air(q, 0) for q in (front, add(front, (0, 0, 2)), add(front, (0, 0, -2))))                     or solid_at(front):
+            # probe the centre and points toward each corner; a probe counts when there is
+            # real air just in front of it (not a zero-thickness taper, not a thin sign
+            # or another brush covering that spot)
+            exposed = []
+            for q in [c] + [add(c, mul(sub(v, c), 0.7)) for v in poly]:
+                front = add(q, mul(n, 0.5))
+                if is_air(front, 0) and is_air(add(q, mul(n, 2)), 0) and not solid_at(front):
+                    exposed.append(q)
+            if not exposed:
                 continue
             checked += 1
-            found = False
-            for key in _near_keys(n, d):
-                for bn, bd, bpoly in index.get(key, ()):
-                    if dot(bn, n) > 0.999 and abs(bd - d) < 0.1 and _in_polygon(c, bpoly, n):
-                        found = True
+            for q in exposed:
+                found = False
+                for key in _near_keys(n, d):
+                    for bn, bd, bpoly in index.get(key, ()):
+                        if dot(bn, n) > 0.999 and abs(bd - d) < 0.1 and _in_polygon(q, bpoly, n):
+                            found = True
+                            break
+                    if found:
                         break
-                if found:
+                if not found:
+                    missing.append({"texture": f.texture, "at": tuple(round(v) for v in q),
+                                    "normal": tuple(round(v, 2) for v in n)})
                     break
-            if not found:
-                missing.append({"texture": f.texture, "at": tuple(round(v) for v in c), "normal": tuple(round(v, 2) for v in n)})
     return missing[:limit], checked, len(missing)
 
 
@@ -445,8 +454,10 @@ class Walker:
                 return self._drop(x, y, z + up) or (x, y, z + up)
         return (x, y, z)
 
-    def flood(self, seeds, limit=400000):
-        seen = set(seeds)
+    def flood(self, seeds, limit=400000, known=()):
+        """Every position reachable from `seeds`. known: positions already known to be
+        reachable (not explored again; e.g. an earlier flood before a door opened)."""
+        seen = set(known) | set(seeds)
         todo = deque(seeds)
         while todo and len(seen) < limit:
             p = todo.popleft()
@@ -703,7 +714,21 @@ def progression(hulls, checkpoints, radius=24, light=None, max_states=300):
             if pos in comp:
                 return comp, blocked
         w.blockers = [b for i, b in doors if i in blocked]
-        comp = frozenset(w.flood([pos]))
+        # a door (or more) opened since an earlier flood that reached pos: everything it
+        # reached is still reachable, so only grow it from the doors that opened
+        base = None
+        for other, comps in cache.items():
+            if set(blocked) <= set(other):
+                for comp in comps:
+                    if pos in comp and (base is None or len(comp) > len(base[1])):
+                        base = (other, comp)
+        if base is not None:
+            opened_boxes = [b for i, b in doors if i in base[0] and i not in blocked]
+            frontier = [p for p in base[1] if any(all(lo[k] - 24 <= p[k] <= hi[k] + 24 for k in range(3))
+                                                  for lo, hi in opened_boxes)]
+            comp = frozenset(w.flood(frontier, known=base[1]))
+        else:
+            comp = frozenset(w.flood([pos]))
         cache.setdefault(blocked, []).append(comp)
         return comp, blocked
 
