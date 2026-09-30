@@ -3,7 +3,7 @@
 Top view (+Y = north), ground floor:
 
             hills . . . trees . . . hills
-      parking lot (cars)  ==== road ==== [booth][barrier] ==== tunnel portal
+      parking lot (cars)  ==== road ==== [booth][barrier] ==== tunnel ==[gate]==> labs
       patio / sidewalk / facade  (outside, under a desert sky)
       cafeteria
           \\  corridor at 45 degrees (cuts the storage room's corner)
@@ -30,15 +30,21 @@ Power: taking the access card at the radio camp shorts the radios and trips the 
 breaker. Every light on the mains goes out, the projector dies, red emergency lamps
 pulse along the way back, and the records door (card AND power) stays shut until the
 breaker in the basement is reset. Light switches are dead while the power is out.
+
+The way on: up on the records mezzanine lies a sector pass. Its card reader opens the
+gate in the road tunnel past the car park, and the tunnel leads to the next map
+(maps/labs.py; the stretch where the level changes is built by maps/campaign.py). The
+pass is a global state, so it still counts over there.
 """
 import math
 
 from hlmap import Level, Map, Material, box, logic, props, scene, voice
 from PIL import Image, ImageDraw
 
-from hlmap.art import DECK, bullets, deck_slide, font, plate, slide, waveform
+from hlmap.art import DECK, boxworth, bullets, deck_slide, font, plate, slide, waveform
 from hlmap.cave import ROCK
 from hlmap.geometry import cylinder
+from maps.campaign import LAMP_TEX, LINK, SODIUM, TUNNEL
 
 CONFERENCE = Material(floor="FIFTIES_FLR02C", wall="FIFTIES_WALL14U", ceiling="FIFTIES_CEIL01",
                       ceiling_align="center")
@@ -118,7 +124,7 @@ def talk_lines(stats):
          f"{stats['lines']} voice lines, and zero holes. The numbers speak for themselves. Well. I speak "
          "for them.", None, "yes"),
         ("That concludes the briefing. The records access card was left at the survey camp, in the cave off "
-         "the hallway. Do try not to touch anything else down there.", None, "wave"),
+         "the hallway. Your sector pass for the lab is up in records. Do try not to touch anything.", None, "wave"),
     ]
 
 
@@ -128,8 +134,10 @@ INTERRUPTION = ("Hm? The lights... Oh, no. Not again.", None, "startle")
 BACK_AFTER = [
     ("Ah, you're back. And so are the lights. I assume that was you, down in the basement. Splendid work.",
      None, "yes"),
-    ("The records door needs power as well as your card, so it should open now. And please, do mind the "
-     "crystals down there. They are not for licking.", None, "converse1"),
+    ("The records door needs power as well as your card, so it should open now. Up on the mezzanine, "
+     "you'll find your sector pass.", None, "converse1"),
+    ("It opens the tunnel past the car park. The lab is expecting you. And please, do mind the crystals. "
+     "They are not for licking.", None, "converse2"),
 ]
 BACK_BEFORE = [
     ("Ah, the lights are back! That must have been you. Splendid.", None, "wave"),
@@ -347,37 +355,6 @@ def access_card_texture():
     return img
 
 
-def boxworth():
-    """Boxworth, the facility's mascot: a supply crate with boots and a hard hat, as
-    32x32 pixel art (transparent; scale it up with NEAREST)."""
-    img = Image.new("RGBA", (32, 32), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    ink, wood, light, seam = (58, 36, 18), (184, 126, 62), (214, 160, 92), (146, 98, 46)
-    d.rectangle((4, 18, 5, 22), fill=wood, outline=ink)                  # arms
-    d.rectangle((26, 16, 27, 20), fill=wood, outline=ink)
-    d.rectangle((8, 27, 12, 30), fill=(52, 54, 62), outline=ink)         # boots
-    d.rectangle((19, 27, 23, 30), fill=(52, 54, 62), outline=ink)
-    d.rectangle((6, 11, 25, 28), fill=wood, outline=ink)                 # the crate
-    d.rectangle((7, 12, 24, 27), outline=light)
-    for x in (12, 19):                                                   # plank seams
-        d.line((x, 13, x, 26), fill=seam)
-    for x, y in ((7, 12), (23, 12), (7, 26), (23, 26)):                  # corner brackets
-        d.rectangle((x, y, x + 1, y + 1), fill=(120, 124, 132))
-    d.rectangle((9, 15, 13, 19), fill=(246, 246, 240), outline=ink)      # eyes
-    d.rectangle((18, 15, 22, 19), fill=(246, 246, 240), outline=ink)
-    d.rectangle((11, 16, 12, 18), fill=ink)
-    d.rectangle((20, 16, 21, 18), fill=ink)
-    d.point([(10, 16), (19, 16)], fill=(255, 255, 255))
-    d.rectangle((8, 21, 9, 21), fill=(232, 124, 110))                    # cheeks
-    d.rectangle((22, 21, 23, 21), fill=(232, 124, 110))
-    d.line((13, 22, 18, 22), fill=ink)                                   # smile
-    d.point([(12, 21), (19, 21)], fill=ink)
-    d.pieslice((8, 2, 23, 16), 180, 360, fill=(255, 204, 0), outline=ink)   # hard hat
-    d.rectangle((5, 9, 26, 11), fill=(232, 170, 0), outline=ink)
-    d.line((15, 3, 15, 8), fill=(255, 232, 110))
-    return img
-
-
 def portrait_texture():
     """'Employee of the Month': Gerald, the ficus from Facilities, in his tie. Or swap
     in a real photo you have permission to use: m.add_texture("PORTRAIT1", path)."""
@@ -467,6 +444,11 @@ def build():
     outside = lvl.room("outside", (-1600, 672, 0), (1216, 2336, 768), OUTSIDE,
                        checkpoints=[(-232, 740), (-700, 1250), (400, 1250), (656, 1470), (-600, 1690), (1000, 1250)])
     patio_door = lvl.doorway(cafe, outside, width=64, height=96, center=-232)
+    # the road tunnel: through the portal into the hill, to the stretch both maps share
+    # (maps/campaign.py), whose far end changes level to labs
+    tunnel_in = lvl.room("tunnel entrance", (1232, 1120, 0), (1616, 1376, 192), TUNNEL, group="tunnel")
+    lvl.doorway(tunnel_in, outside, width=256, height=160, center=1248)
+    LINK.place(m, lvl)
     grounds = lvl.terrain("grounds", outside, ground_height, cell=GRID, flat=[FRONT, LOT, ROAD, BOOTH_PAD])
 
     conf_door = lvl.doorway(conf, hall, width=64, height=96, center=96)
@@ -500,6 +482,9 @@ def build():
     # mains power: every light below is on it; the card pickup trips it, the basement
     # breaker resets it (see the module docstring)
     grid = logic.Circuit("power", origin=(224, 176, 140))
+    # the pass from records: opens the tunnel gate here, and the lab door in labs
+    sector_pass = logic.Flag("sector_pass", False, (848, 64, 200))
+    m.add(sector_pass.entities())
 
     # --- doors & locks ----------------------------------------------------------------------
     m.add(props.door_rotating(conf_door, hinge="right"))
@@ -529,7 +514,8 @@ def build():
     cafeteria(m, cafe, walkway, grid)
     outdoors(m, outside, grounds)
     storage_room(m, storage, store_hole, grid)
-    records_room(m, records, grid)
+    records_room(m, records, grid, sector_pass)
+    tunnel_gate(m, sector_pass)
     basement_rooms(m, basement, grid)
     cave_contents(m, cave, grid)
     grid.emergency("emergency")
@@ -607,6 +593,11 @@ def build():
         "barrier_up": (380, 1180, 90, 4, 22, ["barrier"]),
         "booth_inside": (700, 1500, 70, 14, 215),
         "tunnel": (760, 1250, 80, 0, 0),
+        "tunnel_gate": (1256, 1330, 66, 4, 340),
+        "tunnel_gate_open": (1256, 1330, 66, 4, 340, ["tunnel_gate"]),
+        "tunnel_zone": (2128, 1200, 70, 0, 90),
+        "tunnel_zone_north": (2060, 1700, 70, 0, 55),
+        "records_pass": (824, 150, 206, 22, 90),
         "hills": (-300, 1560, 110, -4, 80),
         "facade": (-420, 1320, 110, 4, 280),
     }
@@ -789,13 +780,16 @@ def outdoors(m, outside, grounds):
     m.add(props.sign((548, 1376, 72), "east", texture="SIGN2", w=28, h=28),        # STOP
           props.detail(box((546, 1372, 0), (550, 1380, 58), "OUT_GALV1", comment="sign post")))
     # the road leaves through a tunnel into the hill
-    m.add(props.detail(box((1120, 1056, 0), (1152, 1120, 192), "OUT_CON", comment="portal"),
+    dirt = "-0OUT_GRND2B"
+    m.add_world(*props.detail(box((1120, 1056, 0), (1152, 1120, 192), "OUT_CON", comment="portal"),
                        box((1120, 1376, 0), (1152, 1440, 192), "OUT_CON", comment="portal"),
                        box((1120, 1120, 160), (1152, 1376, 192), "OUT_CON", comment="portal lintel"),
-                       box((1120, 1056, 192), (1216, 1440, 330), "-0OUT_GRND2B", comment="hill over the tunnel"),
-                       box((1152, 1056, 0), (1216, 1120, 192), "-0OUT_GRND2B", comment="hill"),
-                       box((1152, 1376, 0), (1216, 1440, 192), "-0OUT_GRND2B", comment="hill")))
-    m.add(props.Entity("func_wall", brushes=[box((1150, 1120, 0), (1152, 1376, 160), "BLACK", comment="tunnel dark")]))
+                       box((1152, 1120, 160), (1216, 1376, 192), {"default": dirt, "bottom": "TNNL_C1"},
+                           comment="tunnel roof"),
+                       box((1120, 1056, 192), (1216, 1440, 330), dirt, comment="hill over the tunnel"),
+                       box((1152, 1056, 0), (1216, 1120, 192), {"default": dirt, "north": "TNNL_W12"}, comment="hill"),
+                       box((1152, 1376, 0), (1216, 1440, 192), {"default": dirt, "south": "TNNL_W12"},
+                           comment="hill")).brushes)
     m.add(props.sign((1120, 1248, 176), "west", "SECTOR ACCESS", 128, 20, "warning"))
     # trees on the lawns and hills, cacti on the dry south-east slope
     for k, (x, y) in enumerate([(-1250, 1690), (-1000, 1720), (-760, 1680), (-520, 1710), (-280, 1690), (-40, 1720),
@@ -857,7 +851,49 @@ def menu_texture():
     return img
 
 
-def records_room(m, r, grid):
+def tunnel_gate(m, sector_pass):
+    """The office end of the road tunnel: a see-through security gate that the card
+    reader beside it opens for a sector pass, sodium lamps and the road's centre line.
+    Past the gate, the stretch shared with labs (maps/campaign.py) changes level."""
+    x = 1424
+    gate = box((x, 1120, 0), (x + 4, 1376, 192), "OUT_GALV1", comment="tunnel gate")
+    gate.fit("west", "{GATE")
+    gate.fit("east", "{GATE")
+    # rises into the roof and stays open; rendermode 4 makes the '{' mesh see-through
+    m.add(props.Entity("func_door", brushes=[gate], targetname="tunnel_gate", angle=-1, speed=60, lip=8, wait=-1,
+                       movesnd=3, stopsnd=1, rendermode=4, renderamt=255))
+    m.add(props.card_reader((1392, 1120, 52), "north", "tunnel_gate", sector_pass, "tunnel_reader",
+                            granted="SECTOR ACCESS GRANTED", denied="SECTOR PASS REQUIRED"))
+    m.add(props.sign((1316, 1120, 108), "north", "RESTRICTED AREA\nSECTOR PASS REQUIRED", 80, 30, "red"),
+          props.Entity("func_illusionary", brushes=[box((x - 12, 1120, 0), (x + 16, 1376, 1), "STRIPES1",
+                                                        comment="hazard stripes")]))
+    for lx, ly, facing in ((1344, 1376, "south"), (1536, 1120, "north")):
+        fx, fy = props.DIRS[facing]
+        m.add(props.wall_art((lx, ly, 150), facing, LAMP_TEX, 48, 32, depth=6, frame="OUT_GALV1"),
+              props.light((lx + fx * 24, ly + fy * 24, 140), color=SODIUM, brightness=150))
+    m.add(props.Entity("func_illusionary", brushes=[box((dx, 1246, 0), (dx + 48, 1250, 1), "PAINTY", comment="road dash")
+                                                    for dx in range(1256, 1600, 96)]))
+    # the shared stretch's far end: labs goes on, this map stops (out of sight of the
+    # trigger); it reads as the tunnel carrying on into the dark
+    end = LINK.origins["office"][0] + 512
+    m.add(props.Entity("func_wall", brushes=[box((end - 2, 1888, 0), (end, 2144, 192), "BLACK", comment="tunnel dark")]))
+
+
+def sector_pass_texture():
+    img = Image.new("RGB", (128, 80), (240, 236, 226))
+    d = ImageDraw.Draw(img)
+    d.rectangle((0, 0, 127, 20), fill=(214, 104, 20))
+    d.text((64, 10), "BLACK MESA", fill=(255, 255, 255), font=font(13), anchor="mm")
+    d.rectangle((8, 30, 34, 50), fill=(205, 170, 70), outline=(150, 120, 40))      # chip
+    d.line((8, 40, 34, 40), fill=(150, 120, 40))
+    d.text((82, 36), "SECTOR", fill=(170, 70, 10), font=font(16), anchor="mm")
+    d.text((82, 54), "ACCESS", fill=(60, 60, 70), font=font(12), anchor="mm")
+    d.rectangle((0, 66, 127, 79), fill=(30, 30, 34))
+    d.text((64, 72), "MATERIALS LAB", fill=YELLOW, font=font(9), anchor="mm")
+    return img
+
+
+def records_room(m, r, grid, sector_pass):
     x0, y0, z0 = r.mins
     x1, y1, z1 = r.maxs
     mez_y, mez_z = 112, 128              # mezzanine over the north part, its floor at z 144
@@ -910,6 +946,16 @@ def records_room(m, r, grid):
     m.add(props.table(960, 200, upper, width=64, depth=40), props.chair(960, 164, upper, facing="north"))
     m.add(props.radio(946, 210, upper + 34, "south", texture="C1A1_GAD1", w=20, h=18))
     m.add(props.point("item_healthkit", (984, 188, upper + 40)))     # front corner: the chair is in the middle
+    # the sector pass, on a sign-out desk in front of the racks (at its front edge,
+    # like the card: a stand-in prop shows it, the item itself is hidden)
+    m.add(props.table(824, 236, upper, width=64, depth=36, height=30),
+          props.sign((824, 272, upper + 84), "south", "SECTOR PASSES", 56, 14, "warning"))
+    m.add_texture("SECTORPASS", sector_pass_texture())
+    m.texlight("SECTORPASS", (255, 255, 255), 40)
+    m.add(props.flat_prop((824, 225, upper + 30), 16, 10, "SECTORPASS", name="pass_prop"),
+          props.pickup("item_security", (824, 225, upper + 38), fires=[sector_pass.on],
+                       message="SECTOR ACCESS PASS ACQUIRED", name="sector_pass_card", hide=["pass_prop"],
+                       invisible=True))
 
 
 def basement_rooms(m, b, grid):

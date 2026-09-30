@@ -190,10 +190,71 @@ def _waits(frames):
     return ["hlm_w100"] * (frames // 100) + ["hlm_w10"] * (frames % 100 // 10) + ["wait"] * (frames % 10)
 
 
-def _run_session(variants, script, out_dir, prefix, width=1280, height=720, timeout=120, console=()):
+def _capture_window(path):
+    """Save the Half-Life window's picture (PrintWindow: only that window, even if
+    something covers it) as a PNG. Returns the path, or None if there's no window."""
+    import ctypes
+    from ctypes import wintypes
+    from PIL import Image
+    user32, gdi32, kernel32 = ctypes.windll.user32, ctypes.windll.gdi32, ctypes.windll.kernel32
+    user32.SetProcessDPIAware()          # real pixel sizes (else a scaled display crops the picture)
+    found = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def visit(hwnd, _):                                      # the visible window of hl.exe
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        proc = kernel32.OpenProcess(0x1000, False, pid.value)          # query limited information
+        if proc and user32.IsWindowVisible(hwnd):
+            name = ctypes.create_unicode_buffer(260)
+            size = wintypes.DWORD(260)
+            if kernel32.QueryFullProcessImageNameW(proc, 0, name, ctypes.byref(size)) and \
+                    name.value.lower().endswith("\\hl.exe"):
+                r = wintypes.RECT()
+                user32.GetClientRect(hwnd, ctypes.byref(r))
+                found.append((r.right * r.bottom, hwnd))
+        if proc:
+            kernel32.CloseHandle(proc)
+        return True
+
+    user32.EnumWindows(visit, 0)
+    if not found:
+        return None
+    hwnd = max(found)[1]
+    rect = wintypes.RECT()
+    user32.GetClientRect(hwnd, ctypes.byref(rect))
+    w, h = rect.right - rect.left, rect.bottom - rect.top
+    hdc = user32.GetDC(hwnd)
+    mdc = gdi32.CreateCompatibleDC(hdc)
+    bmp = gdi32.CreateCompatibleBitmap(hdc, w, h)
+    gdi32.SelectObject(mdc, bmp)
+    user32.PrintWindow(hwnd, mdc, 1 | 2)                     # client area, full (GPU) content
+
+    class BITMAPINFOHEADER(ctypes.Structure):
+        _fields_ = [("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG), ("biHeight", wintypes.LONG),
+                    ("biPlanes", wintypes.WORD), ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+                    ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", wintypes.LONG),
+                    ("biYPelsPerMeter", wintypes.LONG), ("biClrUsed", wintypes.DWORD),
+                    ("biClrImportant", wintypes.DWORD)]
+    bi = BITMAPINFOHEADER(ctypes.sizeof(BITMAPINFOHEADER), w, -h, 1, 32, 0, 0, 0, 0, 0, 0)
+    buf = ctypes.create_string_buffer(w * h * 4)
+    gdi32.GetDIBits(mdc, bmp, 0, h, buf, ctypes.byref(bi), 0)
+    gdi32.DeleteObject(bmp)
+    gdi32.DeleteDC(mdc)
+    user32.ReleaseDC(hwnd, hdc)
+    Image.frombuffer("RGB", (w, h), buf.raw, "raw", "BGRX", 0, 1).save(path)
+    return path
+
+
+def _run_session(variants, script, out_dir, prefix, width=1280, height=720, timeout=120, console=(), finish=True,
+                 files=None, capture=None):
     """Run Half-Life windowed on temporary map variants ({name: (source_bsp, write_fn)},
     write_fn(dest) writes the variant) and a console `script` (lines; ints = frames to
-    wait). Returns (png paths of the snapshots taken, console log text)."""
+    wait). finish=False leaves out the final quit; then `capture` = (marker, seconds)
+    ends the session: once `marker` shows in the console log, wait that long, save the
+    window's picture and close the game. `files`: {path under valve/: text} written for
+    the session only (e.g. a map's _load.cfg, which the engine runs when it loads).
+    Returns (png paths of the snapshots taken, console log text)."""
     from PIL import Image
 
     if hl_running():
@@ -201,15 +262,32 @@ def _run_session(variants, script, out_dir, prefix, width=1280, height=720, time
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     maps_dir = config.GAME_DIR / "maps"
+    files = {config.GAME_DIR / rel: text for rel, text in (files or {}).items()}
+    for path in files:
+        if path.exists():
+            raise FileExistsError(f"{path} exists; not overwriting it for a playtest")
+    # a variant may take an installed map's own name (level changes need it: the next
+    # map links back by name); the installed file is set aside and put back afterwards
+    backups = {}
+    for name in variants:
+        dest = maps_dir / f"{name}.bsp"
+        if dest.exists():
+            if name not in _manifest():
+                raise FileExistsError(f"{dest} was not installed by hlmap; not replacing it for a session")
+            backups[dest] = config.BUILD_DIR / f"{name}.bsp.session_backup"
+            shutil.copy2(dest, backups[dest])
     for name, write in variants.items():
         write(maps_dir / f"{name}.bsp")
+    for path, text in files.items():
+        path.write_text(text)
     waits = "wait;" * 10
     first = next(iter(variants))       # warm-up load so skill.cfg is read (see launch())
     cfg = [f'alias hlm_w10 "{waits}"', 'alias hlm_w100 "' + "hlm_w10;" * 10 + '"', f"map {first}",
            "hlm_w10", "exec skill.cfg"] + list(console)
     for line in script:
         cfg += _waits(line) if isinstance(line, int) else [line]
-    cfg += ["echo HLMAP_DONE", "quit"]
+    if finish:
+        cfg += ["echo HLMAP_DONE", "quit"]
     cfg_path = config.GAME_DIR / "hlmap_shot.cfg"
     cfg_path.write_text("\n".join(cfg) + "\n")
 
@@ -222,11 +300,29 @@ def _run_session(variants, script, out_dir, prefix, width=1280, height=720, time
             "-condebug", "-nojoy", "-novid", "+exec", "hlmap_shot.cfg"]
     env = dict(os.environ, SteamNoOverlayUIDrawing="1")   # keep Steam toasts out of the shots
     proc = subprocess.Popen(args, cwd=str(config.HL_DIR), env=env)
+    captured, seen_at = [], None
+
+    def new_log():
+        out = ""
+        for p in log_paths:
+            if p.exists() and p.stat().st_size > log_offsets[p]:
+                with open(p, "rb") as fh:
+                    fh.seek(log_offsets[p])
+                    out += fh.read().decode("latin-1", errors="replace")
+        return out
+
     try:
         deadline = time.time() + timeout
         time.sleep(3)
         while time.time() < deadline and (proc.poll() is None or hl_running()):
             time.sleep(1)
+            if capture and not captured:
+                if seen_at is None and capture[0] in new_log():
+                    seen_at = time.time()
+                if seen_at is not None and time.time() - seen_at >= capture[1]:
+                    captured.append(_capture_window(out_dir / f"{prefix}window.png"))
+                    subprocess.run(["taskkill", "/IM", "hl.exe", "/F"], capture_output=True)
+                    time.sleep(2)
         timed_out = time.time() >= deadline
         if timed_out:
             subprocess.run(["taskkill", "/IM", "hl.exe", "/F"], capture_output=True)
@@ -235,7 +331,11 @@ def _run_session(variants, script, out_dir, prefix, width=1280, height=720, time
         restored = _reg_restore(reg)
         for name in variants:
             (maps_dir / f"{name}.bsp").unlink(missing_ok=True)
+        for dest, backup in backups.items():
+            shutil.move(backup, dest)
         cfg_path.unlink(missing_ok=True)
+        for path in files:
+            path.unlink(missing_ok=True)
 
     log = ""
     for p in log_paths:
@@ -252,6 +352,7 @@ def _run_session(variants, script, out_dir, prefix, width=1280, height=720, time
         Image.open(bmp).convert("RGB").save(png)
         bmp.unlink()
         pngs.append(png)
+    pngs += [c for c in captured if c]
     if timed_out:
         log += "\n[hlmap] timed out waiting for Half-Life; killed it\n"
     if restored:
@@ -299,6 +400,36 @@ def playtest(bsp_path, start, script, out_dir, fire=(), prefix="play", width=128
 
     lines = ["map hlmap_play", 150, "echo HLMAP_PLAY_START"] + list(script) + [10, "snapshot", 10]
     return _run_session({"hlmap_play": write}, lines, out_dir, prefix, width, height, timeout, console)
+
+
+def playtest_transition(bsp_path, start, target, out_dir, settle=6, prefix="link", timeout=120):
+    """Walk into a level change in the real game: the player spawns at start = (x, y,
+    feet_z, yaw) and holds forward until the level changes. Nothing may be left
+    waiting in the console buffer: the game queues its changelevel, and the new map's
+    sign-on, behind it. So a temporary maps/<target>_load.cfg (run by the engine when
+    `target` loads) only lets go of forward and echoes a marker; `settle` seconds
+    after the marker shows in the log, the window's picture is saved (where the player
+    landed) and the game closed. Returns (png paths, console log): the log has
+    "CHANGE LEVEL: <map> <landmark>" and "HLMAP_ARRIVED <target>" if it worked."""
+    x, y, z, yaw = start[:4]
+
+    def write(dest):
+        b = BSP(bsp_path)
+        ents = b.entities
+        for e in ents:
+            if e.get("classname") == "info_player_start":
+                e["origin"] = f"{x:.1f} {y:.1f} {z + 36:.1f}"
+                e["angles"] = f"0 {yaw} 0"
+        b.entities = ents
+        b.save(dest)
+
+    # the copy runs under the map's own name: the next map links back to that name,
+    # and the engine only brings the player across from a map it links to
+    name = Path(bsp_path).stem
+    lines = [f"map {name}", 150, "echo HLMAP_PLAY_START", "+forward"]
+    return _run_session({name: write}, lines, out_dir, prefix, timeout=timeout, console=("developer 2",),
+                        finish=False, files={f"maps/{target}_load.cfg": f"-forward\necho HLMAP_ARRIVED {target}\n"},
+                        capture=(f"HLMAP_ARRIVED {target}", settle))
 
 
 def playtest_pickups(bsp_path, tests, out_dir, walk_frames=90, timeout=None):

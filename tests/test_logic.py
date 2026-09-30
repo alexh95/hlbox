@@ -131,7 +131,7 @@ def test_talk_runs_once_and_aborts_only_while_running():
     w.fire(talk.start)                                # the whole timeline runs (the sim doesn't wait)
     assert lit() == {"cue1": False, "cue2": False, "after": False}
     assert w.globals["talk_running"] == 0             # finished
-    fired = [c for _, c, _ in w.effects]
+    fired = [c for _, c, u in w.effects if u == "toggle"]      # (voices are also turned "off": hushed)
     assert fired.count("ambient_generic") == 2 and fired.count("scripted_sequence") == 1
     w.fire(talk.abort)                                # finished: abort does nothing
     assert lit()["after"] is False and not w.warnings
@@ -143,9 +143,41 @@ def test_talk_runs_once_and_aborts_only_while_running():
     w.fire(talk.abort)
     w.run()
     assert lit() == {"cue1": False, "cue2": True, "after": False}
-    said = [w.ents[i].get("targetname") for i, c, _ in w.effects if c == "ambient_generic"]
+    said = [w.ents[i].get("targetname") for i, c, u in w.effects if c == "ambient_generic" and u == "toggle"]
     assert said == ["talk01_voice", "talk_int_voice"], said
     assert w.globals["talk_running"] == 0 and not w.warnings
+
+
+def test_talk_skip_cuts_the_line_and_goes_to_the_end():
+    from hlmap import Map, scene
+    m = Map("vtalk3")
+    talk = scene.Talk(m, "talk", head=(0, 0, 64))
+    talk.line("One.", fire=["cue1"])
+    talk.line("Two.", fire=["cue2"])
+    talk.on_end.append("after")
+    talk.on_skip.append("skipped_only")
+    ents = talk.entities() + scene.skip_button((0, -64, 48), "north", [talk], name="skip")
+    ents += [props.light((0, 0, 0), targetname=n) for n in ("cue1", "cue2", "after", "skipped_only")]
+    w = World(_lump(ents)).start()
+    lit = lambda: {e["targetname"]: w.lit[i] for i, e in enumerate(w.ents) if e["classname"] == "light"}
+    w.fire("skip")                                    # nothing running: nothing happens
+    assert all(lit().values())
+    w.fire(talk.start, until=talk.lead + 0.1)        # line 1 is being said
+    n = len(w.effects)
+    w.press(next(i for i, e in enumerate(w.ents) if e.get("classname") == "func_button"))
+    w.run()
+    assert lit() == {"cue1": False, "cue2": True, "after": False, "skipped_only": False}
+    offs = [w.ents[i]["targetname"] for i, c, u in w.effects[n:] if c == "ambient_generic" and u == "off"]
+    assert "talk01_voice" in offs                     # the line being said is cut
+    said = [w.ents[i]["targetname"] for i, c, u in w.effects[n:] if c == "ambient_generic" and u == "toggle"]
+    assert said == [], said                           # and nothing more is said
+    assert w.globals["talk_running"] == 0 and w.globals["talk_skipped"] == 1 and not w.warnings
+    w.fire(talk.start)                                # a skipped talk is done for good (its timeline
+    assert lit()["cue2"] is True and _said_after(w, n) == []   # is removed: the game can't cancel queued fires)
+
+
+def _said_after(w, n):
+    return [w.ents[i]["targetname"] for i, c, u in w.effects[n:] if c == "ambient_generic" and u == "toggle"]
 
 
 def test_talk_checks_gestures_against_the_model():

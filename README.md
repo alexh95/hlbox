@@ -8,6 +8,7 @@ end to end, but it works fine by hand too.
 
 ![a scientist presenting generated slides in the conference room, in game](docs/office.jpg)
 ![generated cave turning into Xen, in game](docs/cave.jpg)
+![the second map's test chamber, after someone pressed the red button, in game](docs/labs.jpg)
 
 ```python
 from hlmap import Map, Level, Material, props
@@ -38,6 +39,7 @@ def build():
 ```
 python -m hlmap setup                 # download the SDHLT compilers (checksum-verified)
 python -m hlmap build office          # maps/office.py -> compile -> install -> build/office/plan.png
+python -m hlmap build office labs     # both maps of the campaign, in order
 python -m hlmap build office --shots  # + in-engine screenshots from the map's CAMERAS
 python -m hlmap play office           # launch Half-Life into the map
 python -m hlmap tex FIFTIES --sheet   # search textures, render a contact sheet
@@ -58,6 +60,17 @@ playing it:
   Corridors run at any angle, carved with exact convex CSG (`hlmap/csg.py`). A room
   in the way gets its corner cut: in the office, a 45° corridor slips past the
   storage room to a cafeteria.
+- `hlmap/campaign.py` joins maps with level transitions. Both maps build the stretch
+  where the level changes from one shared function (`maps/campaign.py`), and verify
+  checks that it matches surface by surface, that every landing spot is clear, and
+  that the next map works for every state the player can arrive in. The office's
+  road tunnel leads through a gate, opened by a sector pass from the records room,
+  to a second map: a loading bay with a guard, and a materials lab with a red button
+  you're asked not to press.
+- `hlmap/teleport.py` builds teleporter networks: pads, routes, a power switch,
+  offline slots for places to come, and a board that maps it all. Pressing the red
+  button brings labs' network online; its hub has no doors, only pads and a window
+  onto Xen. `verify` walks through teleporters and checks each trip has a way back.
 - `hlmap/terrain.py` builds open terrain for outdoor areas under a sky: hills and
   lawns as watertight triangle columns (GoldSrc has no displacements). The office's
   cafeteria opens onto a patio and a staff car park with brush-built cars and painted

@@ -56,7 +56,10 @@ def strip_token(key):
 class World:
     """The logic state of a map (from its compiled entity lump) and how it changes."""
 
-    def __init__(self, ents):
+    def __init__(self, ents, globals=None):
+        """globals: global states carried over from the previous map ({name: 0 off,
+        1 on, 2 dead}); env_globals that set an initial state leave those alone, as
+        in the game (the state is only created if it doesn't exist yet)."""
         self.ents = ents
         self.names = {}
         for i, e in enumerate(ents):
@@ -69,7 +72,7 @@ class World:
                 self.inputs[i] = [j for j, f in enumerate(ents) if f.get("target") == n] + \
                                  [j for j, f in enumerate(ents) if f.get("classname") == "multi_manager"
                                   and any(strip_token(k) == n for k in f if k not in _MM_RESERVED)]
-        self.globals = {}     # global state -> 0 off, 1 on, 2 dead
+        self.globals = dict(globals or {})     # global state -> 0 off, 1 on, 2 dead
         for e in ents:
             if e.get("classname") == "env_global" and int(e.get("spawnflags") or 0) & 1 and e.get("globalstate"):
                 self.globals.setdefault(e["globalstate"], int(e.get("initialstate") or 0))
@@ -133,6 +136,10 @@ class World:
         if e.get("targetname"):        # a named door only opens when fired
             return i in self.opened
         return self.master_ok(e.get("master"))
+
+    def teleport_enabled(self, i):
+        """A trigger_teleport works while its master is on (firing it does nothing)."""
+        return i not in self.gone and self.master_ok(self.ents[i].get("master"))
 
     def style_levels(self):
         """Light style -> brightness factor (1.0 = normal) in the current state."""
@@ -311,10 +318,11 @@ class World:
             self.effects.append((i, c, USE_NAMES[use]))
 
     # ------------------------------------------------------------ progress-relevant state
-    def relevance(self, doors):
+    def relevance(self, doors, watch=()):
         """Static backward slice: which entities and global states can (through any
         chain of firing) change whether one of `doors` is passable, or whether such a
-        chain can run. Only these matter for progression; e.g. a light switch does not."""
+        chain can run. Only these matter for progression; e.g. a light switch does not.
+        watch: global states that matter too (e.g. ones the next map reads)."""
         ents = self.ents
         firers = {}                                   # name -> entities that fire it
         for j, f in enumerate(ents):
@@ -345,6 +353,11 @@ class World:
 
         for d in doors:
             need_entity(d)
+        for gs in watch:
+            if gs not in rel_globals:
+                rel_globals.add(gs)
+                for s in setters.get(gs, ()):
+                    need_entity(s)
         while todo:
             j = todo.pop()
             e = ents[j]

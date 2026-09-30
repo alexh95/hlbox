@@ -145,4 +145,13 @@ def compile_map(map_path, profile="normal", steps=("csg", "bsp", "vis", "rad"), 
             base.with_suffix(ext).unlink(missing_ok=True)
     res.ok = not res.errors and not res.leak and bsp.exists()
     res.bsp = bsp if bsp.exists() else None
+    if res.ok and "rad" in steps:
+        # info_texlights is for the compiler (RAD reads it); the game has no such entity
+        # and says "Can't init info_texlights" at every load
+        from .bsp import BSP
+        b = BSP(bsp)
+        ents = b.entities
+        if any(e.get("classname") == "info_texlights" for e in ents):
+            b.entities = [e for e in ents if e.get("classname") != "info_texlights"]
+            b.save()
     return res

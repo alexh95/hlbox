@@ -299,3 +299,176 @@ def bark(size=(64, 128), seed=0):
         d.point((x, y), fill=(110 + rnd.randint(-20, 20), 84 + rnd.randint(-15, 15), 58))
     return img
 
+
+# ---------------------------------------------------------------- the facility's mascot
+
+def boxworth():
+    """Boxworth, the facility's mascot: a supply crate with boots and a hard hat, as
+    32x32 pixel art (transparent; scale it up with NEAREST)."""
+    img = Image.new("RGBA", (32, 32), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    ink, wood, light, seam = (58, 36, 18), (184, 126, 62), (214, 160, 92), (146, 98, 46)
+    d.rectangle((4, 18, 5, 22), fill=wood, outline=ink)                  # arms
+    d.rectangle((26, 16, 27, 20), fill=wood, outline=ink)
+    d.rectangle((8, 27, 12, 30), fill=(52, 54, 62), outline=ink)         # boots
+    d.rectangle((19, 27, 23, 30), fill=(52, 54, 62), outline=ink)
+    d.rectangle((6, 11, 25, 28), fill=wood, outline=ink)                 # the crate
+    d.rectangle((7, 12, 24, 27), outline=light)
+    for x in (12, 19):                                                   # plank seams
+        d.line((x, 13, x, 26), fill=seam)
+    for x, y in ((7, 12), (23, 12), (7, 26), (23, 26)):                  # corner brackets
+        d.rectangle((x, y, x + 1, y + 1), fill=(120, 124, 132))
+    d.rectangle((9, 15, 13, 19), fill=(246, 246, 240), outline=ink)      # eyes
+    d.rectangle((18, 15, 22, 19), fill=(246, 246, 240), outline=ink)
+    d.rectangle((11, 16, 12, 18), fill=ink)
+    d.rectangle((20, 16, 21, 18), fill=ink)
+    d.point([(10, 16), (19, 16)], fill=(255, 255, 255))
+    d.rectangle((8, 21, 9, 21), fill=(232, 124, 110))                    # cheeks
+    d.rectangle((22, 21, 23, 21), fill=(232, 124, 110))
+    d.line((13, 22, 18, 22), fill=ink)                                   # smile
+    d.point([(12, 21), (19, 21)], fill=ink)
+    d.pieslice((8, 2, 23, 16), 180, 360, fill=(255, 204, 0), outline=ink)   # hard hat
+    d.rectangle((5, 9, 26, 11), fill=(232, 170, 0), outline=ink)
+    d.line((15, 3, 15, 8), fill=(255, 232, 110))
+    return img
+
+
+def card_reader(active=False):
+    """A wall card reader, 32x48: a slot, a keypad and a status lamp (red idle, amber
+    while reading: the '+A' frame a pressed button shows)."""
+    img = Image.new("RGB", (32, 48), (58, 62, 70))
+    d = ImageDraw.Draw(img)
+    d.rectangle((0, 0, 31, 47), outline=(110, 116, 128))
+    d.rectangle((1, 1, 30, 46), outline=(34, 36, 42))
+    d.rectangle((5, 5, 26, 14), fill=(24, 26, 30))                       # display
+    lamp = (255, 176, 30) if active else (230, 40, 30)
+    d.ellipse((12, 7, 19, 12), fill=lamp)
+    d.rectangle((6, 18, 25, 21), fill=(12, 12, 14))                      # card slot
+    d.line((6, 22, 25, 22), fill=(120, 126, 138))
+    for r in range(3):                                                   # keypad
+        for c in range(3):
+            x, y = 8 + c * 6, 26 + r * 6
+            d.rectangle((x, y, x + 3, y + 3), fill=(150, 154, 164), outline=(40, 42, 48))
+    d.rectangle((6, 44, 25, 45), fill=(246, 204, 24))
+    return img
+
+
+def boxworth_faces(size=64):
+    """Boxworth's crate as textures for a brush model: (front with his face, plain side).
+    Same palette as boxworth()."""
+    out = []
+    for face in (True, False):
+        img = Image.new("RGB", (32, 32), (184, 126, 62))
+        d = ImageDraw.Draw(img)
+        ink, light, seam = (58, 36, 18), (214, 160, 92), (146, 98, 46)
+        d.rectangle((0, 0, 31, 31), outline=ink)
+        d.rectangle((1, 1, 30, 30), outline=light)
+        for x in (11, 20):                                   # plank seams
+            d.line((x, 2, x, 29), fill=seam)
+        for x, y in ((2, 2), (28, 2), (2, 28), (28, 28)):    # corner brackets
+            d.rectangle((x, y, x + 1, y + 1), fill=(120, 124, 132))
+        if face:
+            d.rectangle((5, 8, 11, 14), fill=(246, 246, 240), outline=ink)     # eyes
+            d.rectangle((20, 8, 26, 14), fill=(246, 246, 240), outline=ink)
+            d.rectangle((8, 10, 10, 12), fill=ink)
+            d.rectangle((21, 10, 23, 12), fill=ink)
+            d.point([(8, 10), (21, 10)], fill=(255, 255, 255))
+            d.rectangle((4, 18, 6, 19), fill=(232, 124, 110))                 # cheeks
+            d.rectangle((25, 18, 27, 19), fill=(232, 124, 110))
+            d.line((11, 21, 20, 21), fill=ink)                                # smile
+            d.point([(10, 20), (21, 20)], fill=ink)
+        out.append(img.resize((size, size), Image.NEAREST))
+    return tuple(out)
+
+
+def skip_panel(label="INTERCOM", size=(24, 36), scale=4):
+    """An intercom panel (size in world units): a label, a speaker grille and a SKIP
+    legend over the spot where scene.skip_button puts its button."""
+    w, h = size[0] * scale, size[1] * scale
+    img = plate("", size, "steel", scale=scale, rivets=False)
+    d = ImageDraw.Draw(img)
+    d.rectangle((6, 6, w - 7, 26), fill=(30, 34, 44))
+    d.text((w // 2, 16), label, fill=(236, 236, 242), font=font(12), anchor="mm")
+    for y in range(32, 64, 6):                                 # speaker grille
+        d.rounded_rectangle((14, y, w - 15, y + 3), radius=1, fill=(40, 44, 54))
+    ink = (16, 26, 62)
+    d.text((w // 2 - 10, 78), "SKIP", fill=ink, font=font(13), anchor="mm")
+    for x0 in (w // 2 + 14, w // 2 + 22):                      # >>
+        d.polygon([(x0, 72), (x0 + 7, 78), (x0, 84)], fill=ink)
+    return img
+
+
+def skip_button(pressed=False):
+    """The skip button's face: '+0' idle, '+A' lit while pressed."""
+    img = Image.new("RGB", (32, 32), (50, 54, 64))
+    d = ImageDraw.Draw(img)
+    d.ellipse((2, 2, 29, 29), fill=(20, 22, 28))
+    d.ellipse((4, 4, 27, 27), fill=(90, 230, 120) if pressed else (40, 130, 70))
+    for x0 in (9, 16):                                          # the fast-forward arrows
+        d.polygon([(x0, 10), (x0 + 7, 16), (x0, 22)], fill=(240, 250, 240))
+    return img
+
+
+def transit_pad(state="on", color=(120, 200, 255), size=64):
+    """A teleporter pad's top: rings around a core. state: 'on' (lit), 'off' (dark,
+    its '+A' frame) or 'offline' (dark, with a red bar)."""
+    import math as _m
+    img = Image.new("RGB", (size, size), (34, 38, 46))
+    d = ImageDraw.Draw(img)
+    c = size / 2
+    lit = state == "on"
+    ring = color if lit else (70, 76, 88)
+    core = tuple(min(255, v + 90) for v in color) if lit else (56, 60, 70)
+    for k in range(8):                                        # hazard ring at the rim
+        a0 = k * 45
+        d.pieslice((1, 1, size - 2, size - 2), a0, a0 + 22, fill=(230, 180, 20))
+    d.ellipse((5, 5, size - 6, size - 6), fill=(34, 38, 46))
+    for r, wdt in ((24, 3), (17, 2), (10, 2)):
+        d.ellipse((c - r, c - r, c + r, c + r), outline=ring, width=wdt)
+    d.ellipse((c - 5, c - 5, c + 5, c + 5), fill=core)
+    for k in range(4):                                        # spokes
+        a = _m.radians(45 + 90 * k)
+        d.line((c + _m.cos(a) * 10, c + _m.sin(a) * 10, c + _m.cos(a) * 24, c + _m.sin(a) * 24), fill=ring, width=2)
+    if state == "offline":
+        d.rectangle((6, c - 5, size - 7, c + 5), fill=(170, 30, 24))
+    return img
+
+
+def network_diagram(sites, edges, size=(256, 192), title="NETWORK", color=(120, 200, 255)):
+    """A wall board of a teleporter network: `sites` as nodes (the busiest in the
+    middle, the rest around it), `edges` [(a, b, active)] as lines, dashed when
+    offline."""
+    import math as _m
+    w, h = size
+    img = Image.new("RGB", size, (16, 20, 30))
+    d = ImageDraw.Draw(img)
+    d.rectangle((0, 0, w - 1, 20), fill=(30, 38, 56))
+    d.text((w // 2, 10), title, fill=(236, 236, 242), font=font(12), anchor="mm")
+    degree = {s: sum(1 for a, b, _ in edges if s in (a, b)) for s in sites}
+    hub = max(sites, key=lambda s: degree[s]) if sites else None
+    others = [s for s in sites if s != hub]
+    cx, cy, rx, ry = w / 2, 20 + (h - 20) / 2, w * 0.30, (h - 20) * 0.30
+    pos = {hub: (cx, cy)}
+    for k, s in enumerate(others):
+        a = _m.radians(-90 + 360 * k / max(1, len(others)))
+        pos[s] = (cx + rx * _m.cos(a), cy + ry * _m.sin(a))
+    for a, b, active in edges:
+        (x0, y0), (x1, y1) = pos[a], pos[b]
+        if active:
+            d.line((x0, y0, x1, y1), fill=color, width=3)
+        else:
+            n = max(1, int(_m.hypot(x1 - x0, y1 - y0) // 8))
+            for k in range(0, n, 2):
+                t0, t1 = k / n, min(1, (k + 1) / n)
+                d.line((x0 + (x1 - x0) * t0, y0 + (y1 - y0) * t0, x0 + (x1 - x0) * t1, y0 + (y1 - y0) * t1),
+                       fill=(110, 110, 120), width=2)
+    offline = {b for a, b, active in edges if not active}
+    for s, (x, y) in pos.items():
+        r = 9 if s == hub else 6
+        d.ellipse((x - r, y - r, x + r, y + r), fill=(110, 110, 120) if s in offline else color,
+                  outline=(236, 236, 242), width=1)
+        half = d.textlength(s, font=font(10)) / 2                  # above the top nodes, below the rest
+        lx = min(w - 4 - half, max(4 + half, x))
+        ly = y - r - 8 if s != hub and y < cy - 4 else y + r + 8
+        d.text((lx, ly), s, fill=(150, 150, 160) if s in offline else (236, 236, 242), font=font(10), anchor="mm")
+    return img

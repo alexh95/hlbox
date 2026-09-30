@@ -136,8 +136,11 @@ def door_rotating(opening, hinge="left", texture="FIFTIES_DR6A2", edge="FIFTIES_
 
 
 def door_sliding(opening, texture="LAB1_DOOR2A", edge="LAB1_DOOR2B", thickness=8, direction="up",
-                 speed=100, wait=4, lip=4, movesnd=1, stopsnd=1, targetname=None):
-    """Sliding func_door filling a doorway. direction: 'up', 'down', or a compass side."""
+                 speed=100, wait=4, lip=4, movesnd=1, stopsnd=1, targetname=None, master=None, **extra):
+    """Sliding func_door filling a doorway. direction: 'up', 'down', or a compass side.
+    targetname: only opens when fired (e.g. by a card_reader); master: only opens
+    while the master is on (a lock, a logic.Flag's is_on), buzzing 'access denied'
+    otherwise. wait=-1 stays open."""
     axis = opening.axis
     mins, maxs = list(opening.mins), list(opening.maxs)
     mid = (mins[axis] + maxs[axis]) / 2
@@ -154,7 +157,38 @@ def door_sliding(opening, texture="LAB1_DOOR2A", edge="LAB1_DOOR2B", thickness=8
         kv["angles"] = f"0 {YAW[direction]} 0"
     if targetname:
         kv["targetname"] = targetname
+    if master:
+        kv.update(master=master, locked_sound=2)          # 2 = "access denied"
+    kv.update(extra)
     return Entity("func_door", brushes=[leaf], kv=kv)
+
+
+def card_reader(pos, facing, target, flag, name, granted="ACCESS GRANTED", denied="ACCESS DENIED",
+                delay=0.6):
+    """A card reader on a wall (pos = centre on the wall surface). +use it: while
+    `flag` (a logic.Flag, e.g. a pass the player picked up; global states carry across
+    maps) is on, it beeps, shows `granted` in green and fires `target` after `delay`
+    (e.g. a named door); otherwise it buzzes and shows `denied` in red. Returns the
+    entities."""
+    from .art import card_reader as art_reader
+    from .logic import gate, sequence
+    from .mapfile import prepare_texture
+    tex = {"+0CARDREADER": prepare_texture("+0CARDREADER", art_reader(False)),
+           "+ACARDREADER": prepare_texture("+ACARDREADER", art_reader(True))}
+    button = switch(pos, facing, f"{name}_use", texture="+0CARDREADER", size=(12, 18), depth=3, sound=0, wait=2)
+    button.textures = tex
+    o = tuple(pos)
+    ents = [button,
+            *sequence(f"{name}_use", [(f"{name}_ok", 0), (f"{name}_no", 0)], o),
+            gate(f"{name}_ok", f"{name}_granted", flag.is_on, o),
+            gate(f"{name}_no", f"{name}_denied", flag.is_off, o),
+            hud_message(f"{name}_msg_ok", o, granted, color=(90, 255, 120), y=0.62, channel=3, hold=2),
+            hud_message(f"{name}_msg_no", o, denied, color=(255, 70, 50), y=0.62, channel=3, hold=2.5),
+            sound_effect(f"{name}_snd_ok", o, "buttons/button9.wav", radius="small"),    # keycard
+            sound_effect(f"{name}_snd_no", o, "buttons/button2.wav", radius="small"),    # access denied
+            *sequence(f"{name}_granted", [(f"{name}_snd_ok", 0), (f"{name}_msg_ok", 0), (target, delay)], o),
+            *sequence(f"{name}_denied", [(f"{name}_snd_no", 0), (f"{name}_msg_no", 0)], o)]
+    return ents
 
 
 # ---------------------------------------------------------------- lights
@@ -501,12 +535,17 @@ def hud_message(name, pos, text, color=(255, 220, 0), y=0.72, channel=2, hold=3.
                   channel=channel, spawnflags=1)   # 1 = all players
 
 
-def sound_effect(name, pos, wav, volume=10, everywhere=False, radius="medium"):
+def sound_effect(name, pos, wav, volume=10, everywhere=False, radius="medium", stoppable=False):
     """A sound played once each time `name` is fired (ambient_generic, not looping).
-    wav is relative to valve/sound, e.g. 'buttons/spark1.wav'."""
-    flags = 16 | 32 | (1 if everywhere else {"small": 2, "medium": 4, "large": 8}[radius])
+    wav is relative to valve/sound, e.g. 'buttons/spark1.wav'.
+
+    stoppable=True: firing it plays it and firing it "off" (a trigger_relay with
+    triggerstate 0) cuts it short. The game then counts it as playing until it's
+    turned off, even after the sound ends, and a saved game or a return to the map
+    plays such sounds again, so turn it off once it's done (scene.Talk does)."""
+    flags = 16 | (0 if stoppable else 32) | (1 if everywhere else {"small": 2, "medium": 4, "large": 8}[radius])
     return Entity("ambient_generic", targetname=name, origin=tuple(pos), message=wav, health=volume,
-                  pitch=100, spawnflags=flags)   # 16 = start silent, 32 = not looped
+                  pitch=100, spawnflags=flags)   # 16 = start silent, 32 = not looped (can't be stopped)
 
 
 def flat_prop(pos, w, d, texture, name=None, thick=1, sides="FIFTIES_DSK5B"):

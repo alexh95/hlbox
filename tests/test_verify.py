@@ -294,6 +294,66 @@ def test_stairs_are_walkable():
     assert p.missing == [], p.missing
 
 
+def _pad_rooms(glass=False, window=False, route="two-way", bad_landing=False):
+    """Room a (start) and room b beside it. With window=True a 24-high sill joins them
+    you can jump through (glass=True puts a func_wall pane in it); otherwise only teleporter pads link
+    them: route "two-way", "one-way" (b's pad offline) or None."""
+    from hlmap import teleport
+    from hlmap.verify import progression, teleport_landings
+    m = Map("vpads")
+    lvl = Level(wall=16)
+    a = lvl.room("a", (0, 0, 0), (384, 256, 128), MAT)
+    b = lvl.room("b", (400, 0, 0), (784, 256, 128), MAT)
+    if window:
+        w = lvl.doorway(a, b, width=128, height=96, sill=24)
+    lvl.build(m)
+    if glass:
+        (x0, y0, z0), (x1, y1, z1) = w.mins, w.maxs
+        m.add(props.Entity("func_wall", brushes=[box((x0 + 7, y0, z0), (x0 + 9, y1, z1), "GLASS_BRIGHT")],
+                           rendermode=2, renderamt=60))
+    if route:
+        net = teleport.Network("t")
+        pa = net.pad("pa", (192, 200, 0), "south", site="A")
+        pb = net.pad("pb", (592, 200, 0), "south", site="B", offline=route == "one-way")
+        net.route(pa, pb, two_way=route == "two-way")
+        m.add(net.entities())
+    if bad_landing:      # a teleporter whose target stands on another teleporter's volume
+        m.add(props.Entity("trigger_teleport", brushes=[box((40, 40, 0), (88, 88, 64), "AAATRIGGER")], target="dst"),
+              props.Entity("trigger_teleport", brushes=[box((296, 40, 0), (344, 88, 64), "AAATRIGGER")], target="dst"),
+              props.point("info_teleport_destination", (320, 64, 0), targetname="dst"))
+    m.add(props.player_start((64, 180, 0)), props.light((192, 128, 100)), props.light((592, 128, 100)))
+    out = Path(tempfile.mkdtemp()) / "vpads.map"
+    res = compile_map(m.write(out), profile="fast", steps=("csg", "bsp"))
+    assert res.ok, res.summary()
+    h = Hulls(res.bsp)
+    return progression(h, lvl.checkpoints()), teleport_landings(h)[0]
+
+
+def test_glass_blocks_the_walker():
+    """A pane of glass (a func_wall) in a low window: without it you could jump through."""
+    p, _ = _pad_rooms(window=True, route=None)
+    assert p.missing == []
+    p, _ = _pad_rooms(window=True, glass=True, route=None)
+    assert [n for n, _ in p.missing] == ["room b"], p.missing
+
+
+def test_teleporter_reaches_a_sealed_room():
+    p, bad = _pad_rooms()
+    assert p.missing == [] and bad == []
+    assert [back for _, back, _ in p.teleports] == [True, True]
+
+
+def test_one_way_teleporter_that_strands_is_caught():
+    p, bad = _pad_rooms(route="one-way")
+    assert p.missing == [] and bad == []
+    assert p.teleports and p.teleports[0][1] is False and "room a" in p.teleports[0][2], p.teleports
+
+
+def test_landing_on_a_teleporter_is_caught():
+    _, bad = _pad_rooms(route=None, bad_landing=True)
+    assert any("on a teleporter" in problem for _, problem in bad), bad
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

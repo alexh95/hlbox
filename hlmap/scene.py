@@ -17,8 +17,13 @@ extend, so custom lines play from the head position and the actor's gestures car
 the performance (scripted_sequence animations; see a model's sequence list).
 
 Names: fire `start` (only while not already running) and `abort` (only while
-running: stops the timeline, says the interrupt line). `running` is a logic.Flag;
-`on_start` targets fire as it starts, `on_end` ones when it finishes or is aborted.
+running: stops the timeline, says the interrupt line) and `skip` (only while
+running: stops it without a word, cutting the line being spoken, and fires `on_skip`
+targets, e.g. the state the lines would have reached). An aborted or skipped talk
+can't run again: its timeline is removed, the only way to cancel fires the game has
+queued. `running` and `skipped` are logic.Flags; `on_start` targets fire as it
+starts, `on_end` ones when it finishes, is aborted or is skipped. skip_button() makes
+a wall panel that skips talks.
 """
 from __future__ import annotations
 
@@ -40,8 +45,10 @@ class Talk:
         self.interruption = None
         self.on_start, self.on_end = [], []
         self.running = logic.Flag(f"{name}_running", False, head)
+        self.skipped = logic.Flag(f"{name}_skipped", False, head)   # the last run was skipped
+        self.on_skip = []
         self.cache_dir = Path(config.BUILD_DIR / m.name / "voice")    # synthesized clips (cached)
-        self.start, self.abort = name, f"{name}_abort"
+        self.start, self.abort, self.skip = name, f"{name}_abort", f"{name}_skip"
         self.duration = None
 
     def line(self, text, say=None, fire=(), gesture=None):
@@ -63,14 +70,22 @@ class Talk:
         if self.interruption:
             spoken[f"{n}_int"] = self.interruption["say"]
         clips = voice.synthesize(spoken, cache_dir, self.voice, self.rate, self.pitch)
-        ents = self.running.entities()
+        ents = self.running.entities() + self.skipped.entities()
         gestures = {}
+        # voices can be cut short: each has a relay that turns it off, and `hush` fires
+        # them all. That also marks finished lines as not playing (see
+        # props.sound_effect), so it runs at the start and the end of every run too.
+        for key in spoken:
+            ents.append(Entity("trigger_relay", targetname=f"{key}_hush", target=f"{key}_voice", triggerstate=0,
+                               origin=self.head))
+        ents += logic.sequence(f"{n}_hush", [(f"{key}_hush", 0) for key in spoken], self.head)
+        ents.append(props.hud_message(f"{n}_clear", self.head, " ", channel=4, hold=0.1))
 
         def say(key, ln):
             """Entities for one line; returns (targets to fire at its start, seconds)."""
             sound = m.add_sound(f"hlbox/{m.name}/{key}.wav", clips[key])
             dur = voice.duration(clips[key])
-            ents.append(props.sound_effect(f"{key}_voice", self.head, sound, radius=self.radius))
+            ents.append(props.sound_effect(f"{key}_voice", self.head, sound, radius=self.radius, stoppable=True))
             sub = "\\n".join(textwrap.wrap(ln["text"], self.wrap))
             ents.append(props.hud_message(f"{key}_sub", self.head, sub, color=self.color, y=0.86, channel=4,
                                           hold=round(dur + 0.3, 1)))
@@ -85,7 +100,8 @@ class Talk:
             if seqs is not None and ln["gesture"] and ln["gesture"] not in seqs:
                 raise ValueError(f"talk {n}: {self.actor_model} has no animation {ln['gesture']!r} "
                                  f"(it has: {', '.join(sorted(seqs))})")
-        steps, t = [(self.running.on, 0)] + [(e, 0) for e in self.on_start], self.lead
+        steps = [(self.running.on, 0), (self.skipped.off, 0), (f"{n}_hush", 0)] + [(e, 0) for e in self.on_start]
+        t = self.lead
         for i, ln in enumerate(self.lines, 1):
             cues, dur = say(f"{n}{i:02d}", ln)
             if seqs and ln["gesture"] and seqs[ln["gesture"]][0] > dur + self.gap:
@@ -94,21 +110,44 @@ class Talk:
             steps += [(c, round(t, 2)) for c in cues]
             t += dur + self.gap
         self.duration = round(t, 2)
-        steps += [(self.running.off, self.duration)] + [(e, self.duration) for e in self.on_end]
+        steps += [(self.running.off, self.duration), (f"{n}_hush", self.duration)]
+        steps += [(e, self.duration) for e in self.on_end]
         timeline = logic.sequence(f"{n}_seq", steps, self.head)
         ents += timeline
         ents.append(logic.gate(self.start, f"{n}_seq", self.running.is_off, self.head))
-        # abort: remove every part of the timeline, then say the interruption
-        stop = [(self.running.off, 0)] + [(e, 0) for e in self.on_end]
+        # abort and skip: remove every part of the timeline and silence the line being
+        # said; abort then says the interruption, skip just ends
+        stop = [(self.running.off, 0), (f"{n}_hush", 0), (f"{n}_clear", 0)] + [(e, 0) for e in self.on_end]
         for k, mm in enumerate(e["targetname"] for e in timeline):
             ents.append(Entity("trigger_relay", targetname=f"{n}_kill{k}", killtarget=mm, origin=self.head))
             stop.append((f"{n}_kill{k}", 0))
+        abort = list(stop)
         if self.interruption:
-            cues, _ = say(f"{n}_int", self.interruption)
-            stop += [(c, 0.3) for c in cues]
-        ents += logic.sequence(f"{n}_abort_seq", stop, self.head)
+            cues, dur = say(f"{n}_int", self.interruption)
+            abort += [(c, 0.3) for c in cues] + [(f"{n}_int_hush", round(0.3 + dur + 0.2, 2))]
+        ents += logic.sequence(f"{n}_abort_seq", abort, self.head)
         ents.append(logic.gate(self.abort, f"{n}_abort_seq", self.running.is_on, self.head))
+        ents += logic.sequence(f"{n}_skip_seq", stop + [(self.skipped.on, 0)] + [(e, 0) for e in self.on_skip],
+                               self.head)
+        ents.append(logic.gate(self.skip, f"{n}_skip_seq", self.running.is_on, self.head))
         for anim, g in gestures.items():   # 4 repeatable, 32 no interruptions, 64 override AI
             ents.append(Entity("scripted_sequence", targetname=g, m_iszEntity=self.actor, m_iszPlay=anim,
                                m_fMoveTo=0, m_flRadius=512, spawnflags=4 | 32 | 64, origin=self.head))
         return ents
+
+
+def skip_button(pos, facing, talks, name="skip", label="INTERCOM"):
+    """A wall panel (pos = centre on the wall) with a button that skips whichever of
+    `talks` is running: the line being said stops, and what the talk leads to happens
+    right away. Returns the entities."""
+    from .art import skip_button as button_art, skip_panel
+    from .mapfile import prepare_texture
+    fx, fy = props.DIRS[facing]
+    x, y, z = pos
+    panel = props.sign((x, y, z), facing, image=skip_panel(label), w=24, h=36, depth=1)
+    tex = {"+0SKIPBTN": prepare_texture("+0SKIPBTN", button_art(False)),
+           "+ASKIPBTN": prepare_texture("+ASKIPBTN", button_art(True))}
+    button = props.switch((x + fx, y + fy, z - 10), facing, name, texture="+0SKIPBTN", size=(12, 12), depth=3,
+                          sound=0, wait=1)
+    button.textures = tex
+    return [panel, button] + logic.sequence(name, [(t.skip, 0) for t in talks], (x + fx * 8, y + fy * 8, z))

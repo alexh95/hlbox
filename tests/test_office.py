@@ -35,8 +35,8 @@ def _enter(w, until=None):
 
 def _said(w):
     """Voice lines played so far, in order."""
-    return [w.ents[i]["targetname"][:-6] for i, c, _ in w.effects
-            if c == "ambient_generic" and w.ents[i].get("targetname", "").endswith("_voice")]
+    return [w.ents[i]["targetname"][:-6] for i, c, u in w.effects      # (hushing turns voices "off")
+            if c == "ambient_generic" and u == "toggle" and w.ents[i].get("targetname", "").endswith("_voice")]
 
 
 def test_first_visit_gives_the_briefing_once():
@@ -55,9 +55,9 @@ def test_back_after_the_briefing():
     w.fire("power_restore")
     n = len(_said(w))
     _enter(w)
-    assert _said(w)[n:] == ["back_after01", "back_after02"], _said(w)[n:]
+    assert _said(w)[n:] == ["back_after01", "back_after02", "back_after03"], _said(w)[n:]
     _enter(w)                              # only once
-    assert len(_said(w)) == n + 2
+    assert len(_said(w)) == n + 3
 
 
 def test_back_after_an_interrupted_briefing():
@@ -69,7 +69,7 @@ def test_back_after_an_interrupted_briefing():
     assert "talk_int" in said and "talk12" not in said, said
     w.fire("power_restore")
     _enter(w)
-    assert _said(w)[-2:] == ["back_after01", "back_after02"], _said(w)
+    assert _said(w)[-3:] == ["back_after01", "back_after02", "back_after03"], _said(w)
 
 
 def test_back_before_the_briefing_then_the_briefing():

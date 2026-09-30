@@ -202,12 +202,13 @@ class Level:
         """Add a room of empty space. overrides: floor=, wall=, ceiling= texture names.
         Rooms must be separated by walls unless they share a `group` (then they merge).
         checkpoints: [(x, y), ...] places in it that must be reachable on foot (default:
-        the centre and inset corners; give them for rooms with terrain)."""
+        the centre and inset corners; give them for rooms with terrain). An empty list:
+        nothing in it needs reaching (a view through a window, a sky)."""
         mat = material or self.material
         if overrides:
             mat = mat.with_(**overrides)
         r = Room(name, AABB(tuple(mins), tuple(maxs)), mat, group=group,
-                 meta={"checkpoints": list(checkpoints)} if checkpoints else {})
+                 meta={"checkpoints": list(checkpoints)} if checkpoints is not None else {})
         if not r.box.valid():
             raise ValueError(f"room {name}: mins must be < maxs, got {mins} {maxs}")
         self.rooms.append(r)
@@ -437,6 +438,8 @@ class Level:
         out = []
         for r in self.rooms:
             (x0, y0, z), (x1, y1, _) = r.mins, r.maxs
+            if "checkpoints" in r.meta and not r.meta["checkpoints"]:
+                continue                               # only there to be looked at
             if r.meta.get("checkpoints"):
                 pts = []
                 for x, y in r.meta["checkpoints"]:
@@ -447,9 +450,10 @@ class Level:
                 continue
             pts = [((x0 + x1) / 2, (y0 + y1) / 2)] + [(x, y) for x in (x0 + 40, x1 - 40) for y in (y0 + 40, y1 - 40)]
             cx, cy = pts[0]
+            mid = (r.floor + r.ceiling) / 2
             for i, (x, y) in enumerate(pts):         # corners cut off: move toward the middle
                 for _ in range(40):
-                    if r.contains((x, y, z + 1), tol=-24):
+                    if r.contains((x, y, mid), tol=-24):
                         break
                     x, y = x + (cx - x) * 0.1, y + (cy - y) * 0.1
                 pts[i] = (x, y)

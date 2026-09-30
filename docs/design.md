@@ -216,10 +216,21 @@ against the level's intended air and refuses to install on failure:
   - Calibration on the office: lit rooms read 110-220, a switched-off hall 6-8,
     dim cave stretches 40-80. Without its emergency lamps, the route from the
     card to the breaker crossed 1,688 dark units.
+- **Solid entities.** func_wall (glass), func_breakable and buttons block the walker,
+  tested exactly against each entity's own compiled hull (every brush model has
+  one). Before this, the walker jumped through the lab's observation window into the
+  test chamber, so "the chamber opens after the test" wasn't really checked.
+  func_wall_toggle is not treated as solid: its state would have to be part of the
+  search (the office slideshow has 12 of them).
+- **Room corners.** Rooms are checked at their centre and four corners inset by 40.
+  A containment test at the floor with a 24-unit inset always failed, which slid
+  every corner to the centre; found while writing the teleporter tests, and fixed.
 - **Performance.** Floods are incremental: when a door opens, the earlier flood is
   kept and only grown from that door, so a big outdoor area doesn't cost a full
-  re-flood per state of play. The office has 84k positions and 12 states in about
-  1.5 minutes.
+  re-flood per state of play. The darkness walk is cached per reachable area, light
+  levels and starting point, since many states differ only in who has said what. The
+  office has 92k positions and 52 states (the briefing states count now, because
+  labs reads them) in about a minute; its whole verify takes about 6.
 - **Decals.** Every infodecal must have solid within 4 units (the game traces 5
   units from it), or it silently doesn't appear.
 - **Pickups.** Every item is walked at straight, as a player who has spotted it does.
@@ -290,6 +301,18 @@ against the level's intended air and refuses to install on failure:
     load each. The item is swapped for an item_security, which has the same touch
     box but no "does the player need it" rule. It then reports whether the game
     agrees with the static model.
+  - `--links` walks into every trigger_changelevel from the side players come from.
+    Two engine facts shape it. The game queues its level change, and the new map's
+    sign-on commands, at the end of the same console buffer the script's waits sit
+    in. So the script must end at the trigger, or the change (and then the new
+    map's loading) waits behind it and the game hangs at LOADING. And the copy of
+    the map must run under its own name: the next map brings the player across only
+    from a map it links to. So the installed BSP is set aside for the session and
+    put back after. The new map's temporary `maps/<map>_load.cfg` only lets go of
+    forward and echoes a marker. Python watches the console log for it, waits for
+    the map to settle, and saves the Half-Life window's picture (`PrintWindow`, only
+    that window, DPI-aware) before closing the game. Both directions of the
+    office/labs tunnel arrive standing in the other map's copy of the tunnel.
 - **Limitations:**
   - Needs a desktop session and takes over the screen for about 15 s.
   - Movement is scripted input, not a bot. It checks specific walks, not whole
@@ -464,12 +487,52 @@ Quality and budget measures:
   - Map state and conditions. Done: `logic.Flag`, `logic.gate`, and `logic.Circuit`
     for power failures (§3.10).
   - Hurt, push and teleport volumes.
+- **Teleporters. Done** (`hlmap/teleport.py`). Networks of pads with routes
+  between them, powered by a Flag (dark and dead until `net.start`), offline pads as
+  slots for destinations to come, and a generated network board (`net.diagram()`).
+  - The walker takes active teleporters as moves (their `master` read from the
+    simulated state), so an area reachable only by pad counts as reachable once the
+    pads are on. The flood cache is keyed by which doors are shut and which
+    teleporters are on.
+  - Checks: every landing stands clear, on the ground, not on a teleporter or in a
+    level change; with everything on, every trip has a way back to where it was
+    stepped on (a flood from the landing that stops once it finds it), and a trip
+    without one fails if it cuts anything off.
+  - In labs, the resonance test brings the network online: pads in the test chamber
+    and the loading bay go to a transit hub, a room with no doors whose window looks
+    out on a Xen sky (a room made of sky, `checkpoints=[]`, with floating rocks). Its
+    three offline pads, SITE 2 to 4, are where the next ideas plug in.
+  - Next: sites in other maps. A campaign Link whose zone holds two pads (each map's
+    changelevel on the pad the other map lands on), with the flash and sound on
+    arrival, would make a pad a level change.
 - **NPCs and items.**
   - Scientists, security guards and monsters placed on the floor with checks.
   - `scripted_sequence` and `scripted_sentence` using the existing sentences.
   - Weapons, ammo, health, batteries and the HEV suit.
-- **Multi-map campaigns.** Scripts that emit several linked maps, with
-  `trigger_changelevel` plus `info_landmark` pairs placed consistently in both maps.
+- **Multi-map campaigns. Done** (`hlmap/campaign.py`, `maps/campaign.py`).
+  - One script per map. `maps/campaign.py` lists the maps in order and defines each
+    `Link`: a stretch of level (the zone) that both maps build from the same function,
+    the landmark's position in each map (offsets in multiples of 512, so textures
+    line up), each map's trigger, and the global states the other side cares about.
+    `link.place(m, lvl)` builds the zone and writes the `info_landmark`, the
+    `trigger_transition` over the zone and the `trigger_changelevel`.
+  - State crosses maps as global states (`logic.Flag`): the office's sector pass opens
+    the lab door (`props.card_reader`), and the labs' guard and intercom know whether
+    you sat through the office briefing.
+  - Verify: the way out is a checkpoint; the global states the player can leave with
+    are recorded (`build/<map>/exits.json`) and the next map is verified from where
+    the player lands, once per state it reads. Declared `carries` are explored even
+    when no door depends on them. With both maps compiled, each direction of a
+    transition is checked: the landmark (once per map), the changelevel inside the
+    transition volume, every landing spot (standing, clear of walls, not in the air,
+    not touching a trigger back), the zone's surfaces (same planes, textures and
+    texture alignment, sampled every 32 units) and the light where the player lands.
+    `tests/test_campaign.py` compiles linked pairs and proves the checks catch a
+    different zone, shifted textures and a landing in a wall.
+  - `playtest <map> --links` walks into each changelevel in the game and captures
+    the arrival (see §3.9 Playtests for why that needs a window capture).
+  - Not simulated: returning to a map (the game restores it as it was left; only
+    the landing is checked).
 - **Narrative and screen effects (all stock):**
   - `game_text` for on-screen notes, triggered by a button on a note or sign.
     Done: `props.hud_message`.
@@ -551,8 +614,9 @@ lint and the budget report (§3.6, §3.8).
     add back up to the original volume.
   - A verify-based test per geometry generator (rooms, caves).
   - Golden `.map` output for the example maps.
-- **Return paths.** Walkability checks the way there, not back. Check that a player
-  can always return from every area (no one-way drops that trap them).
+- **Return paths.** Done for teleporters (every trip needs a way back, or must not
+  cut anything off). Still to do for one-way drops: positions from which the rest of
+  the level can't be reached (strongly connected parts of the walk graph).
 - **Performance per view.** Record the `r_speeds` output (world and entity polygon
   counts) during screenshot runs to measure detail at each camera.
 - **Headless renderer.** Render the compiled BSP, with textures and lightmaps, from
@@ -599,8 +663,8 @@ Notes for if that changes:
    approval.
 3. **numpy.** Pure Python is fine for today's geometry. Large terrain or noise grids
    would benefit from numpy, which is a new dependency and needs approval.
-4. **Campaign structure.** One script per map, or one script emitting a linked set of
-   maps.
+4. **Campaign structure.** Decided: one script per map, plus `maps/campaign.py` for
+   the order and the links (the zone each link shares is built there, once).
 
 Suggested order:
 1. The convex geometry core, tests and the budget report (§4.1, §8).
@@ -608,7 +672,7 @@ Suggested order:
 3. Architectural helpers (§4.2).
 4. Terrain and caves (§4.3).
 5. The custom content pipeline (§6).
-6. Multi-map campaigns.
+6. Multi-map campaigns (done: office -> labs).
 
 ## 11. Engine and compiler limits
 

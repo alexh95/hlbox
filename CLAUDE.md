@@ -9,6 +9,9 @@ screenshots. There is no GUI editor in the loop.
 - `hlmap/` is the library. It covers the geometry, the .map writer, the room builder, props, map logic
   (`logic.py`) and its simulator (`sim.py`), compile, preview, verification and game integration.
 - `maps/<name>.py` holds one map per file. Each defines `build() -> Map` and optionally `CAMERAS`.
+- `maps/campaign.py` lists the maps in the order a player meets them and defines the
+  links between them, including the stretch of level both sides of a transition build
+  (see "Campaigns"). `hlmap/campaign.py` is the library side of that.
 - `build/<name>/` holds the generated `.map`, `.bsp`, logs, `plan.png` and `shots/*.png`. It's disposable.
 - `tools/sdhlt/` has the SDHLT v1.3.0 compilers (`tools/Win64/*.exe`), `sdhlt.wad` (tool textures) and `sdhlt.fgd`.
   It's not in git; `python -m hlmap setup` downloads it and verifies the checksums.
@@ -22,6 +25,7 @@ screenshots. There is no GUI editor in the loop.
 ```
 python -m hlmap setup                  # once per checkout: fetch the compilers
 python -m hlmap build <map>            # script -> .map -> compile (normal) -> install -> build/<map>/plan.png
+python -m hlmap build office labs      # several maps, in campaign order (each verified with how you arrive)
 python -m hlmap build <map> --shots    # ...and take in-engine screenshots of CAMERAS
 python -m hlmap build <map> --profile fast|final
 python -m hlmap preview <map> [--view top|x|y] [--cut N]   # cutaway PNG only, no compile
@@ -33,11 +37,15 @@ python -m hlmap verify <map>           # collision/visibility checks (build runs
 python -m hlmap playtest <map> --pickups   # in the real game: walk straight at every item, is it picked up?
 python -m hlmap playtest <map> --at "x y feet_z yaw" [--fire NAME] --script "+forward; 60; -forward; 100"
                                        # scripted play from a start; prints what fired, saves a snapshot
+python -m hlmap playtest <map> --links # walk into every level change: does the next map load? (snapshot)
+python -m hlmap playtest <map> --teleports [--fire transit_start]   # step onto every teleporter (snapshot)
 python -m hlmap info <map>             # BSP stats + entity lump
 python tests/test_verify.py            # the verifier must catch holes, invisible walls, missing faces,
                                        # lockouts and dark routes
 python tests/test_logic.py             # logic helpers behave as intended (simulated, no compile)
 python tests/test_office.py            # the office's story: briefing, power cut, welcome back (simulated)
+python tests/test_campaign.py          # level transitions must match up; what office hands to labs;
+                                       # the lab's skippable intercom and early chamber door
 ```
 
 The verification loop after every change:
@@ -48,9 +56,11 @@ The verification loop after every change:
      that reaches into intended solid. That means walk-through walls or see-through
      gaps.
    - **Invisible walls:** solid collision where the player's box fits in open air.
-   - **Walkability and progression:** every room, cave stretch and `m.checkpoints`
-     entry must be reachable ON FOOT: steps of at most 18, jumps of at most 45, falls
-     under 600, ladders.
+   - **Walkability and progression:** every room (its centre and inset corners), cave
+     stretch and `m.checkpoints` entry must be reachable ON FOOT: steps of at most 18,
+     jumps of at most 45, falls under 600, ladders, and active teleporters. Solid brush
+     entities (func_wall glass, buttons, func_breakable) block the way, tested against
+     their own compiled collision hulls; func_wall_toggle and func_illusionary don't.
      - Every progress-relevant pickup, button and trigger volume is tried in every
        order. Its effects are simulated through the entity logic (`hlmap/sim.py`:
        relays, multi_managers, locks, global state, gates, lights). Doors block while
@@ -58,6 +68,11 @@ The verification loop after every change:
      - "locks never opened" plus unreachable rooms means a key behind its own door.
    - **Lockout:** no order of play may leave an area unreachable for good. For
      example, a one-shot breaker used before the power fails.
+   - **Teleporters:** each lands the player standing, clear of solid, not in mid-air,
+     not on another teleporter (that would bounce them on) and not in a level change.
+     With them all on, every trip must have a way back to where it was stepped on. A
+     one-way trip only warns when everything stays reachable, and fails when it cuts
+     the player off (it names what's lost).
    - **Darkness:** after every step, the way to the next objective must be lit.
      There's no flashlight without the HEV suit. The check uses the compiled
      lightmaps with the light styles as the simulation left them. A floor under 24
@@ -71,6 +86,13 @@ The verification loop after every change:
      the approaches stop short, that fails for items with a target (keys) and warns
      for the rest. `playtest --pickups` repeats the same walks in the game.
    - **Coverage:** every visible face exists in the BSP.
+   - **Campaign:** every level change is reachable (a "way to <map>" checkpoint).
+     The global states the player can leave with go to `build/<map>/exits.json`, and
+     the next map is verified from where they land, once per state it reads. When
+     both maps are compiled, each transition is checked both ways: the landmark,
+     the transition volume, every landing spot (standing, not in a wall or the air,
+     not touching a trigger back), the shared stretch surface by surface (plane,
+     texture, alignment), and the light where the player lands.
    A clean compile does NOT mean clean collision. The compiler's "ambiguous leafnode"
    warnings once hid walk-through cave walls, and only `verify` (or a playtest) shows
    them.
@@ -129,7 +151,9 @@ def build():
   catches that. Separate adjacent rooms by exactly `wall` units so `doorway()` finds
   the shared wall. Rooms that touch or overlap are an error unless they share a
   `group=` (then they merge into one space). `lvl.air(name, mins, maxs, like=room)` adds
-  alcoves and window holes. `doorway(..., sill=40)` makes a window.
+  alcoves and window holes. `doorway(..., sill=40)` makes a window. A room with
+  `checkpoints=[]` is only for looking at (the view out of a window, a sky with
+  floating rocks): nothing in it has to be reachable.
 - **Corridors at any angle.** `c = lvl.corridor(name, [(x, y), ...], width=96, height=112,
   material=...)` runs a corridor along a polyline from inside one room to inside
   another, carving the walls it passes through.
@@ -177,6 +201,69 @@ def build():
     dry ground, OUT_WLK paving, OUT_WALL1A / OUT_WALL7 block walls, OUT_ROOF1,
     OUT_SHRB1 hedge, OUT_CAC1 cactus, STRIPES1/4 hazard stripes, {CHAINLINK and
     {FENCE fences, {GATE, {GRASS1/2 tufts, GLASS_DARK/MED, TIRES/TRK_TIRE, BLACK.
+- **Campaigns (several maps).** Each map is its own script; `maps/campaign.py` says how
+  they join. `MAPS = [...]` is the order a player meets them. A `Link` is one level
+  transition:
+  ```python
+  LINK = Link("tunnel", ("office", "labs"), zone=((-512, -512, 0), (512, 512, 192)),
+              origins={"office": (2128, 1632, 0), "labs": (-944, 96, 0)},
+              triggers={"office": ((-128, 128, 0), (128, 192, 192)),
+                        "labs": ((-128, -192, 0), (128, -128, 192))},
+              build=tunnel_zone, carries=["sector_pass", "brief_pending"])
+  ```
+  - `build(m, lvl, origin)` makes the **zone**: the stretch both maps build
+    identically (rooms, lights, signs), around the landmark at `origin`. Each map
+    calls `LINK.place(m, lvl)` before `lvl.build(m)`. That builds the zone and adds
+    the `info_landmark`, a `trigger_transition` over the zone and a
+    `trigger_changelevel` to the other map over its `triggers` box (relative to the
+    origin). Join your own rooms onto the zone's rooms (same `group` to merge).
+  - Half-Life keeps the player's offset from the landmark, so they land at the same
+    spot of the other map's copy. Put each map's trigger before a corner, so the
+    zone's far end (which only the other map continues) is out of sight, and far from
+    where the other map's trigger lands you. A `BLACK` func_wall at a dead end reads
+    as the tunnel going on into the dark.
+  - The origins must differ by multiples of 512, so world-aligned textures line up
+    (verify checks the alignment too).
+  - Global states (`logic.Flag`) carry over; nothing else does, apart from what's in
+    the transition volume. Declare a map's own copy of each flag it reads (with its
+    default), so loading it on its own works. `carries` lists the ones the other map
+    cares about: verify explores every way of setting them before the player leaves,
+    even with no door depending on them. It warns when a map reads a state that the
+    previous map sets but no link carries (e.g. two maps both have a talk called
+    "talk": the `talk_running` flags would collide).
+  - Keys that must work across maps are Flags, not items: `props.pickup(...,
+    fires=[pass_flag.on])`, then `props.card_reader(pos, facing, "lab_door",
+    pass_flag, "lab_reader")` beside a door with `targetname="lab_door"`. The reader
+    beeps and fires it while the flag is on, and says `denied` otherwise.
+  - Build the maps together (`build office labs`) or earlier ones first: a later
+    map's verify needs the earlier map's `exits.json`. Install both, or the level
+    change fails in the game. `playtest <map> --links` tries each change for real.
+  - Returning to a map isn't simulated (the game restores it as it was left); only
+    the landing is checked.
+- **Teleporters (`hlmap.teleport`).**
+  ```python
+  net = teleport.Network("transit", online=False)       # dark until net.start is fired
+  a = net.pad("pad_chamber", (1736, 400, 0), "west", site="TEST CHAMBER")
+  b = net.pad("hub_chamber", (1024, -200, 0), "south", site="TRANSIT HUB")
+  net.route(a, b)                                        # two-way by default
+  net.pad("hub_site2", (1216, -200, 0), "south", site="TRANSIT HUB", label="SITE 2", offline=True)
+  m.add(net.entities())
+  m.add(props.sign(pos, facing, image=net.diagram(), w=112, h=84))   # the network board
+  ```
+  - A pad is a raised disc with a sign on a post behind it (its destination). Its
+    middle is a `trigger_teleport`; the player lands in front of the destination pad
+    (`arrive` units toward its `facing`), facing away from it. Landing on a pad would
+    send them straight on, so keep landing spots clear (verify checks).
+  - An offline network is a Flag: pads are dark (their disc on the `+A` frame,
+    sprite and light off) and dead until `net.start` fires. `trigger_teleport`
+    ignores being fired, so the Flag is their master.
+  - Stepping on flashes the screen (env_fade), with a whoosh there and a sound where
+    the player lands.
+  - Offline pads (`offline=True`, no route) are slots for places still to come: they
+    look the part, say "OFFLINE", and show as dashed lines on `net.diagram()`. Giving
+    one a route lights it with the rest. A place in another map would be a campaign
+    Link whose zone has two pads (each map's trigger on the pad the other map lands
+    on), so arrivals never stand on a live trigger.
 - **Stairs between floors.** `steps, hole = lvl.stairs(name, lower, upper, top=(x, y),
   down="north")` makes a staircase from `upper`'s floor down into `lower`, which must
   sit directly below (`wall` units of slab).
@@ -226,7 +313,9 @@ def build():
   - **Wall items:** wall_art (pictures, clocks, fuse boxes, whiteboards).
   - **Structure:** railing, ladder, door_rotating, door_sliding.
   - **Lights:** ceiling_light, light.
-  - **Logic:** switch, lock, pickup (item plus message plus sound, firing targets).
+  - **Logic:** switch, lock, pickup (item plus message plus sound, firing targets),
+    card_reader (a reader that fires its target while a Flag is on).
+  - **Sound:** sound_effect (once per fire; `stoppable=True` lets an "off" cut it).
   - **Presentation:** projector (with a visible additive light cone) and screen
     (toggleable slides).
   - **Xen:** crystal, xen_plantlight.
@@ -314,8 +403,18 @@ def build():
     `gesture` start with it, and the next line follows after `gap`. The timeline
     comes from the real clip lengths (`talk.duration`).
   - `talk.abort` (only while running) stops it and says the interruption.
-    `talk.on_start` targets fire as it starts, `talk.on_end` on finish or abort.
-    `talk.running` is a Flag. Set these before `talk.entities()`.
+    `talk.skip` (only while running) stops it without a word: the line being said is
+    cut (voices are stoppable sounds), the subtitle cleared, `on_end` fires (so what
+    the talk leads to still happens) and `on_skip` too. `talk.on_start` targets fire
+    as it starts, `talk.on_end` on finish, abort or skip. `talk.running` and
+    `talk.skipped` are Flags: gate follow-up talks on `skipped.is_off` so a skip
+    skips the scene. Set these before `talk.entities()`.
+  - An aborted or skipped talk can't run again: its timeline is removed, the only
+    way to cancel the fires the game has queued.
+  - `scene.skip_button(pos, facing, [talks], name)` is an intercom panel with a SKIP
+    button that skips whichever of the talks is running. Don't make the player wait
+    for dialogue to open a door: open it on the event (the labs chamber opens at the
+    flash) and let the talk run alongside.
   - Story state: use Flags ("briefing given", "power restored") and one room-wide
     `trigger_multiple` feeding `when(...)` branches. That's how the office picks
     between the briefing and the two welcome-backs. Test such branches with the
@@ -450,6 +549,35 @@ def build():
   second. Keep gestures shorter than the lines they go with.
 - In a `game_text` message, a literal `\n` is a line break (the engine turns it into
   one). Lines aren't wrapped for you, and scene.Talk wraps them at 64 characters.
+- Global state names are shared by every map of a campaign. Flags from `Talk`s
+  (`<talk>_running`), switched light groups (`<group>_lit`) and the power (`power`)
+  are global states too; give each map's talks and groups distinct names.
+- A `map` console command starts a new game (clearing the transition saves); level
+  changes need every map installed under `valve/maps`.
+- The game queues a level change, and the next map's sign-on, at the end of the
+  console buffer. Scripted waits still in the buffer hold it up, and the game sits at
+  LOADING. A scripted session must end where a level change should happen
+  (`playtest --links` does, then captures the window from outside the game).
+- The engine brings the player across only from a map the next map links to by
+  name, so a renamed test copy of a map breaks its level changes. `playtest --links`
+  runs the copy under the map's own name and restores the installed BSP after.
+- Any point entity outside the level makes the compile leak (the `info_texlights`
+  helper entity is written at the player start for that reason, and stripped from the
+  BSP after RAD: the game doesn't know it and says "Can't init info_texlights").
+- Loading a map prints some stock notices that are not problems: "failed to locate
+  sequence file", "couldn't exec maps/<map>_load.cfg", "Couldn't open file
+  overviews/<map>.txt", "Unable to open commandmenu.txt", "Unknown command:
+  VModEnable", and after a level change "Loading game from SAVE\<map>.HL1...
+  ERROR: couldn't open." (no saved state on a first visit). Logic entities made
+  without a position default to (0, 0, 0): give them one inside the level.
+- A `trigger_teleport` can't be switched by firing it; use its `master`. The game
+  sets the player's feet 1 unit over the destination's origin and turns them to its
+  angles.
+- A "not looped" ambient_generic can't be stopped once it plays. A looped one with a
+  WAV that has no loop points plays once and stops when turned off, but the game
+  counts it as playing until then and plays it again after a save is loaded or the
+  map is revisited. `props.sound_effect(..., stoppable=True)` makes the stoppable
+  kind; turn it off when done.
 - Collision is only trusted after `verify` passes. If you change a geometry
   generator, run `python tests/test_verify.py` and add a verify-based test for it.
 - A func_door_rotating needs an ORIGIN brush at the hinge (props.door_rotating adds one).

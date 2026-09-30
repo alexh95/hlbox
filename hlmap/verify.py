@@ -55,8 +55,14 @@ class Hulls:
         nx, ny, nz, d, _ = self.planes[idx]
         return (nx, ny, nz), d
 
-    def contents(self, hull, p):
-        """Contents at point p (for hulls 1-3, p is the player/monster origin)."""
+    def model_head(self, model, hull):
+        """The root of a brush model's collision tree for `hull` (1-3)."""
+        return struct.unpack_from("<4i", self.bsp.lumps["models"], model * 64 + 36)[hull]
+
+    def contents(self, hull, p, head=None):
+        """Contents at point p (for hulls 1-3, p is the player/monster origin). head: a
+        brush model's tree (model_head) instead of the world's; p is then relative to
+        the entity's origin."""
         if hull == 0:
             n = self.heads[0]
             while n >= 0:
@@ -64,7 +70,7 @@ class Hulls:
                 nrm, d = self._plane(pl)
                 n = c0 if dot(nrm, p) - d >= 0 else c1
             return self.leaves[-n - 1]
-        n = self.heads[hull]
+        n = self.heads[hull] if head is None else head
         while n >= 0:
             pl, c0, c1 = self.clipnodes[n]
             nrm, d = self._plane(pl)
@@ -387,25 +393,85 @@ MAX_FALL = 600        # ~ where falling damage becomes lethal
 HALF = (16, 16, 36)   # standing player half extents (hull 1)
 
 
+SOLID_ENTITIES = ("func_wall", "func_breakable", "func_button", "func_rot_button")
+
+
+def _grow(lo, hi):
+    """A box grown by the standing player's half size: where the player's origin is
+    when their box touches it."""
+    return tuple(lo[k] - HALF[k] for k in range(3)), tuple(hi[k] + HALF[k] for k in range(3))
+
+
+def solid_entities(hulls):
+    """Brush entities that are always solid (glass, walls, buttons; doors are handled
+    by state): [(root of the model's standing-player hull, entity origin, grown box)]."""
+    models = hulls.models()
+    out = []
+    for e in hulls.entities:
+        if e.get("classname") in SOLID_ENTITIES and e.get("model", "").startswith("*"):
+            o = tuple(float(c) for c in e["origin"].split()) if e.get("origin") else (0.0, 0.0, 0.0)
+            out.append((hulls.model_head(int(e["model"][1:]), 1), o, _grow(*_placed(models, e))))
+    return out
+
+
+def teleports(hulls):
+    """trigger_teleports: [(entity index, grown box, where it puts the player (origin),
+    target name)]. The game puts the player's feet 1 unit over the target's origin."""
+    models = hulls.models()
+    named = {e["targetname"]: e for e in hulls.entities if e.get("targetname") and e.get("origin")}
+    out = []
+    for i, e in enumerate(hulls.entities):
+        if e.get("classname") == "trigger_teleport" and e.get("model", "").startswith("*"):
+            dest = named.get(e.get("target", ""))
+            land = None
+            if dest is not None:
+                x, y, z = (float(c) for c in dest["origin"].split())
+                land = (x, y, z + HALF[2] + 1)
+            out.append((i, _grow(*_placed(models, e)), land, e.get("target", "")))
+    return out
+
+
 class Walker:
     """Where a player can get to ON FOOT: gravity, 18-unit steps, 45-unit jumps, falls
-    up to MAX_FALL, ladders (func_ladder volumes), and doors - locked doors block until
-    their lock opens. Positions are standing-player origins on an 8-unit grid."""
+    up to MAX_FALL, ladders (func_ladder volumes), doors (locked doors block until their
+    lock opens), solid brush entities (glass, func_walls: their own collision hulls)
+    and teleporters (walking into an active one moves the player to its landing).
+    Positions are standing-player origins on an 8-unit grid."""
 
-    def __init__(self, hulls, ladders=(), step=8):
+    def __init__(self, hulls, ladders=(), step=8, solids=()):
         self.h = hulls
         self.step = step
         self.ladders = [(tuple(lo[k] - HALF[k] for k in range(3)), tuple(hi[k] + HALF[k] for k in range(3)))
                         for lo, hi in ladders]
         self.blockers = []
+        self.teleports = []          # [(grown box, landing position)] of the active ones
         self._cache = {}
+        self._solids = {}
+        for head, o, (lo, hi) in solids:
+            for gx in range(int(lo[0] // 128), int(hi[0] // 128) + 1):
+                for gy in range(int(lo[1] // 128), int(hi[1] // 128) + 1):
+                    self._solids.setdefault((gx, gy), []).append((head, o, lo, hi))
 
     def _solid(self, p):
         if p not in self._cache:
-            self._cache[p] = self.h.contents(1, p) != -1
+            hit = self.h.contents(1, p) != -1
+            if not hit:
+                for head, o, lo, hi in self._solids.get((int(p[0] // 128), int(p[1] // 128)), ()):
+                    if all(lo[k] < p[k] < hi[k] for k in range(3)) and \
+                            self.h.contents(1, (p[0] - o[0], p[1] - o[1], p[2] - o[2]), head) != -1:
+                        hit = True
+                        break
+            self._cache[p] = hit
         if self._cache[p]:
             return True
         return any(all(lo[k] < p[k] < hi[k] for k in range(3)) for lo, hi in self.blockers)
+
+    def teleport_at(self, p):
+        """Where an active teleporter the player at p touches sends them, or None."""
+        for (lo, hi), land in self.teleports:
+            if all(lo[k] <= p[k] <= hi[k] for k in range(3)):
+                return land
+        return None
 
     def _on_ladder(self, p):
         return any(all(lo[k] <= p[k] <= hi[k] for k in range(3)) for lo, hi in self.ladders)
@@ -427,6 +493,9 @@ class Walker:
             z -= 8 if not (self._solid((x, y, z - 8)) or self._on_ladder((x, y, z - 8))) else 1
 
     def _moves(self, p):
+        land = self.teleport_at(p)
+        if land is not None:          # the teleporter takes over: that's the only way on
+            return [land]
         x, y, z = p
         on_ladder = self._on_ladder(p)
         out = []
@@ -454,18 +523,21 @@ class Walker:
                 return self._drop(x, y, z + up) or (x, y, z + up)
         return (x, y, z)
 
-    def flood(self, seeds, limit=400000, known=()):
+    def flood(self, seeds, limit=400000, known=(), goal=None):
         """Every position reachable from `seeds`. known: positions already known to be
-        reachable (not explored again; e.g. an earlier flood before a door opened)."""
+        reachable (not explored again; e.g. an earlier flood before a door opened).
+        goal(p): stop as soon as a position passes it; returns (found, seen) then."""
         seen = set(known) | set(seeds)
         todo = deque(seeds)
         while todo and len(seen) < limit:
             p = todo.popleft()
+            if goal is not None and goal(p):
+                return True, seen
             for q in self._moves(p):
                 if q not in seen:
                     seen.add(q)
                     todo.append(q)
-        return seen
+        return (False, seen) if goal is not None else seen
 
 
 def _placed(models, e):
@@ -490,6 +562,11 @@ def item_rest(hulls, origin):
         if any(hulls.contents(0, (x + cx, y + cy, z - dz - 1)) == -2 for cx, cy in corners):
             return (x, y, z - dz)
     return origin
+
+
+def touches_box(p, lo, hi):
+    """Does a standing player at origin p touch the box lo..hi (a trigger volume)?"""
+    return all(lo[k] - HALF[k] <= p[k] <= hi[k] + HALF[k] for k in range(3))
 
 
 def touches_item(p, item):
@@ -639,6 +716,8 @@ class Progress:
         self.softlocks = []      # (path of steps, checkpoints that can no longer be reached)
         self.darkness = []       # (path, next objective, units of darkness on the best way there)
         self.warnings = []
+        self.exits = {}          # exit name -> [(globals, position, path)]
+        self.teleports = []      # (teleporter, can the player get back, checkpoints lost if not)
         self.states = 0
         self.truncated = False
 
@@ -658,11 +737,18 @@ def _describe(ents, i, models):
     return f"{verb} {c} at {at} -> {e.get('target')}"
 
 
-def progression(hulls, checkpoints, radius=24, light=None, max_states=300):
+def progression(hulls, checkpoints, radius=24, light=None, max_states=300, globals=None, start=None,
+                exits=None, watch=()):
     """Play the map's logic on foot. From the player start, every progress-relevant
     thing the player can reach (pickups, buttons, trigger volumes) is tried in every
     order, with its effects simulated through the entity logic (hlmap/sim.py: relays,
     multi_managers, locks, global state, gates...). Doors block while locked.
+
+    globals, start: arriving from another map, the global states carried over and
+    where the player lands (a standing origin) instead of the player start.
+    exits: {name: (mins, maxs)} volumes that leave the map (trigger_changelevel).
+    watch: global states worth telling apart even if no door here depends on them
+    (the ones the next map reads), so every way to set them is explored.
 
     Returns a Progress:
       missing    checkpoints no order of play reaches
@@ -672,15 +758,19 @@ def progression(hulls, checkpoints, radius=24, light=None, max_states=300):
       darkness   (with `light`, a FloorLight) for each state along the way: how much
                  darkness the best way to the next objective crosses. There is no
                  flashlight without the HEV suit, so dark stretches are real.
+      exits      {name: [(globals, position, path)]}: every distinct global state the
+                 player can leave through each exit with, where they touch it, and a
+                 line of play that gets there
     """
     from .sim import BUTTONS, DOORS, ITEMS, World
     res = Progress()
     ents = hulls.entities
     models = hulls.models()
-    world0 = World(ents).start()
+    world0 = World(ents, globals).start()
     res.warnings += world0.warnings
     ladders = [_placed(models, e) for e in ents if e.get("classname") == "func_ladder"]
-    w = Walker(hulls, ladders)
+    w = Walker(hulls, ladders, solids=solid_entities(hulls))
+    tele = [(i, box, w.settle(land)) for i, box, land, _ in teleports(hulls) if land is not None]
     doors = []
     for i, e in enumerate(ents):
         if e.get("classname") in DOORS and (e.get("master") or e.get("targetname")) and e.get("model", "").startswith("*"):
@@ -703,25 +793,32 @@ def progression(hulls, checkpoints, radius=24, light=None, max_states=300):
             lo, hi = _placed(models, e)
             actions.append((i, "touch", lambda p, lo=lo, hi=hi:
                             all(lo[k] - HALF[k] < p[k] < hi[k] + HALF[k] for k in range(3))))
-    rel = world0.relevance([i for i, _ in doors])
+    rel = world0.relevance([i for i, _ in doors] + [i for i, _, _ in tele], watch)
     actions = [a for a in actions if a[0] in rel[0]]
 
     cache = {}
 
+    def configure(blocked, enabled):
+        w.blockers = [b for i, b in doors if i in blocked]
+        w.teleports = [(box, land) for i, box, land in tele if i in enabled]
+
     def flood(world, pos):
         blocked = tuple(i for i, _ in doors if not world.door_passable(i))
-        for comp in cache.get(blocked, ()):
+        enabled = tuple(i for i, _, _ in tele if world.teleport_enabled(i))
+        cfg = (blocked, enabled)
+        for comp in cache.get(cfg, ()):
             if pos in comp:
-                return comp, blocked
-        w.blockers = [b for i, b in doors if i in blocked]
+                return comp, cfg
+        configure(blocked, enabled)
         # a door (or more) opened since an earlier flood that reached pos: everything it
-        # reached is still reachable, so only grow it from the doors that opened
+        # reached is still reachable, so only grow it from the doors that opened (with
+        # the same teleporters on: one that switches on also stops walks across it)
         base = None
-        for other, comps in cache.items():
-            if set(blocked) <= set(other):
+        for (b_other, e_other), comps in cache.items():
+            if e_other == enabled and set(blocked) <= set(b_other):
                 for comp in comps:
                     if pos in comp and (base is None or len(comp) > len(base[1])):
-                        base = (other, comp)
+                        base = (b_other, comp)
         if base is not None:
             opened_boxes = [b for i, b in doors if i in base[0] and i not in blocked]
             frontier = [p for p in base[1] if any(all(lo[k] - 24 <= p[k] <= hi[k] + 24 for k in range(3))
@@ -729,19 +826,24 @@ def progression(hulls, checkpoints, radius=24, light=None, max_states=300):
             comp = frozenset(w.flood(frontier, known=base[1]))
         else:
             comp = frozenset(w.flood([pos]))
-        cache.setdefault(blocked, []).append(comp)
-        return comp, blocked
+        cache.setdefault(cfg, []).append(comp)
+        return comp, cfg
 
     def lock_name(i):
         return ents[i].get("master") or ents[i].get("targetname") or f"door {i}"
 
-    start = next(e for e in ents if e.get("classname") == "info_player_start")
-    pos0 = w.settle(tuple(float(c) for c in start["origin"].split()))
+    def tele_name(i):
+        return f"teleporter to {ents[i].get('target')}"
+
+    if start is None:
+        start = tuple(float(c) for c in next(e for e in ents if e.get("classname") == "info_player_start")
+                      ["origin"].split())
+    pos0 = w.settle(start)
     nodes, order = {}, []
     queue = deque([(world0, pos0, [], None)])
     while queue:
         world, pos, path, via = queue.popleft()
-        comp, blocked = flood(world, pos)
+        comp, (blocked, enabled) = flood(world, pos)
         key = (world.key(rel), min(comp))
         if via:
             nodes[via[0]]["children"].append((via[1], key))
@@ -750,7 +852,8 @@ def progression(hulls, checkpoints, radius=24, light=None, max_states=300):
         if len(nodes) >= max_states:
             res.truncated = True
             continue
-        node = {"world": world, "comp": comp, "blocked": blocked, "entry": pos, "path": path, "children": []}
+        node = {"world": world, "comp": comp, "blocked": blocked, "enabled": enabled, "entry": pos, "path": path,
+                "children": []}
         nodes[key] = node
         order.append(key)
         base = world.key(rel)
@@ -770,6 +873,10 @@ def progression(hulls, checkpoints, radius=24, light=None, max_states=300):
                 was, now = world.door_passable(d), w2.door_passable(d)
                 if was != now:
                     change.append(f"{lock_name(d)} {'unlocked' if now else 'LOCKED'}")
+            for t, _, _ in tele:
+                was, now = world.teleport_enabled(t), w2.teleport_enabled(t)
+                if was != now:
+                    change.append(f"{tele_name(t)} {'on' if now else 'off'}")
             res.warnings += [x for x in w2.warnings if x not in res.warnings]
             step = _describe(ents, i, models) + (f": {'; '.join(change)}" if change else "")
             queue.append((w2, spot, path + [step], (key, a)))
@@ -817,8 +924,37 @@ def progression(hulls, checkpoints, radius=24, light=None, max_states=300):
             res.softlocks.append((nodes[k]["path"], lost))
     res.log = nodes[next(k for k in order if k in goals)]["path"]
 
+    # every teleporter trip must have a way back (to where the player stepped on), or
+    # at least leave everything else still reachable; checked with all of them on
+    if tele:
+        best = max(goals, key=lambda k: len(nodes[k]["enabled"]))
+        node = nodes[best]
+        configure(node["blocked"], node["enabled"])
+        for t, (lo, hi), land in tele:
+            if t not in node["enabled"]:
+                continue
+            around = lambda p, lo=lo, hi=hi: (not all(lo[k] <= p[k] <= hi[k] for k in range(3)) and
+                                              all(lo[k] - 48 <= p[k] <= hi[k] + 48 for k in range(2)) and
+                                              lo[2] - 48 <= p[2] <= hi[2])
+            back, seen = w.flood([land], goal=around)
+            lost = sorted(checkpoints[c][0] for c in cov[best] - covers(seen)) if not back else []
+            res.teleports.append((tele_name(t), back, lost))
+
+    for name, (lo, hi) in (exits or {}).items():     # what the player can leave with
+        out, seen = [], set()
+        for k in order:
+            node = nodes[k]
+            g = tuple(sorted(node["world"].globals.items()))
+            if g in seen:
+                continue
+            spot = next((p for p in node["comp"] if touches_box(p, lo, hi)), None)
+            if spot is not None:
+                seen.add(g)
+                out.append((dict(g), spot, node["path"]))
+        res.exits[name] = out
+
     if light is not None:
-        seeable_cache = {}
+        seeable_cache, walk_cache = {}, {}
         for k in order:
             if k not in finish or k in goals:
                 continue
@@ -831,10 +967,15 @@ def progression(hulls, checkpoints, radius=24, light=None, max_states=300):
             if sig not in seeable_cache:
                 seeable_cache[sig] = _seeable(node["comp"], light, levels)
             seeable = seeable_cache[sig]
-            w.blockers = [b for i, b in doors if i in node["blocked"]]
+            configure(node["blocked"], node["enabled"])
             best_cost, best_a = None, None
             for a, _ in useful:
-                cost = _dark_walk(w, node["comp"], seeable, node["entry"], a[2])
+                # states that differ only in things that don't move doors or lights
+                # (e.g. who has said what) walk the same way
+                wk = (sig, node["blocked"], node["enabled"], node["entry"], a[0])
+                if wk not in walk_cache:
+                    walk_cache[wk] = _dark_walk(w, node["comp"], seeable, node["entry"], a[2])
+                cost = walk_cache[wk]
                 if cost is not None and (best_cost is None or cost < best_cost):
                     best_cost, best_a = cost, a
             if best_a is not None:
@@ -878,3 +1019,33 @@ def _dark_walk(walker, comp, seeable, start, reach):
                 dist[q] = d + step
                 (dq.appendleft if step == 0 else dq.append)(q)
     return None
+
+
+def teleport_landings(hulls):
+    """Where each trigger_teleport puts the player: [(teleporter, problem)] for
+    landings inside something, in mid-air, on a teleporter (sent straight on: two pads
+    would bounce the player back and forth) or in a level change. Returns (problems,
+    number of teleporters)."""
+    from .campaign import changelevels
+    tele = teleports(hulls)
+    w = Walker(hulls, solids=solid_entities(hulls))
+    changes = [_grow(*b) for _, _, b in changelevels(hulls)]
+    out = []
+    for i, _, land, target in tele:
+        name = f"teleporter to {target}"
+        if land is None:
+            out.append((name, f"its target {target!r} is not a named point entity"))
+            continue
+        spot = tuple(round(c) for c in land)
+        if w._solid(spot):
+            out.append((name, f"puts the player inside something at {spot}"))
+            continue
+        ground = w._drop(*spot)
+        if ground is None or spot[2] - ground[2] > STEP_HEIGHT:
+            out.append((name, f"puts the player in mid-air at {spot}"))
+            ground = ground or spot
+        if any(all(lo[k] <= ground[k] <= hi[k] for k in range(3)) for j, (lo, hi), _, _ in tele):
+            out.append((name, f"puts the player on a teleporter at {spot} (straight on to the next one)"))
+        if any(all(lo[k] <= ground[k] <= hi[k] for k in range(3)) for lo, hi in changes):
+            out.append((name, f"puts the player in a level change at {spot}"))
+    return out, len(tele)

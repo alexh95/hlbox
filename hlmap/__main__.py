@@ -1,12 +1,15 @@
 """Command line:  python -m hlmap <command> ...
 
   setup                                       download the SDHLT compilers into tools/sdhlt
-  build <map> [--profile fast|normal|final] [--no-install] [--shots]
+  build <map> [<map>...] [--profile fast|normal|final] [--no-install] [--shots]
         maps/<map>.py -> build/<map>/<map>.map -> compile -> install -> previews
+        (several maps: in campaign order, maps/campaign.py)
   preview <map> [--view top|x|y] [--cut N]    orthographic cutaway PNG (no compile)
   shots <map> [--cam "x y z pitch yaw"]... [--fire NAME|@doors]
                                               in-engine screenshots (uses CAMERAS by default)
   play <map>                                  launch Half-Life into the map
+  playtest <map> --pickups | --links | --at "x y z yaw" --script "..."
+                                              scripted play in the real game
   tex <pattern> [--sheet]                     search textures (and render a contact sheet)
   verify <map>                                collision/visibility checks of the compiled BSP
                                               (also run by build; failures block install)
@@ -26,9 +29,14 @@ def load_map_module(name):
     path = config.MAPS_SRC_DIR / f"{name}.py"
     if not path.exists():
         sys.exit(f"no map source {path}")
+    root = str(config.MAPS_SRC_DIR.parent)     # map scripts may import shared parts (maps.campaign)
+    if root not in sys.path:
+        sys.path.insert(0, root)
     spec = importlib.util.spec_from_file_location(f"maps.{name}", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    if not hasattr(mod, "build"):
+        sys.exit(f"{path} has no build(): not a map (shared code for maps lives there too)")
     return mod
 
 
@@ -51,11 +59,26 @@ def cmd_setup(a):
 
 
 def cmd_build(a):
-    from .compile import compile_map
-    from .preview import render
+    """Build each map in turn (in campaign order when several are named, so each one
+    is verified with how players arrive from the one before)."""
     from .setup import installed
     if not installed():
         sys.exit("SDHLT compilers missing: run  python -m hlmap setup")
+    maps = list(a.map)
+    if len(maps) > 1:
+        from .campaign import order
+        rank = {n: i for i, n in enumerate(order())}
+        maps.sort(key=lambda n: rank.get(n, len(rank)))
+    for name in maps:
+        if len(maps) > 1:
+            print(f"==================== {name}")
+        a1 = argparse.Namespace(**{**vars(a), "map": name})
+        _build_one(a1)
+
+
+def _build_one(a):
+    from .compile import compile_map
+    from .preview import render
     m, mod = build_map(a.map)
     problems = m.check()
     level = getattr(m, "level", None)
@@ -101,6 +124,9 @@ def cmd_build(a):
         files = m.content_files(d)
         print("installed:", str(game.install(res.bsp, a.map, files=files))
               + (f" (+{len(files)} files: sounds, {a.map}.res)" if files else ""))
+        for target in sorted({e.get("map") for e in m.find("trigger_changelevel")}):
+            if not (config.GAME_DIR / "maps" / f"{target}.bsp").exists():
+                print(f"note: {a.map} leads to {target}, which isn't installed yet (build {target} too)")
     if a.shots:
         a.cam, a.fire, a.only, a.console, a.log = None, None, None, None, False
         cmd_shots(a)
@@ -194,8 +220,14 @@ def cmd_playtest(a):
                   f"{'' if same else ' (verify expected the opposite)'}")
         print(f"{agree} of {len(got)} approaches agree with verify's model")
         return
+    if a.links:
+        _playtest_links(a, bsp, d)
+        return
+    if a.teleports:
+        _playtest_teleports(a, bsp, d)
+        return
     if not a.at:
-        sys.exit('pass --pickups, or --at "x y feet_z yaw" with --do steps')
+        sys.exit('pass --pickups, --links, or --at "x y feet_z yaw" with --do steps')
     start = tuple(float(c) for c in a.at.split())
     steps = list(a.do or []) + [x.strip() for x in (a.script or "").split(";") if x.strip()]
     script = [int(s) if s.isdigit() else s for s in steps]
@@ -207,6 +239,97 @@ def cmd_playtest(a):
             print("  console:", line)
     for p in pngs:
         print(f"shot {p}")
+
+
+def _playtest_links(a, bsp, d):
+    """Walk into every trigger_changelevel in the real game: start on open ground a
+    little before it, hold forward, and check the game arrived in the other map; the
+    picture (build/<map>/playtest/link_<target>_window.png) shows where the player landed."""
+    import math
+    from . import game
+    from .campaign import changelevels
+    from .verify import HALF, Hulls, Walker, _placed, straight_walk, touches_box
+    h = Hulls(bsp)
+    w = Walker(h, [_placed(h.models(), e) for e in h.entities if e.get("classname") == "func_ladder"])
+    start = next(e for e in h.entities if e.get("classname") == "info_player_start")
+    pos0 = w.settle(tuple(float(c) for c in start["origin"].split()))
+    links = changelevels(h)
+    if not links:
+        sys.exit("no trigger_changelevel in this map")
+    for target, lm, (lo, hi) in links:
+        mid = ((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2)
+        # the side players come from: reachable from the start (doors open) without
+        # crossing the trigger; open ground 96-160 units from it, from which walking
+        # straight at it gets there
+        w.blockers = [(tuple(lo[k] - HALF[k] for k in range(3)), tuple(hi[k] + HALF[k] for k in range(3)))]
+        comp = w.flood([pos0])
+        best = None
+        for p in sorted(comp, key=lambda p: abs(math.hypot(p[0] - mid[0], p[1] - mid[1]) - 128)):
+            if not 96 <= math.hypot(p[0] - mid[0], p[1] - mid[1]) <= 160:
+                continue
+            if straight_walk(h, p, mid, lambda q: touches_box(q, lo, hi))[0]:
+                best = p
+                break
+        if best is None:
+            print(f"to {target}: no open ground to walk into the trigger from")
+            continue
+        yaw = math.degrees(math.atan2(mid[1] - best[1], mid[0] - best[0]))
+        at = (best[0], best[1], best[2] - 36, round(yaw))
+        print(f"to {target} ({lm}): walking in from {tuple(round(c) for c in best[:2])}, facing {round(yaw)}")
+        pngs, log = game.playtest_transition(bsp, at, target, d, prefix=f"link_{target}_")
+        (d / f"link_{target}.log").write_text(log, encoding="utf-8")
+        after = log[log.find("HLMAP_PLAY_START"):] if "HLMAP_PLAY_START" in log else ""
+        changed = next((line.strip() for line in after.splitlines() if line.startswith("CHANGE LEVEL")), None)
+        arrived = f"HLMAP_ARRIVED {target}" in after
+        if changed:
+            print("  console:", changed)
+        for line in after.splitlines():      # (a first visit's "couldn't open" save lookups are normal)
+            if any(k in line.lower() for k in ("landmark", "transition", "overflow")):
+                print("  console:", line.strip())
+        print(f"  {'ok  ' if arrived else 'FAIL'} " + (f"arrived in {target}" if arrived else
+                                                      "the game started to change level but never arrived" if changed
+                                                      else "the game did NOT change level"))
+        for p in pngs:
+            print(f"  shot {p}")
+
+
+def _playtest_teleports(a, bsp, d):
+    """Walk onto every trigger_teleport in the real game (from open ground in front of
+    it, with --fire first, e.g. to power a network) and snapshot where it puts you."""
+    import math
+    from . import game
+    from .verify import (Hulls, Walker, _placed, solid_entities, straight_walk, teleports)
+    h = Hulls(bsp)
+    w = Walker(h, [_placed(h.models(), e) for e in h.entities if e.get("classname") == "func_ladder"],
+               solids=solid_entities(h))
+    tele = teleports(h)
+    if not tele:
+        sys.exit("no trigger_teleport in this map")
+    w.teleports = [(box, w.settle(land)) for _, box, land, _ in tele if land]     # all on, to get everywhere
+    start = next(e for e in h.entities if e.get("classname") == "info_player_start")
+    comp = w.flood([w.settle(tuple(float(c) for c in start["origin"].split()))])
+    if any(h.entities[i].get("master") for i, _, _, _ in tele) and not a.fire:
+        print("note: these teleporters have a master; pass --fire to switch them on first (e.g. --fire transit_start)")
+    for i, (lo, hi), land, target in tele:
+        mid = ((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2)
+        touching = lambda q, lo=lo, hi=hi: all(lo[k] <= q[k] <= hi[k] for k in range(3))
+        best = None
+        for p in sorted(comp, key=lambda p: abs(math.hypot(p[0] - mid[0], p[1] - mid[1]) - 96)):
+            if 72 <= math.hypot(p[0] - mid[0], p[1] - mid[1]) <= 160 and w.teleport_at(p) is None \
+                    and straight_walk(h, p, mid, touching)[0]:
+                best = p
+                break
+        if best is None:
+            print(f"teleporter to {target}: no open ground to walk onto it from")
+            continue
+        yaw = round(math.degrees(math.atan2(mid[1] - best[1], mid[0] - best[0])))
+        print(f"teleporter to {target}: walking on from {tuple(round(c) for c in best[:2])}, "
+              f"should land at {tuple(round(c) for c in land) if land else '?'}")
+        pngs, log = game.playtest(bsp, (best[0], best[1], best[2] - 36, yaw), ["+forward", 30, "-forward", 150], d,
+                                  fire=a.fire or (), prefix=f"teleport_{target}_")
+        (d / f"teleport_{target}.log").write_text(log, encoding="utf-8")
+        for p in pngs:
+            print(f"  shot {p}")
 
 
 def run_verify(m, bsp_path, coverage_check=True):
@@ -277,47 +400,119 @@ def run_verify(m, bsp_path, coverage_check=True):
                 print(f"    near {p['at']}  region {p['bounds'][0]}..{p['bounds'][1]}")
         else:
             print(f"verify ok   hull {hull} ({HULL_NAMES[hull]}): no invisible walls")
+    from . import campaign
+    exits = {(target, lm): b for target, lm, b in campaign.changelevels(h)}
     checkpoints = level.checkpoints() + [(name, [(p[0], p[1], p[2] + 37)])
                                          for name, p in getattr(m, "checkpoints", [])]
+    # every way out must be reachable (the middle of its floor)
+    checkpoints += [(f"way to {target}", [((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, lo[2] + 37)])
+                    for (target, _), (lo, hi) in exits.items()]
     light = FloorLight(h.bsp) if h.bsp.lumps["lighting"] else None
-    prog = progression(h, checkpoints, light=light)
-    for i, line in enumerate(prog.log, 1):
-        print(f"verify      progression {i}. {line}")
-    for wmsg in prog.warnings:
-        print(f"verify WARN logic: {wmsg}")
-    if prog.missing:
-        ok = False
-        print(f"verify FAIL walkability: {len(prog.missing)} places a player can't get to on foot "
-              f"(steps <= 18, jumps <= 45, ladders, locked doors):")
-        for name, pts in prog.missing[:10]:
-            print(f"    {name} near {tuple(round(c) for c in pts[0])}")
-        if prog.never:
-            print(f"    locks never opened: {', '.join(prog.never)}")
-    else:
-        print(f"verify ok   walkability: all {len(checkpoints)} checkpoints reachable on foot "
-              f"({len(prog.reached)} positions, {prog.states} states of play"
-              f"{', truncated' if prog.truncated else ''})")
-    if prog.softlocks:
-        ok = False
-        print(f"verify FAIL lockout: {len(prog.softlocks)} lines of play leave areas unreachable for good, e.g.:")
-        for path, lost in prog.softlocks[:3]:
-            print(f"    after: {' / '.join(path) or '(start)'}")
-            print(f"      lost: {', '.join(lost)}")
-    elif len(prog.log) > 0:
-        print(f"verify ok   lockout: no order of play locks the player out ({prog.states} states)")
-    if light is not None and prog.darkness:
-        worst = max(prog.darkness, key=lambda d: d[2])
-        dark = [d for d in prog.darkness if d[2] > DARK_LIMIT]
-        if dark:
+    # arriving from an earlier map of the campaign: start where the player lands, with
+    # the global states they can bring (one run per distinct state this map reads)
+    runs = [("", None, None)]
+    arrivals = campaign.entries(m.name)
+    if arrivals is None:
+        earlier = campaign.order()[:campaign.order().index(m.name)]
+        print(f"verify WARN campaign: {', '.join(earlier)} not verified yet, so how players arrive here is "
+              "unknown; checking from the player start with the map's own starting state")
+    elif arrivals:
+        read = {e["globalstate"] for e in h.entities if e.get("globalstate")}
+        seen = {}
+        for prev, lm, glob, pos in arrivals:
+            key = tuple(sorted((g, glob.get(g, 0)) for g in read))
+            seen.setdefault(key, (prev, lm, glob, pos))
+        runs = []
+        brought = {g for a in arrivals for g in a[2]}
+        for key, (prev, lm, glob, pos) in seen.items():
+            state = ", ".join(f"{g} {'on' if v == 1 else 'off'}" for g, v in key
+                              if g in brought and not g.endswith("_not"))
+            runs.append((f"from {prev}{': ' + state if state else ''}", glob, pos))
+        print(f"verify      campaign: players arrive from {', '.join(sorted({a[0] for a in arrivals}))} "
+              f"in {len(arrivals)} global state(s), {len(runs)} different for this map")
+        carried = set(campaign.carried(m.name))
+        mine = {e["globalstate"] for e in h.entities if e.get("classname") == "env_global" and e.get("globalstate")}
+        for g in sorted(read & brought - carried - {f"{c}_not" for c in carried}):
+            print(f"verify WARN campaign: this map reads global state {g!r}, which "
+                  f"{'both maps set' if g in mine else 'comes from the previous map'}, but no link "
+                  "carries it: its value on arrival wasn't explored (list it in the Link's carries, or rename "
+                  "it if the maps mean different things by it)")
+    reached, found, tele_report = set(), {}, []
+    for k, (label, glob, start) in enumerate(runs):
+        prog = progression(h, checkpoints, light=light, globals=glob, start=start, exits=exits,
+                           watch=campaign.carried(m.name))
+        reached |= prog.reached
+        for key, states in prog.exits.items():
+            have = found.setdefault(key, [])
+            have += [s for s in states if s[0] not in [x[0] for x in have]]
+        tag = f" [{label}]" if label else ""
+        if k == 0:
+            tele_report = prog.teleports
+            if label:
+                print(f"verify      arriving {label}:")
+            for i, line in enumerate(prog.log, 1):
+                print(f"verify      progression {i}. {line}")
+            for wmsg in prog.warnings:
+                print(f"verify WARN logic: {wmsg}")
+        if prog.missing:
             ok = False
-            print(f"verify FAIL darkness: the way forward crosses more than {DARK_LIMIT} units the player "
-                  f"can't see in (no flashlight without the HEV suit):")
-            for path, goal, cost in dark[:3]:
-                print(f"    after: {' / '.join(path) or '(start)'}")
-                print(f"      to {goal}: {cost} units in the dark")
+            print(f"verify FAIL walkability{tag}: {len(prog.missing)} places a player can't get to on foot "
+                  f"(steps <= 18, jumps <= 45, ladders, locked doors):")
+            for name, pts in prog.missing[:10]:
+                print(f"    {name} near {tuple(round(c) for c in pts[0])}")
+            if prog.never:
+                print(f"    locks never opened: {', '.join(prog.never)}")
         else:
-            print(f"verify ok   darkness: every way forward is lit (worst {worst[2]} units in the dark, "
-                  f"after {len(worst[0])} step{'s' if len(worst[0]) != 1 else ''}, to {worst[1].split(' -> ')[0]})")
+            print(f"verify ok   walkability{tag}: all {len(checkpoints)} checkpoints reachable on foot "
+                  f"({len(prog.reached)} positions, {prog.states} states of play"
+                  f"{', truncated' if prog.truncated else ''})")
+        if prog.softlocks:
+            ok = False
+            print(f"verify FAIL lockout{tag}: {len(prog.softlocks)} lines of play leave areas unreachable for good, "
+                  "e.g.:")
+            for path, lost in prog.softlocks[:3]:
+                print(f"    after: {' / '.join(path) or '(start)'}")
+                print(f"      lost: {', '.join(lost)}")
+        elif len(prog.log) > 0:
+            print(f"verify ok   lockout{tag}: no order of play locks the player out ({prog.states} states)")
+        if light is not None and prog.darkness:
+            worst = max(prog.darkness, key=lambda d: d[2])
+            dark = [d for d in prog.darkness if d[2] > DARK_LIMIT]
+            if dark:
+                ok = False
+                print(f"verify FAIL darkness{tag}: the way forward crosses more than {DARK_LIMIT} units the player "
+                      f"can't see in (no flashlight without the HEV suit):")
+                for path, goal, cost in dark[:3]:
+                    print(f"    after: {' / '.join(path) or '(start)'}")
+                    print(f"      to {goal}: {cost} units in the dark")
+            else:
+                print(f"verify ok   darkness{tag}: every way forward is lit (worst {worst[2]} units in the dark, "
+                      f"after {len(worst[0])} step{'s' if len(worst[0]) != 1 else ''}, "
+                      f"to {worst[1].split(' -> ')[0]})")
+    from .verify import teleport_landings
+    bad, n_tele = teleport_landings(h)
+    for name, problem in bad:
+        ok = False
+        print(f"verify FAIL teleport: {name} {problem}")
+    if n_tele and not bad:
+        print(f"verify ok   teleport: all {n_tele} teleporters put the player down standing, clear of the others")
+    for name, back, lost in tele_report:
+        if lost:
+            ok = False
+            print(f"verify FAIL teleport: {name} is one-way and strands the player: can't reach {', '.join(lost)}")
+        elif not back:
+            print(f"verify WARN teleport: {name} is one-way (no way back to where it was stepped on)")
+    if tele_report and all(back for _, back, _ in tele_report):
+        print(f"verify ok   teleport: every trip has a way back ({len(tele_report)} teleporters, all on)")
+    if exits:
+        campaign.save_exits(m.name, h, found, reached)
+        for (target, lm), states in found.items():
+            names = {g for glob, _, _ in states for g in glob if not g.endswith("_not")}
+            differ = sorted(g for g in names if len({s[0].get(g, 0) for s in states}) > 1)
+            print(f"verify ok   exit to {target} ({lm}): the player can leave in {len(states)} global state(s)"
+                  + (f", differing in {', '.join(differ)}" if differ else ""))
+    ok = _verify_links(m.name, h, reached) and ok
+    prog.reached = reached
     items = [e for e in h.entities if e.get("classname", "").startswith(("item_", "weapon_", "ammo_"))
              and e.get("origin")]
     for e in items:
@@ -365,6 +560,39 @@ def run_verify(m, bsp_path, coverage_check=True):
                 print(f"    {f['texture']} at {f['at']} facing {f['normal']}")
         else:
             print(f"verify ok   coverage: all {checked} visible faces present")
+    return ok
+
+
+def _verify_links(name, h, reached):
+    """Level changes out of `name` and into it from other compiled maps (see
+    campaign.check_transition). Returns True unless a transition is broken."""
+    from . import campaign
+    from .verify import Hulls
+    ok = True
+    out = {t for t, _, _ in campaign.changelevels(h)}
+    for other in sorted((out | set(campaign.order())) - {name}):
+        bsp = config.BUILD_DIR / other / f"{other}.bsp"
+        if not bsp.exists():
+            if other in out:
+                print(f"verify WARN campaign: {name} leads to {other}, which isn't built yet (not checked)")
+            continue
+        ho = Hulls(bsp)
+        pairs = [(h, ho, name, other, reached)] if other in out else []
+        if any(t == name for t, _, _ in campaign.changelevels(ho)):
+            touch = campaign.touched_from(other, name)
+            if touch is None:
+                print(f"verify WARN campaign: verify {other} to check its way into {name}")
+            else:
+                pairs.append((ho, h, other, name, touch))
+        for ha, hb, an, bn, r in pairs:
+            problems, warnings, notes = campaign.check_transition(ha, hb, an, bn, r)
+            for p in problems:
+                print(("verify FAIL transition: " if not p.startswith("    ") else "") + p)
+            for w in warnings:
+                print(f"verify WARN transition: {w}")
+            for n in notes:
+                print(f"verify ok   transition: {n}")
+            ok = ok and not problems
     return ok
 
 
@@ -424,7 +652,7 @@ def main(argv=None):
     su.set_defaults(fn=cmd_setup)
 
     b = sub.add_parser("build")
-    b.add_argument("map")
+    b.add_argument("map", nargs="+", help="one or more maps (several: built in campaign order)")
     b.add_argument("--profile", default="normal", choices=["fast", "normal", "final"])
     b.add_argument("--no-install", action="store_true")
     b.add_argument("--no-verify", action="store_true", help="skip collision/visibility checks")
@@ -466,6 +694,8 @@ def main(argv=None):
     pt = sub.add_parser("playtest", help="play the map in the real game from a scripted start")
     pt.add_argument("map")
     pt.add_argument("--pickups", action="store_true", help="walk straight at every item; check it's picked up")
+    pt.add_argument("--links", action="store_true", help="walk into every level change; check the next map loads")
+    pt.add_argument("--teleports", action="store_true", help="walk onto every teleporter; snapshot the landing")
     pt.add_argument("--at", help='"x y feet_z yaw" player start')
     pt.add_argument("--fire", action="append", help="targetname to trigger first (as for shots)")
     pt.add_argument("--do", action="append", help='a console command ("+forward") or frames to wait ("60"); '

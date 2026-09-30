@@ -12,8 +12,40 @@ brushes; the others are point entities with an `origin`.
   (clears the level-transition memory).
 - **info_player_start**: the single-player spawn. Origin = floor + 36. `angles "0 yaw 0"`.
 - **info_player_deathmatch**: the multiplayer spawn (same placement rules).
-- **info_landmark**: shared point for level transitions (`targetname`).
-- **trigger_changelevel** (brush): `map`, `landmark`.
+
+## Teleporters
+
+`hlmap.teleport` writes these; see CLAUDE.md "Teleporters".
+
+- **trigger_teleport** (brush): `target` = where to (usually an
+  info_teleport_destination), `master` (the only way to switch it; firing it does
+  nothing). `spawnflags` 1 = monsters too, 2 = not players. The player's feet land 1
+  unit over the target's origin, turned to its `angles`, with no speed.
+- **info_teleport_destination**: `targetname`, `angles`. Put it on the floor.
+- **env_sprite**: `model` (e.g. "sprites/exit1.spr"), `rendermode` 5 (additive),
+  `renderamt`, `rendercolor`, `scale`, `framerate`, `spawnflags` 1 = starts on. Fire
+  it to toggle.
+- **env_fade**: `duration`, `holdtime`, `renderamt`, `rendercolor`; `spawnflags` 1 =
+  fade from the colour (a flash), 2 = modulate, 4 = only the player who fired it.
+
+## Level transitions
+
+`hlmap.campaign.Link.place()` writes all three; see CLAUDE.md "Campaigns".
+
+- **info_landmark**: `targetname`. The same name must be in both maps, once each. The
+  player keeps their offset from it (translation only, no rotation), so the geometry
+  around it must match.
+- **trigger_changelevel** (brush): `map` (next map), `landmark`. Touching it changes
+  level (`spawnflags 2` = only when fired). Put the other map's trigger well away from
+  where the player lands, or they bounce straight back.
+- **trigger_transition** (brush): `targetname` = the landmark's name. Only entities
+  inside it travel with the player (without one, anything in the landmark's view that
+  can travel: monsters and items). The changelevel must be inside it, or the game
+  refuses to change level ("Player isn't in the transition volume").
+- What carries over: the player (health, suit, weapons), entities in the transition
+  volume, and every global state (`env_global`). An `env_global` with `spawnflags 1`
+  only sets its initial state if the state doesn't exist yet, so carried states win.
+  Returning to a map restores it as it was left.
 
 ## Lights
 
@@ -43,6 +75,7 @@ brushes; the others are point entities with an `origin`.
   (seconds before closing, -1 stays open), `lip` (how much stays visible), `movesnd`
   1-10, `stopsnd` 1-8, `targetname`, `spawnflags` (1 starts open, 32 toggle, 256 use
   only).
+  `locked_sound` 2 = access denied (played when its `master` says no).
 - **func_door_rotating**: needs an ORIGIN brush at the hinge. `distance` 90, `speed`,
   `wait`. `spawnflags`: 2 reverse, 16 one-way, 64 X-axis, 128 Y-axis, 256 use only.
   Without one-way, it opens away from the player.
