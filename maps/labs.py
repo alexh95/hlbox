@@ -364,7 +364,11 @@ def test(m, chamber, chamber_door, briefing, net):
     m.add(boxworth)
     # effects
     o = (cx, cy, 120)
-    m.add(props.sound_effect("test_alarm", (1300, 480, 120), "ambience/warn2.wav", volume=8, radius="large"),
+    # the alarm loops (its WAV has loop points) until the reveal turns it off
+    m.add(props.sound_effect("test_alarm", (1300, 480, 120), "ambience/warn2.wav", volume=8, radius="large",
+                             stoppable=True),
+          props.Entity("trigger_relay", targetname="test_alarm_off", target="test_alarm", triggerstate=0,
+                       origin=(1300, 480, 120)),
           props.sound_effect("test_hum", o, "ambience/particle_suck1.wav", volume=10, radius="large"),
           props.sound_effect("test_pop", o, "ambience/port_suckout1.wav", volume=10, radius="large"),
           props.point("env_shake", o, targetname="test_shake", amplitude=4, duration=2.5, frequency=30, radius=1200),
@@ -390,7 +394,8 @@ def test(m, chamber, chamber_door, briefing, net):
     # the reveal (after the test talk, or right away if it's skipped); the intercom's
     # reaction only if nobody skipped the test
     m.add(logic.sequence("test_after", [("test_flash", 0), ("test_pop", 0), ("boxworth", 0.2), ("test_sparks", 0.4),
-                                        ("chamber_door", 0.6), (net.start, 1.5), ("test_if_briefed", 2.5),
+                                        ("test_alarm_off", 0.4), ("chamber_door", 0.6), (net.start, 1.5),
+                                        ("test_if_briefed", 2.5),
                                         ("test_if_skipped", 2.5)], o),
           logic.when("test_if_briefed", endings["test_briefed"].start, [briefing.is_off, talk.skipped.is_off], o),
           logic.when("test_if_skipped", endings["test_skipped"].start, [briefing.is_on, talk.skipped.is_off], o))

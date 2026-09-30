@@ -578,6 +578,10 @@ def build():
   counts it as playing until then and plays it again after a save is loaded or the
   map is revisited. `props.sound_effect(..., stoppable=True)` makes the stoppable
   kind; turn it off when done.
+- Some stock WAVs loop by themselves (loop points in the file: `ambience/warn2.wav`,
+  the labs alarm). Played "once" they repeat for ever and can't be stopped, and a
+  large radius carries them through the map. `build` flags this; make them
+  `stoppable=True` and turn them off (a trigger_relay with triggerstate 0).
 - Collision is only trusted after `verify` passes. If you change a geometry
   generator, run `python tests/test_verify.py` and add a verify-based test for it.
 - A func_door_rotating needs an ORIGIN brush at the hinge (props.door_rotating adds one).

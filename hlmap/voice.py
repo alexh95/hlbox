@@ -132,3 +132,20 @@ def check_wav(path):
             return probs
     except (wave.Error, EOFError) as e:
         return [f"not a PCM WAV ({e})"]
+
+
+def loops(path):
+    """Does a WAV loop (a 'cue ' chunk)? The game repeats such a sound until it's
+    turned off."""
+    import struct
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return False
+    i = 12
+    while i + 8 <= len(data):
+        cid, size = struct.unpack_from("<4sI", data, i)
+        if cid == b"cue ":
+            return True
+        i += 8 + size + (size & 1)
+    return False

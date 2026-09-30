@@ -175,7 +175,14 @@ class Map:
         for e in self.find("infodecal"):
             if str(e.get("texture")) not in db:
                 problems.append(f"infodecal texture {e.get('texture')!r} is not in decals.wad")
-        from .voice import check_wav
+        from . import config
+        from .voice import check_wav, loops
+        for e in self.find("ambient_generic"):     # a looping WAV played "once" can never be stopped
+            wav = str(e.get("message") or "")
+            src = self.custom_sounds.get(wav) or config.GAME_DIR / "sound" / wav
+            if wav.endswith(".wav") and int(e.get("spawnflags") or 0) & 32 and loops(src):
+                problems.append(f"sound {e.get('targetname') or wav}: {wav} loops, and played once it never stops; "
+                                "use props.sound_effect(..., stoppable=True) and turn it off")
         for n, src in self.custom_sounds.items():
             if len(n) > 60:
                 problems.append(f"sound name {n!r} is longer than 60 characters")

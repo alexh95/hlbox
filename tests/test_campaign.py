@@ -183,6 +183,17 @@ def test_the_red_button():
         assert w.door_passable(_index(w, "func_door", targetname="chamber_door"))
 
 
+def test_the_alarm_stops_when_boxworth_appears():
+    for skip in (False, True):
+        w = _labs(_office(briefing=True))
+        alarm = _index(w, "ambient_generic", targetname="test_alarm")
+        w.press(_index(w, "func_button", target="lab_test"), until=2 if skip else None)
+        if skip:
+            w.press(_index(w, "func_button", target="intercom_skip"))
+        uses = [u for i, c, u in w.effects if i == alarm]
+        assert uses == ["toggle", "off"], uses                  # on with the first line, off at the reveal
+
+
 def test_the_test_brings_the_transit_network_online():
     w = _labs(_office(briefing=True))
     pads = [i for i, e in enumerate(w.ents) if e.get("classname") == "trigger_teleport"]

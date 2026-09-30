@@ -180,6 +180,17 @@ def _said_after(w, n):
     return [w.ents[i]["targetname"] for i, c, u in w.effects[n:] if c == "ambient_generic" and u == "toggle"]
 
 
+def test_a_looping_sound_played_once_is_caught():
+    """warn2.wav has loop points: played once (not stoppable) it would never stop."""
+    from hlmap import Map
+    m = Map("vsound")
+    m.add(props.sound_effect("alarm", (0, 0, 0), "ambience/warn2.wav"))
+    assert any("loops" in p for p in m.check())
+    m = Map("vsound2")
+    m.add(props.sound_effect("alarm", (0, 0, 0), "ambience/warn2.wav", stoppable=True))
+    assert not any("loops" in p for p in m.check())
+
+
 def test_talk_checks_gestures_against_the_model():
     from hlmap import Map, scene
     talk = scene.Talk(Map("vtalk2"), "t", head=(0, 0, 64), actor="sci", actor_model="models/scientist.mdl")
