@@ -96,6 +96,59 @@ def test_landing_in_a_wall_is_caught():
     assert any("inside a wall" in p for p in problems), problems
 
 
+def _pad_pair(facing_b="south", one_way=False, strip_back=False):
+    """Maps pa and pb, each a room with a pad; the pads are joined by a PadLink. The
+    pad in pa faces north; pb's should face the other way. one_way: only pa's pad
+    leaves (pb's is an arrivals pad); strip_back: pb loses its changelevel back."""
+    from hlmap import teleport
+    from hlmap.campaign import PadLink
+    link = PadLink("hop", ("pa", "pb"), network="t", one_way_from="pa" if one_way else None)
+    out = {}
+    for name, (pos, facing) in (("pa", ((256, 160, 0), "north")), ("pb", ((256, 352, 0), facing_b))):
+        m = Map(name)
+        lvl = Level(wall=16)
+        lvl.room("room", (0, 0, 0), (512, 512, 160), ZONE)
+        lvl.build(m)
+        net = teleport.Network("t")
+        net.pad(f"{name}_pad", pos, facing, site=name.upper(), label="THE OTHER MAP", link=link)
+        ents = net.entities(m)
+        if strip_back and name == "pb":
+            ents = [e for e in ents if e.classname != "trigger_changelevel"]
+        m.add(ents, props.player_start((256, 420 if name == "pa" else 100, 0)),
+              props.light((256, 256, 120)))
+        path = Path(tempfile.mkdtemp()) / f"{name}.map"
+        res = compile_map(m.write(path), profile="fast", steps=("csg", "bsp"))
+        assert res.ok, res.summary()
+        out[name] = Hulls(res.bsp)
+    w = Walker(out["pa"])
+    start = next(e for e in out["pa"].entities if e.get("classname") == "info_player_start")
+    reached = w.flood([w.settle(tuple(float(c) for c in start["origin"].split()))])
+    return out["pa"], out["pb"], reached
+
+
+def test_pads_into_another_map_land_the_player_clear():
+    ha, hb, reached = _pad_pair()
+    problems, _, notes = check_transition(ha, hb, "pa", "pb", reached)
+    assert problems == [], problems
+    assert any("teleporter pad" in n for n in notes) and any("stand clear" in n for n in notes), notes
+
+
+def test_pads_facing_the_same_way_would_bounce_the_player_back():
+    ha, hb, reached = _pad_pair(facing_b="north")
+    problems, _, _ = check_transition(ha, hb, "pa", "pb", reached)
+    assert any("touching a changelevel" in p for p in problems), problems
+
+
+def test_a_one_way_pad_lands_the_player_and_needs_its_link_back():
+    ha, hb, reached = _pad_pair(one_way=True)                 # pb's pad only receives
+    problems, _, _ = check_transition(ha, hb, "pa", "pb", reached)
+    assert problems == [], problems
+    assert not campaign.changelevels(hb)                       # no way out of pb (its link back is inert)
+    ha, hb, reached = _pad_pair(one_way=True, strip_back=True)
+    problems, _, _ = check_transition(ha, hb, "pa", "pb", reached)
+    assert any("no trigger_changelevel back" in p for p in problems), problems   # they'd land in the void
+
+
 def test_link_rejects_origins_that_misalign_textures():
     try:
         Link("x", ("a", "b"), zone=((-64, -64, 0), (64, 64, 64)), origins={"a": (0, 0, 0), "b": (100, 0, 0)},
@@ -197,9 +250,15 @@ def test_the_alarm_stops_when_boxworth_appears():
 def test_the_test_brings_the_transit_network_online():
     w = _labs(_office(briefing=True))
     pads = [i for i, e in enumerate(w.ents) if e.get("classname") == "trigger_teleport"]
-    assert len(pads) == 4 and not any(w.teleport_enabled(i) for i in pads)
+    assert len(pads) == 2 and not any(w.teleport_enabled(i) for i in pads)       # the chamber <-> the hub
+    away = {e["landmark"]: e["hlmap_master"] for e in w.ents                     # pads into other maps
+            if e.get("classname") == "trigger_changelevel" and e.get("hlmap_style") == "portal"
+            and not e.get("hlmap_arrivals")}
+    assert sorted(away) == ["pad_office", "pad_xen"], away                       # (the field lab's is arrivals only)
+    assert not any(w.master_ok(m) for m in away.values())
     w.press(_index(w, "func_button", target="lab_test"))
     assert all(w.teleport_enabled(i) for i in pads)
+    assert w.master_ok(away["pad_office"]) and w.master_ok(away["pad_xen"])
     discs = [i for i, e in enumerate(w.ents) if e.get("targetname", "").endswith("_disc")]
     assert discs and all(w.frame[i] == 0 for i in discs)         # lit
     w.fire("transit_start")                                     # starting it again does nothing
@@ -231,6 +290,93 @@ def test_the_chamber_opens_without_waiting_for_the_intercom():
         if len(_said(w)) > lines:
             lines, last_line_at = len(_said(w)), t
     assert lines == 7 and opened_at < last_line_at - 5, (opened_at, last_line_at)
+
+
+def _xen(globals_=None, inventory=()):
+    return World(_map_ents("xen"), globals_, inventory).start()
+
+
+def _airlock(w):
+    """The airlock's inner and outer doors (touch doors: open while their master is)."""
+    return (_index(w, "func_door", master="airlock_in_is_on"), _index(w, "func_door", master="airlock_out_is_on"))
+
+
+def test_the_airlock_wants_the_field_kit():
+    w = _xen()
+    inner, outer = _airlock(w)
+    cycle = _index(w, "func_button", target="airlock_try")
+    assert w.door_passable(inner) and not w.door_passable(outer)
+    w.press(cycle)
+    assert not w.door_passable(outer)                                   # no kit: denied
+    assert any(w.ents[i].get("targetname") == "airlock_denied" for i, _, _ in w.effects)
+    w.pickup(_index(w, "item_longjump"))
+    assert "item_longjump" not in w.inventory                          # the module goes on the suit
+    w.pickup(_index(w, "item_suit"))
+    w.pickup(_index(w, "item_longjump"))
+    w.press(cycle)
+    assert not w.door_passable(outer)                                   # still no crowbar
+    w.pickup(_index(w, "weapon_crowbar"))
+    w.press(cycle)
+    assert w.door_passable(outer) and not w.door_passable(inner)        # never both open
+    w.press(cycle)                                                      # changed your mind: back in
+    assert w.door_passable(inner) and not w.door_passable(outer)
+
+
+def test_the_airlock_is_one_way():
+    w = _xen()
+    for item in ("item_suit", "item_longjump", "weapon_crowbar"):
+        w.pickup(_index(w, item))
+    inner, outer = _airlock(w)
+    cycle = _index(w, "func_button", target="airlock_try")
+    w.press(cycle)
+    w.touch(_index(w, "trigger_multiple", target="airlock_seal"))       # out on the shelf
+    assert not w.door_passable(outer) and not w.door_passable(inner)    # sealed behind you
+    # turned back in the doorway and got shut in: CYCLE lets them out (not back in)
+    w2 = w.copy()
+    w2.press(cycle)
+    assert w2.door_passable(outer) and not w2.door_passable(inner)
+    # back in the station later (from the hub): it opens to the station again
+    w.touch(_index(w, "trigger_multiple", target="station_enter"))
+    assert w.door_passable(inner) and not w.door_passable(outer)
+
+
+def test_the_field_lab_keeps_the_crowbar_and_the_station_gives_another():
+    w = _xen()
+    for item in ("item_suit", "item_longjump", "weapon_crowbar"):
+        w.pickup(_index(w, item))
+    inner, outer = _airlock(w)
+    w.press(_index(w, "func_button", target="airlock_try"))            # out to the islands
+    w.touch(_index(w, "trigger_multiple", target="airlock_seal"))
+    way_out = _index(w, "func_door", master="xen_crowbar_is_on")
+    lab_door = _index(w, "func_door", targetname="decon_inner")
+    assert w.door_passable(way_out) and not w.door_passable(lab_door)
+    w.touch(_index(w, "trigger_multiple", target="decon"))
+    assert w.inventory == {"item_suit", "item_longjump"}, w.inventory     # no stock entity takes these
+    assert w.door_passable(lab_door) and not w.door_passable(way_out)    # no way back out
+    pad = _index(w, "trigger_changelevel", landmark="pad_xen_lab")
+    assert not w.master_ok(w.ents[pad]["hlmap_master"])
+    w.pickup(_index(w, "item_security"))                                # the clearance card
+    assert w.master_ok(w.ents[pad]["hlmap_master"])
+    assert w.frame[_index(w, "func_wall", targetname="lab_pad_disc")] == 0          # lit
+    assert w.globals["xen_clearance"] == 1 and w.globals["gear_confiscated"] == 1
+    # back by the hub's pad to the station, the map as it was left
+    w.start()
+    w.touch(_index(w, "trigger_multiple", target="station_enter"))
+    assert "weapon_crowbar" in w.inventory and w.globals["gear_confiscated"] == 0
+    assert w.door_passable(way_out)                                      # it takes it again at the end
+    assert w.door_passable(inner) and not w.door_passable(outer)         # the airlock is open to you again
+    w.touch(_index(w, "trigger_multiple", target="station_enter"))
+    assert [c for _, c, _ in w.effects].count("game_player_equip") == 1     # only when it was taken
+
+
+def test_the_field_lab_pad_is_one_way():
+    labs = _labs()
+    back = [e for e in labs.ents if e.get("classname") == "trigger_changelevel" and e.get("landmark") == "pad_xen_lab"]
+    # the engine needs a changelevel back to bring the player across; nothing can fire it
+    assert len(back) == 1 and back[0].get("spawnflags") == "2" and not back[0].get("targetname"), back
+    assert back[0].get("hlmap_arrivals")                                 # not a way out, for verify
+    assert len([e for e in labs.ents if e.get("classname") == "info_landmark"
+                and e.get("targetname") == "pad_xen_lab"]) == 1          # the field lab's pad lands you there
 
 
 if __name__ == "__main__":

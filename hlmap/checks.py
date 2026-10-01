@@ -57,7 +57,9 @@ def use_reach(m, level):
 def doorway_clearance(m, level, depth=64):
     """Doorways need open floor in front of them on both sides: no stair hole, railing,
     crate or other furniture within `depth` units of the opening (a player must be able
-    to walk straight up to a door, not around obstacles)."""
+    to walk straight up to a door, not around obstacles). Windows (a sill) aren't walked
+    through; solid beside the opening that reaches its wall (rock around a passage, a
+    thicker jamb) only makes the doorway deeper."""
     problems = []
     blockers = []
     for r in level.extra_air:
@@ -74,6 +76,8 @@ def doorway_clearance(m, level, depth=64):
         a = op.axis
         o = 1 - a
         (lo, hi) = op.mins, op.maxs
+        if lo[2] > max(op.a.floor, op.b.floor) + 18:
+            continue                      # a window
         for sign, room in ((-1, op.a), (+1, op.b)) if op.direction[a] > 0 else ((+1, op.a), (-1, op.b)):
             face = lo[a] if sign < 0 else hi[a]
             zmin, zmax = [0, 0, lo[2]], [0, 0, lo[2] + 72]
@@ -82,6 +86,8 @@ def doorway_clearance(m, level, depth=64):
             for name, blo, bhi in blockers:
                 if bhi[2] <= lo[2] + 18 and not name.startswith("stair hole"):
                     continue              # a step up (sidewalk, low slab), not in the way
+                if (bhi[o] <= lo[o] or blo[o] >= hi[o]) and blo[a] <= face + sign <= bhi[a]:
+                    continue              # beside the opening, from its wall out: a jamb
                 if all(blo[k] < zmax[k] and zmin[k] < bhi[k] for k in range(3)) and blo[2] < lo[2] + 8:
                     problems.append(f"{name} blocks the way to doorway {op.room.name} "
                                     f"(within {depth} units on the {room.name} side)")

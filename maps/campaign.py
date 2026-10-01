@@ -1,6 +1,8 @@
 """The campaign: its maps in the order a player meets them, and where they join.
 
-    office  --(road tunnel)-->  labs
+    office  --(road tunnel)-->  labs  --(transit pad)-->  xen
+       ^                          |  ^                     |
+       +--(pad in the basement)---+  +--(one way: the field lab's pad, after the course)
 
 Each map is its own script. The stretch of road tunnel where the level changes is
 built here, once, so both maps have exactly the same copy of it (verify compares
@@ -22,10 +24,10 @@ T3 beyond the stub, labs no T1) is in view when the level changes, and each land
 player well away from the other map's trigger.
 """
 from hlmap import Material, box, props
-from hlmap.campaign import Link
+from hlmap.campaign import Link, PadLink
 from hlmap.mapfile import Entity, prepare_texture
 
-MAPS = ["office", "labs"]
+MAPS = ["office", "labs", "xen"]
 
 TUNNEL_HEIGHT = 192
 TUNNEL = Material(floor="OUT_PAVE1", wall="TNNL_W12", ceiling="TNNL_C1")
@@ -85,3 +87,14 @@ LINK = Link("tunnel", ("office", "labs"),
             build=tunnel_zone,
             carries=["sector_pass",       # the pass from records opens the lab door
                      "brief_pending"])    # the guard and the lab's intercom know if you skipped the briefing
+
+
+# teleporter pads that change level (hlmap.teleport: net.pad(..., link=...)); in each
+# pair the two pads face opposite ways
+OFFICE_PAD = PadLink("pad_office", ("office", "labs"),
+                     carries=["transit_online"])     # the network, switched on in labs, powers the basement pad
+XEN_GATE = PadLink("pad_xen", ("labs", "xen"),       # the hub <-> the Xen field station
+                   carries=["gear_confiscated"])     # the field lab took the crowbar: the station gives one back
+XEN_RETURN = PadLink("pad_xen_lab", ("labs", "xen"),  # the Xen field lab (the course's end) -> the hub
+                     one_way_from="xen",             # the hub's end only receives: no way back to the lab
+                     carries=["xen_clearance"])      # the field lab's keycard (what it opens comes later)

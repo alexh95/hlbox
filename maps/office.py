@@ -35,16 +35,19 @@ The way on: up on the records mezzanine lies a sector pass. Its card reader open
 gate in the road tunnel past the car park, and the tunnel leads to the next map
 (maps/labs.py; the stretch where the level changes is built by maps/campaign.py). The
 pass is a global state, so it still counts over there.
+
+A transit pad stands dark in the basement. Once the lab's resonance test has switched
+the transit network on, it lights up and goes to the transit hub in labs.
 """
 import math
 
-from hlmap import Level, Map, Material, box, logic, props, scene, voice
+from hlmap import Level, Map, Material, box, logic, props, scene, teleport, voice
 from PIL import Image, ImageDraw
 
 from hlmap.art import DECK, boxworth, bullets, deck_slide, font, plate, slide, waveform
 from hlmap.cave import ROCK
 from hlmap.geometry import cylinder
-from maps.campaign import LAMP_TEX, LINK, SODIUM, TUNNEL
+from maps.campaign import LAMP_TEX, LINK, OFFICE_PAD, SODIUM, TUNNEL
 
 CONFERENCE = Material(floor="FIFTIES_FLR02C", wall="FIFTIES_WALL14U", ceiling="FIFTIES_CEIL01",
                       ceiling_align="center")
@@ -517,6 +520,11 @@ def build():
     records_room(m, records, grid, sector_pass)
     tunnel_gate(m, sector_pass)
     basement_rooms(m, basement, grid)
+    # the transit network's pad (hlmap.teleport): dark until the labs' test switches the
+    # network on (a global state, carried here), then it goes to the transit hub
+    net = teleport.Network("transit", online=False)
+    net.pad("basement_pad", (130, 40, -176), "north", site="OFFICE BASEMENT", label="TRANSIT HUB", link=OFFICE_PAD)
+    m.add(net.entities(m))
     cave_contents(m, cave, grid)
     grid.emergency("emergency")
     m.add(props.hud_message("power_fail_msg", grid.origin, "WARNING: MAIN POWER FAILURE", color=(255, 60, 40),
@@ -571,6 +579,8 @@ def build():
         "cave_power_out": cave.camera(0.1, look_ahead=0.45, branch=1) + (["records_card"],),
         "breaker": (190, 64, -112, 10, 180, ["records_card"]),
         "breaker_power_on": (190, 64, -112, 10, 180),
+        "basement_pad": (250, 300, -110, 16, 245),
+        "basement_pad_on": (250, 300, -110, 16, 245, ["transit_online_on", ("transit_sync", 0.8)]),
         # switched off before the failure: stays off after the reset; the projector returns
         "power_restored": (420, 20, 72, 6, 125, ["conference_lights_switch", "records_card",
                                                   ("power_restore", 2.2)]),
@@ -988,8 +998,8 @@ def basement_rooms(m, b, grid):
           props.pipe((-330, -24, z1 - 10), (440, -24, z1 - 10), size=6, texture="GENERIC030"))
     for x, y, tex in [(200, 320, "BARREL2"), (236, 326, "BARREL3"), (218, 290, "BARREL4")]:
         m.add(props.barrel(x, y, z0, texture=tex))
-    m.add(props.table(220, 40, z0, width=112, depth=40, top="FIFTIES_DSK5B", legs="FIFTIES_DSK5B"))
-    m.add(props.radio(200, 48, z0 + 34, "south", texture="C1A1_GAD4", w=18, h=24))
+    m.add(props.table(260, 40, z0, width=112, depth=40, top="FIFTIES_DSK5B", legs="FIFTIES_DSK5B"))
+    m.add(props.radio(240, 48, z0 + 34, "south", texture="C1A1_GAD4", w=18, h=24))
     m.add(props.wall_art((x0, 180, z0 + 64), "east", "+0FUSEBOX", 24, 48))
     for x, y, s, t in [(40, 220, 48, "CRATE02"), (40, 172, 40, "CRATE19"), (300, 180, 48, "CRATE25")]:
         m.add(props.crate(x, y, z0, size=s, texture=t))

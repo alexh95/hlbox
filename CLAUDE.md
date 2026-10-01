@@ -25,7 +25,7 @@ screenshots. There is no GUI editor in the loop.
 ```
 python -m hlmap setup                  # once per checkout: fetch the compilers
 python -m hlmap build <map>            # script -> .map -> compile (normal) -> install -> build/<map>/plan.png
-python -m hlmap build office labs      # several maps, in campaign order (each verified with how you arrive)
+python -m hlmap build office labs xen  # several maps, in campaign order (each verified with how you arrive)
 python -m hlmap build <map> --shots    # ...and take in-engine screenshots of CAMERAS
 python -m hlmap build <map> --profile fast|final
 python -m hlmap preview <map> [--view top|x|y] [--cut N]   # cutaway PNG only, no compile
@@ -37,15 +37,17 @@ python -m hlmap verify <map>           # collision/visibility checks (build runs
 python -m hlmap playtest <map> --pickups   # in the real game: walk straight at every item, is it picked up?
 python -m hlmap playtest <map> --at "x y feet_z yaw" [--fire NAME] --script "+forward; 60; -forward; 100"
                                        # scripted play from a start; prints what fired, saves a snapshot
+                                       # (a frame = 10 ms of game time; `give item_suit` etc. work)
 python -m hlmap playtest <map> --links # walk into every level change: does the next map load? (snapshot)
 python -m hlmap playtest <map> --teleports [--fire transit_start]   # step onto every teleporter (snapshot)
 python -m hlmap info <map>             # BSP stats + entity lump
 python tests/test_verify.py            # the verifier must catch holes, invisible walls, missing faces,
-                                       # lockouts and dark routes
+                                       # lockouts and dark routes; jumps, long jumps, low gravity, pits
 python tests/test_logic.py             # logic helpers behave as intended (simulated, no compile)
 python tests/test_office.py            # the office's story: briefing, power cut, welcome back (simulated)
 python tests/test_campaign.py          # level transitions must match up; what office hands to labs;
-                                       # the lab's skippable intercom and early chamber door
+                                       # the lab's skippable intercom and early chamber door; the Xen
+                                       # airlock's kit check, the crowbar taken and given back
 ```
 
 The verification loop after every change:
@@ -60,7 +62,20 @@ The verification loop after every change:
      stretch and `m.checkpoints` entry must be reachable ON FOOT: steps of at most 18,
      jumps of at most 45, falls under 600, ladders, and active teleporters. Solid brush
      entities (func_wall glass, buttons, func_breakable) block the way, tested against
-     their own compiled collision hulls; func_wall_toggle and func_illusionary don't.
+     their own compiled collision hulls; func_wall_toggle and func_illusionary don't
+     (nor do solid point entities such as xen_tree: keep them out of narrow ways).
+     - **Jumps.** In a map with a long jump module or gravity zones, jumps off edges
+       are flown as arcs in 8 directions: running jumps (credited 280 forward; the
+       game allows 320) where there's room for a run-up, and long jumps (510 of the
+       game's 560) while the player has the module. A trigger_gravity zone scales
+       jumps and safe falls (in 0.6 a standing jump rises 75; the verifier's running
+       jump clears about 340 units edge to edge, its long jump about 670). A
+       trigger_hurt of 100+ damage (a void) is death: nothing lands in it. So a gap
+       only the long jump clears is really checked, both ways.
+     - **Gear** is part of the state of play: the HEV suit, the long jump module
+       (only taken with the suit) and weapons are picked up like keys.
+       player_weaponstrip takes weapons and ammo (not the suit or the module),
+       game_player_equip gives what it names.
      - Every progress-relevant pickup, button and trigger volume is tried in every
        order. Its effects are simulated through the entity logic (`hlmap/sim.py`:
        relays, multi_managers, locks, global state, gates, lights). Doors block while
@@ -68,6 +83,10 @@ The verification loop after every change:
      - "locks never opened" plus unreachable rooms means a key behind its own door.
    - **Lockout:** no order of play may leave an area unreachable for good. For
      example, a one-shot breaker used before the power fails.
+   - **Hostiles:** a monster from `verify.HOSTILE` (headcrabs, zombies, ...), or a
+     monstermaker making one, that the player can get within 256 units of without a
+     weapon fails. Hand out the crowbar first, and gate the way on it (the Xen
+     airlock won't cycle without it).
    - **Teleporters:** each lands the player standing, clear of solid, not in mid-air,
      not on another teleporter (that would bounce them on) and not in a level change.
      With them all on, every trip must have a way back to where it was stepped on. A
@@ -88,11 +107,20 @@ The verification loop after every change:
    - **Coverage:** every visible face exists in the BSP.
    - **Campaign:** every level change is reachable (a "way to <map>" checkpoint).
      The global states the player can leave with go to `build/<map>/exits.json`, and
-     the next map is verified from where they land, once per state it reads. When
-     both maps are compiled, each transition is checked both ways: the landmark,
-     the transition volume, every landing spot (standing, not in a wall or the air,
-     not touching a trigger back), the shared stretch surface by surface (plane,
-     texture, alignment), and the light where the player lands.
+     the next map is verified from where they land, once per state it reads (and
+     gear they carry). When both maps are compiled, each transition is checked both
+     ways: the landmark, the transition volume, every landing spot (standing, not
+     in a wall or the air, not touching a trigger back), the shared stretch surface
+     by surface (plane, texture, alignment), and the light where the player lands.
+     Coming back from a later map, the player must be able to leave again (not
+     stranded).
+   - **Round trips** (`m.verify_round_trips = True`, for a map the player can
+     come back to and play again, like the Xen course): for every state the
+     player can leave in, by every way the other map offers back (its pad's power
+     read with the states they left with), the map is played again from as it was
+     left. Back the way first arrivals come in, every checkpoint must be reachable
+     again; any other way, the player must be able to leave again. Leaving by such
+     a map's ways out isn't a lockout, even with areas closed behind the player.
    A clean compile does NOT mean clean collision. The compiler's "ambiguous leafnode"
    warnings once hid walk-through cave walls, and only `verify` (or a playtest) shows
    them.
@@ -235,11 +263,26 @@ def build():
     fires=[pass_flag.on])`, then `props.card_reader(pos, facing, "lab_door",
     pass_flag, "lab_reader")` beside a door with `targetname="lab_door"`. The reader
     beeps and fires it while the flag is on, and says `denied` otherwise.
-  - Build the maps together (`build office labs`) or earlier ones first: a later
-    map's verify needs the earlier map's `exits.json`. Install both, or the level
-    change fails in the game. `playtest <map> --links` tries each change for real.
-  - Returning to a map isn't simulated (the game restores it as it was left); only
-    the landing is checked.
+  - Build the maps together (`build office labs xen`) or earlier ones first: a later
+    map's verify needs the earlier map's `exits.json`. Built together, a map's
+    transitions into the maps built after it are checked when those are (both
+    ways), and coming back from them at the end. Install them all, or the level
+    change fails in the game. `playtest <map> --links` tries each change for real
+    (`--fire` a pad's power first: `--fire transit_start`).
+  - Returning to a map: the game restores it as it was left. Verify checks the
+    player isn't stranded there; with `m.verify_round_trips` it plays the map again
+    from as it was left (see Round trips above).
+  - **Pads into other maps** are `PadLink`s: `PadLink("pad_xen", ("labs", "xen"),
+    carries=[...])`, then in each map `net.pad(..., link=XEN_GATE)`. The two pads
+    face opposite ways (arrivals keep their facing). Items and monsters within the
+    pad's transition box (48 past the pad) travel with the player: keep them off it.
+    A way out that doesn't lead back: `PadLink(..., one_way_from="xen")`. That map's
+    pad leaves; the other map's `net.pad(..., link=)` becomes an arrivals pad (dark,
+    signed ARRIVALS), and the network board draws the trip as an arrow. The arrivals
+    pad keeps a changelevel back that nothing can fire (use only, unnamed): without
+    one the engine doesn't bring the player across, and they arrive at their old
+    coordinates, in the void (found by `playtest --links`; verify now checks every
+    level change has its link back).
 - **Teleporters (`hlmap.teleport`).**
   ```python
   net = teleport.Network("transit", online=False)       # dark until net.start is fired
@@ -261,9 +304,12 @@ def build():
     the player lands.
   - Offline pads (`offline=True`, no route) are slots for places still to come: they
     look the part, say "OFFLINE", and show as dashed lines on `net.diagram()`. Giving
-    one a route lights it with the rest. A place in another map would be a campaign
-    Link whose zone has two pads (each map's trigger on the pad the other map lands
-    on), so arrivals never stand on a live trigger.
+    one a route or a link lights it with the rest.
+  - `link=` a campaign `PadLink`: the pad changes level to the other map's pad of the
+    same link (a use-only trigger_changelevel fired after the flash). `power=` a
+    Flag of the pad's own (a clearance card): dark and dead until it's on. Each map
+    lights its pads the first time it finds their power on (at load or on coming
+    back); after turning a power on during play, fire `net.sync` too.
 - **Stairs between floors.** `steps, hole = lvl.stairs(name, lower, upper, top=(x, y),
   down="north")` makes a staircase from `upper`'s floor down into `lower`, which must
   sit directly below (`wall` units of slab).
@@ -461,9 +507,28 @@ def build():
   Put stairwells at the far end of a room, not by its door.
 - **Xen.** Available entities: `xen_plantlight` (retracts near the player and turns
   off its `target` light; see props.xen_plantlight), `xen_hair`, `xen_spore_small`,
-  `xen_spore_medium`, `xen_spore_large` and `xen_tree` (it attacks). Crystals:
-  `props.crystal(...)` with `CRYS_2A` plus `m.texlight("CRYS_2A", ...)` to glow.
-  `ambient_generic` with `message="ambience/aliencave1.wav"` gives a looping cave sound.
+  `xen_spore_medium`, `xen_spore_large` and `xen_tree` (it attacks; spores and
+  trees are solid boxes). Crystals: `props.crystal(...)` with `CRYS_2A` plus
+  `m.texlight("CRYS_2A", ...)` to glow. `props.ambient_loop(pos,
+  "ambience/aliencave1.wav")` gives a looping cave sound (alienwind1, alien_zonerator
+  loop too).
+  - **Islands and cliffs** (maps/xen.py) go in a sky room (`checkpoints=[]`, with
+    `m.checkpoints` on each island): `props.floating_island((x, y), r, top)` (a
+    flat top, a lumpy underside; its edge wanders 0.9-1.05 r),
+    `props.rock_wall(axis, back, front, u_cuts, z_cuts, hole=)` (a rough face over a
+    sky wall, with a clean passage through for a doorway), `props.rock_shelf(...)`
+    (a ledge, the landing outside a door), `props.xen_rock` (out of reach, to look
+    at).
+  - **Low gravity and the void:** `props.gravity_zone(mins, maxs, 0.6)` over the
+    outside and one of 1.0 over the way back in (the player keeps the last zone's
+    gravity), `props.hurt_zone(mins, maxs, 1000)` under everything.
+  - **Hazards:** `props.hurt_zone(..., 10, damagetype=1048576)` over an acid pool (a
+    func_illusionary of `!TOXICGRN`), an `env_beam` with `damage` between two
+    info_targets, `props.monster_maker(pos, "monster_headcrab", live=2)` (more come
+    as they die).
+  - **Gear:** `props.point("item_suit", pos, spawnflags=1)` (short logon),
+    `props.pickup("item_longjump", ..., sound=None)`, `props.pickup("weapon_crowbar",
+    ...)`; fire Flags from them to gate an airlock on the kit.
 - **Default texture alignment** is world-aligned, so textures tile continuously across
   brushes. Room walls put the texture's bottom edge on the floor, so wainscots line up.
   `floor_align`/`ceiling_align` of `min` or `center` puts the tile grid on the room
@@ -474,6 +539,11 @@ def build():
 
 - **Player.** 32x32x72 standing, 36 crouched, eye at 64. Max step 18. Jumps 45 high
   (~56 with a crouch-jump). A falling player takes damage from about 300 units.
+- **Jumps across gaps** (edge to edge, level): a running jump about 245, a long
+  jump about 450 (560 forward; crouch and jump while running, with the module on
+  the suit). In 0.6 gravity: about 390 running, about 730 long. The verifier
+  credits less (220 and 410; 345 and 670 in 0.6). The Xen course's long-jump gaps
+  are 420-460 in 0.6 gravity: past any running jump, well inside a long jump.
 - **Doors.** At least 64 wide and 96-112 tall. Corridors are at least 64 wide (96-128
   is comfortable). Ceilings are 128+.
 - **Furniture.** Table top 32-36. Chair seat 18 (steppable). Stairs are 16 high by 16
@@ -573,6 +643,26 @@ def build():
 - A `trigger_teleport` can't be switched by firing it; use its `master`. The game
   sets the player's feet 1 unit over the destination's origin and turns them to its
   angles.
+- A monstermaker with a name and "start on" (spawnflags 1) never starts: HLSDK
+  schedules no first think for it. Leave the name off, or fire it (a trigger_auto
+  with triggerstate 1); `props.monster_maker` does that, and `build` flags the
+  broken kind. The Xen course's first headcrabs never came because of it.
+- A save remembers brush entities by model number (`*12`), so rebuilding a map breaks
+  saves made in it, and the transition saves of maps already visited: doors, pads
+  and walls come back with the wrong model or none. After installing a rebuilt map,
+  start from `map <name>` or the level change into it, not an older save.
+  (`playtest` checked: saving and loading on the same build keeps the pads as they
+  were, in the hub and in the Xen station.)
+- Items don't respawn in single player. `player_weaponstrip` removes weapons and
+  ammo, never the HEV suit or the long jump module (no stock entity takes those).
+  To give a weapon back, fire a `game_player_equip` (`spawnflags` 1, a key per
+  item, e.g. `weapon_crowbar 1`) from something the player set off (a trigger they
+  walk into): it equips the activator, so a trigger_auto can't.
+- `trigger_gravity` sets the player's gravity and it stays when they leave the
+  volume (and across a level change): put a 1.0 zone on the way back in.
+- An ambient_generic that starts on and loops (no `spawnflags` 16 or 32) plays a WAV
+  without loop points once as the map loads, and again on every load. `build`
+  flags it; `props.ambient_loop` is for WAVs that loop.
 - A "not looped" ambient_generic can't be stopped once it plays. A looped one with a
   WAV that has no loop points plays once and stops when turned off, but the game
   counts it as playing until then and plays it again after a save is loaded or the

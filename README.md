@@ -39,7 +39,7 @@ def build():
 ```
 python -m hlmap setup                 # download the SDHLT compilers (checksum-verified)
 python -m hlmap build office          # maps/office.py -> compile -> install -> build/office/plan.png
-python -m hlmap build office labs     # both maps of the campaign, in order
+python -m hlmap build office labs xen # the whole campaign, in order
 python -m hlmap build office --shots  # + in-engine screenshots from the map's CAMERAS
 python -m hlmap play office           # launch Half-Life into the map
 python -m hlmap tex FIFTIES --sheet   # search textures, render a contact sheet
@@ -68,9 +68,20 @@ playing it:
   to a second map: a loading bay with a guard, and a materials lab with a red button
   you're asked not to press.
 - `hlmap/teleport.py` builds teleporter networks: pads, routes, a power switch,
-  offline slots for places to come, and a board that maps it all. Pressing the red
-  button brings labs' network online; its hub has no doors, only pads and a window
-  onto Xen. `verify` walks through teleporters and checks each trip has a way back.
+  offline slots for places to come, pads into other maps, and a board that maps it
+  all. Pressing the red button brings labs' network online; its hub has no doors,
+  only pads (back to the office basement, and out to Xen) and a window onto Xen.
+  `verify` walks through teleporters and checks each trip has a way back.
+- The third map, `xen`, is a long jump course. A field station hands out the HEV
+  suit, the long jump module and a crowbar, and its airlock won't cycle without
+  them; it's one way, sealing behind you. Outside, in 60% gravity, floating islands and cliff ledges run over a void,
+  with two gaps only the long jump clears, headcrabs that keep coming, an acid pool
+  and an arc between two crystals. At the far end a decontamination airlock keeps
+  the crowbar and locks the way back; the field lab behind it has the card that
+  powers its pad home (one way, onto the hub's arrivals pad). Come back through the
+  station and you get a new crowbar and can run it again. `verify` flies every running jump and long jump in the low
+  gravity, treats the void as death, tracks the gear, fails if you could meet a
+  headcrab unarmed, and plays the course again after a round trip through the hub.
 - `hlmap/terrain.py` builds open terrain for outdoor areas under a sky: hills and
   lawns as watertight triangle columns (GoldSrc has no displacements). The office's
   cafeteria opens onto a patio and a staff car park with brush-built cars and painted
@@ -85,7 +96,9 @@ playing it:
     simulation of the entity logic. Can every area be reached? Can any order lock
     you out?
   - after every step, whether the way on is lit enough to see (from the compiled
-    lightmaps).
+    lightmaps);
+  - jumps, long jumps and gravity zones, gear, hostiles met unarmed, and coming
+    back to a map after leaving it.
   `build` won't install a map that fails.
 - `hlmap/scene.py` and `hlmap/voice.py` stage talks. In the office, a scientist
   presents a 12-slide briefing with voice lines synthesized at build time, subtitles

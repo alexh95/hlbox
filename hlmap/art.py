@@ -436,15 +436,15 @@ def transit_pad(state="on", color=(120, 200, 255), size=64):
 
 def network_diagram(sites, edges, size=(256, 192), title="NETWORK", color=(120, 200, 255)):
     """A wall board of a teleporter network: `sites` as nodes (the busiest in the
-    middle, the rest around it), `edges` [(a, b, active)] as lines, dashed when
-    offline."""
+    middle, the rest around it), `edges` [(a, b, active[, to])] as lines, dashed when
+    offline, with an arrowhead at `to` for a one-way trip."""
     import math as _m
     w, h = size
     img = Image.new("RGB", size, (16, 20, 30))
     d = ImageDraw.Draw(img)
     d.rectangle((0, 0, w - 1, 20), fill=(30, 38, 56))
     d.text((w // 2, 10), title, fill=(236, 236, 242), font=font(12), anchor="mm")
-    degree = {s: sum(1 for a, b, _ in edges if s in (a, b)) for s in sites}
+    degree = {s: sum(1 for a, b, *_ in edges if s in (a, b)) for s in sites}
     hub = max(sites, key=lambda s: degree[s]) if sites else None
     others = [s for s in sites if s != hub]
     cx, cy, rx, ry = w / 2, 20 + (h - 20) / 2, w * 0.30, (h - 20) * 0.30
@@ -452,17 +452,23 @@ def network_diagram(sites, edges, size=(256, 192), title="NETWORK", color=(120, 
     for k, s in enumerate(others):
         a = _m.radians(-90 + 360 * k / max(1, len(others)))
         pos[s] = (cx + rx * _m.cos(a), cy + ry * _m.sin(a))
-    for a, b, active in edges:
+    for a, b, active, *to in edges:
         (x0, y0), (x1, y1) = pos[a], pos[b]
         if active:
             d.line((x0, y0, x1, y1), fill=color, width=3)
+            if to:                                   # one way: an arrowhead short of `to`
+                (tx, ty), (sx, sy) = pos[to[0]], pos[b if to[0] == a else a]
+                ang = _m.atan2(ty - sy, tx - sx)
+                ax, ay = tx - 13 * _m.cos(ang), ty - 13 * _m.sin(ang)
+                d.polygon([(ax, ay), (ax - 9 * _m.cos(ang - 0.5), ay - 9 * _m.sin(ang - 0.5)),
+                           (ax - 9 * _m.cos(ang + 0.5), ay - 9 * _m.sin(ang + 0.5))], fill=color)
         else:
             n = max(1, int(_m.hypot(x1 - x0, y1 - y0) // 8))
             for k in range(0, n, 2):
                 t0, t1 = k / n, min(1, (k + 1) / n)
                 d.line((x0 + (x1 - x0) * t0, y0 + (y1 - y0) * t0, x0 + (x1 - x0) * t1, y0 + (y1 - y0) * t1),
                        fill=(110, 110, 120), width=2)
-    offline = {b for a, b, active in edges if not active}
+    offline = {b for a, b, active, *_ in edges if not active}
     for s, (x, y) in pos.items():
         r = 9 if s == hub else 6
         d.ellipse((x - r, y - r, x + r, y + r), fill=(110, 110, 120) if s in offline else color,

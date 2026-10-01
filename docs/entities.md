@@ -27,6 +27,9 @@ brushes; the others are point entities with an `origin`.
   it to toggle.
 - **env_fade**: `duration`, `holdtime`, `renderamt`, `rendercolor`; `spawnflags` 1 =
   fade from the colour (a flash), 2 = modulate, 4 = only the player who fired it.
+- Pads into other maps (`link=`) use a **trigger_changelevel** with `spawnflags` 2
+  (use only) and a `targetname`, fired by the pad's depart sequence; see Level
+  transitions.
 
 ## Level transitions
 
@@ -97,7 +100,13 @@ brushes; the others are point entities with an `origin`.
 - **func_rotating**: fan. ORIGIN brush, `speed`, `spawnflags` 1 = start on.
 - **trigger_once** / **trigger_multiple**: AAATRIGGER texture. `target`, `delay`,
   `wait` (for trigger_multiple).
-- **trigger_hurt**: `dmg`, `damagetype`.
+- **trigger_hurt**: `dmg` per second (dealt half each half second), `damagetype`
+  (1048576 acid, 256 shock, 8 burn, 32 fall), `spawnflags` 2 = starts off. Monsters
+  die in it too.
+- **trigger_gravity**: `gravity` (1 normal, 0.6 low). Sets the touching player's
+  gravity, which stays after they leave (and across a level change).
+- **func_recharge** / **func_healthcharger**: wall chargers for the HEV's armour and
+  health (`+0RECHARGE` has its `+A` empty frame).
 - **trigger_push**: `speed`, `angles`.
 - **trigger_teleport**: `target` = info_teleport_destination.
 
@@ -148,4 +157,20 @@ brushes; the others are point entities with an `origin`.
   **monster_headcrab**: `angles`, `body`, `skin`, `targetname`. Origin sits on the
   floor. Scientists and barneys follow the player when used.
 - **item_healthkit**, **item_battery**, **weapon_crowbar**, **weapon_9mmhandgun**,
-  **ammo_9mmclip**, **item_suit** (needed for a HUD and weapons).
+  **ammo_9mmclip**, **item_suit** (needed for a HUD and weapons; `spawnflags` 1 = the
+  short logon), **item_longjump** (only taken with the suit; crouch and jump while
+  running). Items and weapons fire their `target` when taken. They don't respawn.
+- **player_weaponstrip**: fired, takes the player's weapons and ammo (not the suit or
+  the long jump module).
+- **game_player_equip**: a key per item to give (`weapon_crowbar 1`), `spawnflags` 1 =
+  only when fired. It equips the activator: fire it from something the player set
+  off (a trigger they walk into), not a trigger_auto.
+- **monstermaker**: `monstertype` (e.g. monster_headcrab), `monstercount` (-1 = no
+  end), `m_imaxlivechildren` (how many at once), `delay` (seconds between),
+  `spawnflags` 1 = starts on (on anyway without a targetname). It can make items and
+  weapons too. Nothing appears while something stands under it.
+- **env_beam**: `LightningStart`, `LightningEnd` (named entities, e.g. info_target),
+  `texture` "sprites/laserbeam.spr", `BoltWidth`, `NoiseAmplitude`, `damage` per
+  second to whatever it crosses, `life` 0 = for ever, `spawnflags` 1 = starts on.
+- **xen_tree** (attacks the player close in front; a solid box), **xen_hair**
+  (decoration), **xen_plantlight**, **xen_spore_small/medium/large** (solid).

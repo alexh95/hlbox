@@ -23,19 +23,19 @@ the flash (no waiting for the intercom), and an intercom panel on the lab wall s
 whatever it is saying.
 
 The test also brings the resonance transit network online (hlmap.teleport): a pad in
-the chamber and one in the loading bay send you to the transit hub, a room with no
-doors, somewhere in Xen by the look out of its window. Its pads go back to both, and
-three more wait offline for sites still to come ("SITE 2" to "SITE 4").
+the chamber sends you to the transit hub, a room with no doors, somewhere in Xen by
+the look out of its window. Its pads lead back to the chamber, to the office basement
+(another map) and to the Xen field station (the xen map: the long jump course).
+Players who finish the course come back from its field lab onto an arrivals pad (a
+one-way link). Two more wait offline for sites still to come ("SITE 3", "SITE 4").
 
 The tunnel leads back to the office.
 """
-import math
-
 from hlmap import Level, Map, Material, box, logic, props, scene, teleport
 from hlmap.art import boxworth_faces, font, paint
-from hlmap.geometry import cylinder, hull
+from hlmap.geometry import cylinder
 from hlmap.mapfile import prepare_texture
-from maps.campaign import LAMP_TEX, LINK, SODIUM, TUNNEL
+from maps.campaign import LAMP_TEX, LINK, OFFICE_PAD, SODIUM, TUNNEL, XEN_GATE, XEN_RETURN
 from PIL import Image, ImageDraw
 
 BAY = Material(floor="TNNL_FLR4", wall="TNNL_W12C2", ceiling="TNNL_C1", floor_align="min")
@@ -87,7 +87,8 @@ TEST_SKIPPED = [
 HUB_WELCOME = [
     ("Welcome to the resonance transit hub. Please step away from the pads.", None, None),
     ("Its location is classified. Also, unknown. Please do not tap on the glass.", None, None),
-    ("Sites two to four are offline, pending construction. Watch this space.", None, None),
+    ("The Xen field station is open. Mind the gravity. Sites three and four are pending construction. Watch "
+     "this space.", None, None),
 ]
 
 
@@ -122,7 +123,7 @@ def build():
     chamber_door = lvl.doorway(lab, chamber, width=128, height=112, center=592)
     # the transit hub: no doors, only pads; its window looks out on Xen (a room made of
     # sky, with floating rocks, that nobody needs to reach)
-    hub = lvl.room("transit hub", (704, -608, 0), (1344, -96, 192), HUB)
+    hub = lvl.room("transit hub", (640, -608, 0), (1408, -96, 192), HUB)
     view = lvl.room("xen view", (256, -1856, -768), (1792, -624, 640), SKY, checkpoints=[])
     hub_window = lvl.doorway(hub, view, width=384, height=104, center=1024, sill=40)
     lvl.build(m)
@@ -161,8 +162,8 @@ def build():
         # the transit network, online
         "chamber_pad": (1500, 330, 80, 8, 15, ["transit_start"]),
         "skip_panel": (1296, 300, 64, 8, 270),
-        "bay_pad": (340, 420, 80, 10, 270, ["transit_start"]),
         "hub": (1024, -560, 110, 12, 90, ["transit_start"]),
+        "hub_east": (900, -420, 90, 8, 0, ["transit_start"]),
         "hub_window": (1024, -300, 90, 4, 270, ["transit_start"]),
         "hub_board": (900, -400, 70, 0, 250, ["transit_start"]),
         "hub_offline": (1024, -420, 70, 0, 20, ["transit_start"]),
@@ -403,26 +404,29 @@ def test(m, chamber, chamber_door, briefing, net):
 
 
 def transit_hub(m, hub, view, window, net):
-    """The resonance transit hub and its network: pads here, in the test chamber and in
-    the loading bay; three offline slots for sites to come; the view out; the intercom."""
+    """The resonance transit hub and its network: a pad here and in the test chamber;
+    pads into the office basement and to the Xen field station (other maps: campaign
+    PadLinks, their partners face the other way), and an arrivals pad for the Xen field
+    lab's one-way pad; two offline slots for sites to come; the view out; the
+    intercom."""
     x0, y0, z0 = hub.mins
     x1, y1, z1 = hub.maxs
-    # the network: two-way routes to the chamber and the bay, three slots
     chamber_pad = net.pad("pad_chamber", (1736, 400, 0), "west", site="TEST CHAMBER")   # arrive facing Boxworth
-    bay_pad = net.pad("pad_bay", (340, 200, 0), "north", site="LOADING BAY")
-    net.route(net.pad("hub_chamber", (1024, -200, 0), "south", site="TRANSIT HUB"), chamber_pad)
-    net.route(net.pad("hub_bay", (832, -200, 0), "south", site="TRANSIT HUB"), bay_pad)
-    for k, (pos, facing) in enumerate((((1216, -200, 0), "south"), ((784, -400, 0), "east"),
-                                       ((1264, -400, 0), "west")), 2):
-        net.pad(f"hub_site{k}", pos, facing, site="TRANSIT HUB", label=f"SITE {k}", offline=True)
-    m.add(net.entities())
+    net.route(net.pad("hub_chamber", (928, -200, 0), "south", site="TRANSIT HUB"), chamber_pad)
+    net.pad("hub_office", (736, -200, 0), "south", site="TRANSIT HUB", label="OFFICE BASEMENT", link=OFFICE_PAD)
+    net.pad("hub_xen", (1120, -200, 0), "south", site="TRANSIT HUB", label="XEN FIELD STATION", link=XEN_GATE)
+    net.pad("hub_field_lab", (1328, -420, 0), "west", site="TRANSIT HUB", label="XEN FIELD LAB",
+            link=XEN_RETURN)                        # arrivals only: the course's end leads back here
+    net.pad("hub_site3", (1312, -200, 0), "south", site="TRANSIT HUB", label="SITE 3", offline=True)
+    net.pad("hub_site4", (720, -420, 0), "east", site="TRANSIT HUB", label="SITE 4", offline=True)
+    m.add(net.entities(m))
     # the room: lab lights, the network board, the window and what's out there
-    for x in (832, 1216):
+    for x in (768, 1024, 1280):
         for y in (-480, -224):
             m.add(props.ceiling_light(x, y, z1, width=64, depth=32, texture=LAB_LAMP))
-    for x, y in ((1024, -352), (832, -300), (1216, -300), (1024, -520)):
+    for x, y in ((1024, -352), (800, -300), (1248, -300), (1024, -520)):
         m.add(props.light((x, y, z1 - 30), color=(210, 230, 255), brightness=170))
-    m.add(props.sign((768, y0, 96), "north", image=net.diagram(size=(224, 168)), w=112, h=84, frame="FIFTIES_DSK5B"),
+    m.add(props.sign((736, y0, 96), "north", image=net.diagram(size=(224, 168)), w=112, h=84, frame="FIFTIES_DSK5B"),
           props.sign((1024, y1, 150), "south", "RESONANCE TRANSIT HUB", 144, 18, "steel"))
     (wx0, wy0, wz0), (wx1, wy1, wz1) = window.mins, window.maxs
     m.add(props.Entity("func_wall", brushes=[box((wx0, wy0 + 7, wz0), (wx1, wy0 + 9, wz1), "GLASS_BRIGHT",
@@ -432,7 +436,7 @@ def transit_hub(m, hub, view, window, net):
                       kv={"_light": "200 150 255 110", "_diffuse_light": "120 90 190 40"}))
     for k, (c, size) in enumerate((((640, -1120, 40), 150), ((1420, -980, -120), 110), ((1120, -1560, 260), 190),
                                    ((520, -1640, -260), 120), ((1560, -1500, 60), 90))):
-        m.add(xen_rock(c, size, seed=k))
+        m.add(props.xen_rock(c, size, seed=k))
     # the intercom: says hello on the first arrival; a panel skips it
     head = (x1 - 6, -300, 150)
     hello = scene.Talk(m, "hub_hello", head, voice_name="zira", radius="medium", color=(170, 220, 255))
@@ -440,30 +444,5 @@ def transit_hub(m, hub, view, window, net):
         hello.line(text, say=say)
     m.add(hello.entities(), props.trigger((x0, y0, 0), (x1, y1, 128), hello.start),
           props.wall_art((x1, -300, 150), "west", "LAB1_SKR1", 20, 24, depth=4, frame="FIFTIES_DSK5B"),
-          scene.skip_button((1296, y0, 60), "north", [hello], name="hub_skip"))
+          scene.skip_button((1312, y0, 60), "north", [hello], name="hub_skip"))
 
-
-def xen_rock(center, size, seed=0):
-    """A floating Xen rock: a lumpy convex hull, crystals on top."""
-    import random
-    rnd = random.Random(seed)
-    cx, cy, cz = center
-    snap = lambda v: 8 * round(v / 8)                 # a coarse grid: no sliver faces
-    pts = []
-    for k in range(9):                                 # a flat, lumpy-edged top (crystals sit on it)
-        a = 2 * math.pi * k / 9 + rnd.uniform(-0.15, 0.15)
-        r = size * rnd.uniform(0.7, 1.0)
-        pts.append((snap(cx + r * math.cos(a)), snap(cy + r * math.sin(a)), snap(cz)))
-    for k in range(3):
-        a = 2 * math.pi * k / 3 + rnd.uniform(-0.3, 0.3)
-        r = size * rnd.uniform(0.2, 0.4)
-        pts.append((snap(cx + r * math.cos(a)), snap(cy + r * math.sin(a)), snap(cz - size * rnd.uniform(0.8, 1.1))))
-    rock = props.detail(hull(pts, {"top": "-0XENO_2WA", "default": "-0XENO_2W1"}, comment="xen rock"))
-    n = 2 if size > 100 else 1                         # apart from each other (touching ones lose faces)
-    a0 = rnd.uniform(0, 2 * math.pi)
-    crystals = [props.crystal((round(cx + math.cos(a0 + j * math.pi) * size * 0.3 * (n > 1)),
-                               round(cy + math.sin(a0 + j * math.pi) * size * 0.3 * (n > 1)), snap(cz) + 8),
-                              height=round(size * rnd.uniform(0.4, 0.7)), radius=round(size * 0.08),
-                              lean=(rnd.randint(-8, 8), rnd.randint(-8, 8)), seed=seed * 7 + j)
-                for j in range(n)]
-    return [rock] + crystals

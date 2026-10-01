@@ -172,17 +172,30 @@ class Map:
             elif e.get("landmark") and marks.count(str(e.get("landmark"))) != 1:
                 problems.append(f"trigger_changelevel to {e.get('map')}: landmark {e.get('landmark')!r} must be an "
                                 f"info_landmark in this map exactly once (found {marks.count(str(e.get('landmark')))})")
+        for e in self.find("monstermaker"):     # HLSDK: named + "start on" sets no first think
+            if e.get("targetname") and int(e.get("spawnflags") or 0) & 1:
+                problems.append(f"monstermaker {e.get('targetname')} has a name and 'start on': it never starts "
+                                "(fire it, e.g. from a trigger_auto, or leave the name off)")
         for e in self.find("infodecal"):
             if str(e.get("texture")) not in db:
                 problems.append(f"infodecal texture {e.get('texture')!r} is not in decals.wad")
         from . import config
         from .voice import check_wav, loops
-        for e in self.find("ambient_generic"):     # a looping WAV played "once" can never be stopped
+        for e in self.find("ambient_generic"):
             wav = str(e.get("message") or "")
             src = self.custom_sounds.get(wav) or config.GAME_DIR / "sound" / wav
-            if wav.endswith(".wav") and int(e.get("spawnflags") or 0) & 32 and loops(src):
+            if not wav.endswith(".wav") or not Path(src).exists():
+                if wav.endswith(".wav") and Path(config.GAME_DIR / "sound").exists():
+                    problems.append(f"sound {e.get('targetname') or wav}: {wav} is not a sound the game has")
+                continue
+            flags = int(e.get("spawnflags") or 0)
+            if flags & 32 and loops(src):          # a looping WAV played "once" can never be stopped
                 problems.append(f"sound {e.get('targetname') or wav}: {wav} loops, and played once it never stops; "
                                 "use props.sound_effect(..., stoppable=True) and turn it off")
+            elif not flags & (16 | 32) and not loops(src):
+                problems.append(f"sound {e.get('targetname') or wav}: {wav} has no loop points, so a sound that "
+                                "starts on plays it once as the map loads (and on every load); use a looping WAV "
+                                "(props.ambient_loop) or props.sound_effect")
         for n, src in self.custom_sounds.items():
             if len(n) > 60:
                 problems.append(f"sound name {n!r} is longer than 60 characters")

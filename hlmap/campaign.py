@@ -31,6 +31,10 @@ next map is checked with each combination the player can arrive with.
 Coordinates in `zone` and `triggers` are relative to the origin. The origins must
 differ by multiples of 512, so textures aligned to the world line up in both copies.
 
+PadLink is the other kind: teleporter pads that change level (hlmap.teleport,
+net.pad(..., link=PAD)). Nothing is shared but the pad; the player keeps their
+facing and lands in front of the other map's pad. See PadLink.
+
 Checks (python -m hlmap verify <map>, see check_transition):
   - every changelevel is reachable, and the global states the player can leave with
     (build/<map>/exits.json) are where the next map's verification starts;
@@ -55,11 +59,55 @@ from .mapfile import Entity
 ALIGN = 512       # origins differ by multiples of this (textures up to 512 line up)
 
 
-class Link:
-    def __init__(self, name, maps, zone, origins, triggers, build, carries=()):
-        self.name = name                     # the landmark's and the transition volume's name
-        self.carries = tuple(carries)        # global states that matter on the other side
+class Connection:
+    """A way between two maps: `name` is its landmark's; `carries` the global states
+    that matter on the other side (verify explores every way of setting them)."""
+
+    def __init__(self, name, maps, carries=()):
+        self.name = name
         self.maps = tuple(maps)              # (earlier map, later map) in campaign order
+        self.carries = tuple(carries)
+        self.passes = ()                     # states that cross on purpose but need no exploring
+
+    def other(self, map_name):
+        a, b = self.maps
+        if map_name not in self.maps:
+            raise ValueError(f"{type(self).__name__} {self.name} joins {a} and {b}, not {map_name}")
+        return b if map_name == a else a
+
+
+class PadLink(Connection):
+    """Teleporter pads that change level: one pad in each map, made by
+    net.pad(..., link=THIS) (hlmap.teleport). Stepping on one fires a changelevel to
+    the other map.
+
+    Half-Life keeps the player's offset from the landmark and their facing. The
+    landmark sits `arrive / 2` in front of each pad, and the two pads face opposite
+    ways, so a player who walks onto one pad lands `arrive` in front of the other,
+    facing away from it (off its trigger). Nothing else is shared: verify checks the
+    landings, not the rooms around them. `network`: the teleport.Network's name in
+    both maps; its "<network>_arriving" state (set leaving, cleared arriving: the
+    flash on arrival) crosses with the player, on purpose. `one_way_from`: a map name
+    for a way out that doesn't lead back: that map's pad leaves, the other map's pad
+    only receives (an "arrivals" pad: no trigger, no power)."""
+
+    def __init__(self, name, maps, carries=(), arrive=104, network="transit", one_way_from=None):
+        super().__init__(name, maps, carries)
+        if one_way_from is not None and one_way_from not in self.maps:
+            raise ValueError(f"PadLink {name}: one_way_from={one_way_from!r} is not one of {self.maps}")
+        self.arrive = arrive
+        self.network = network
+        self.one_way_from = one_way_from     # only that map's pad leaves; the other only receives
+        self.passes = (f"{network}_arriving",)
+
+    def departs(self, map_name):
+        """Does this link's pad in `map_name` send the player to the other map?"""
+        return self.one_way_from in (None, map_name)
+
+
+class Link(Connection):
+    def __init__(self, name, maps, zone, origins, triggers, build, carries=()):
+        super().__init__(name, maps, carries)
         self.zone = (tuple(zone[0]), tuple(zone[1]))
         self.origins = {k: tuple(v) for k, v in origins.items()}
         self.triggers = {k: (tuple(v[0]), tuple(v[1])) for k, v in triggers.items()}
@@ -75,12 +123,6 @@ class Link:
             if not all(zl[k] <= lo[k] and hi[k] <= zh[k] for k in range(3)):
                 raise ValueError(f"link {name}: {m_}'s trigger must lie inside the zone "
                                  "(the game only changes level from inside the transition volume)")
-
-    def other(self, map_name):
-        a, b = self.maps
-        if map_name not in self.maps:
-            raise ValueError(f"link {self.name} joins {a} and {b}, not {map_name}")
-        return b if map_name == a else a
 
     def landmark(self, map_name):
         o = self.origins[map_name]
@@ -125,14 +167,20 @@ def order():
 
 
 def links():
-    """Every Link defined in maps/campaign.py."""
+    """Every Link and PadLink defined in maps/campaign.py."""
     mod = definition()
-    return [v for v in vars(mod).values() if isinstance(v, Link)] if mod else []
+    return [v for v in vars(mod).values() if isinstance(v, Connection)] if mod else []
 
 
 def carried(map_name):
     """Global states the campaign's links from or to `map_name` carry."""
     return sorted({g for ln in links() if map_name in ln.maps for g in ln.carries})
+
+
+def passing(map_name):
+    """Global states that cross the links from or to `map_name` on purpose without
+    needing to be explored (a pad's arrival flash)."""
+    return sorted({g for ln in links() if map_name in ln.maps for g in ln.passes})
 
 
 def exits_path(map_name):
@@ -141,37 +189,48 @@ def exits_path(map_name):
 
 def save_exits(map_name, hulls, found, reached):
     """Record how the player can leave `map_name` (build/<map>/exits.json):
-    {target map: {"landmark":, "at": landmark origin, "states": [{"globals":,
-    "position":, "path":}], "touch": [every position touching the trigger]}}.
-    found: progression's exits {(target, landmark): [(globals, position, path)]}."""
+    {"exits": [{"target":, "landmark":, "at": landmark origin, "states":
+    [{"globals":, "position":, "path":, "inventory":}], "touch": [every position
+    touching the trigger]}]}. found: progression's exits {(target, landmark):
+    [(globals, position, path, inventory, ...)]}."""
     from .verify import touches_box
     marks = _landmarks(hulls.entities)
-    boxes = {(t, lm): b for t, lm, b in changelevels(hulls)}
-    data = {}
+    boxes = {(t, lm): b for t, lm, b, _ in changelevels(hulls)}
+    out = []
     for (target, lm), states in found.items():
         lo, hi = boxes[(target, lm)]
-        data[target] = {"landmark": lm, "at": list(marks.get(lm, [(0, 0, 0)])[0]),
-                        "states": [{"globals": g, "position": list(p), "path": path} for g, p, path in states],
-                        "touch": sorted(list(p) for p in reached if touches_box(p, lo, hi))}
+        out.append({"target": target, "landmark": lm, "at": list(marks.get(lm, [(0, 0, 0)])[0]),
+                    "states": [{"globals": st[0], "position": list(st[1]), "path": st[2], "inventory": st[3]}
+                               for st in states],
+                    "touch": sorted(list(p) for p in reached if touches_box(p, lo, hi))})
     exits_path(map_name).parent.mkdir(parents=True, exist_ok=True)
-    exits_path(map_name).write_text(json.dumps(data, indent=1))
+    exits_path(map_name).write_text(json.dumps({"exits": out}, indent=1))
 
 
-def touched_from(map_name, target):
-    """Positions in `map_name` from which the player touches its changelevel into
-    `target` (from its last verify), or None."""
+def _exits(map_name):
     p = exits_path(map_name)
     if not p.exists():
         return None
-    data = json.loads(p.read_text()).get(target)
-    return [tuple(x) for x in data["touch"]] if data else None
+    data = json.loads(p.read_text())
+    return data.get("exits", []) if isinstance(data, dict) and "exits" in data else None
+
+
+def touched_from(map_name, target):
+    """Positions in `map_name` from which the player touches its changelevels into
+    `target` (from its last verify), or None."""
+    ex = _exits(map_name)
+    if ex is None:
+        return None
+    got = [tuple(x) for e in ex if e["target"] == target for x in e["touch"]]
+    return got or None
 
 
 def entries(map_name):
-    """How the player arrives in `map_name` from earlier maps of the campaign:
-    [(from map, landmark, globals, position in THIS map)]. Positions are translated
-    through the landmarks of the two compiled maps. Returns None when an earlier map
-    that links here hasn't been verified yet."""
+    """How the player arrives in `map_name`: [(from map, landmark, globals, position
+    in THIS map, inventory, kind)], kind "arrive" from maps earlier in the campaign
+    and "return" from later ones. Positions are translated through the landmarks of
+    the two compiled maps. Returns None when an earlier map that links here hasn't
+    been verified yet."""
     maps = order()
     if map_name not in maps:
         return []
@@ -179,22 +238,25 @@ def entries(map_name):
     here = config.BUILD_DIR / map_name / f"{map_name}.bsp"
     marks_here = _landmarks(Hulls(here).entities) if here.exists() else {}
     out, missing = [], False
-    for prev in maps[:maps.index(map_name)]:
-        p = exits_path(prev)
-        if not p.exists():
-            missing = True
+    for other in maps:
+        if other == map_name:
             continue
-        data = json.loads(p.read_text()).get(map_name)
-        if not data:
+        ex = _exits(other)
+        earlier = maps.index(other) < maps.index(map_name)
+        if ex is None:
+            missing = missing or earlier
             continue
-        name = data["landmark"]
-        if len(marks_here.get(name, [])) != 1:
-            continue                         # check_transition reports it
-        d = tuple(marks_here[name][0][k] - data["at"][k] for k in range(3))
-        for s in data["states"]:
-            pos = tuple(s["position"][k] + d[k] for k in range(3))
-            out.append((prev, name, {k: int(v) for k, v in s["globals"].items()}, pos))
-    return None if missing and not out else out
+        for e in ex:
+            if e["target"] != map_name or len(marks_here.get(e["landmark"], [])) != 1:
+                continue                     # check_transition reports a missing landmark
+            d = tuple(marks_here[e["landmark"]][0][k] - e["at"][k] for k in range(3))
+            for st in e["states"]:
+                pos = tuple(st["position"][k] + d[k] for k in range(3))
+                out.append((other, e["landmark"], {k: int(v) for k, v in st["globals"].items()}, pos,
+                            tuple(st.get("inventory", ())), "arrive" if earlier else "return"))
+    if missing and not any(k == "arrive" for *_, k in out):
+        return None
+    return out
 
 
 # ---------------------------------------------------------------- checking a transition
@@ -208,11 +270,16 @@ def _landmarks(ents):
 
 
 def changelevels(hulls):
-    """[(target map, landmark, (mins, maxs))] of a compiled map's trigger_changelevels."""
+    """[(target map, landmark, (mins, maxs), master)] of a compiled map's
+    trigger_changelevels; master: what must be on for it to work (a pad's power:
+    hlmap_master, which the game ignores), or None. Inert ones (hlmap_arrivals: the
+    link back an arrivals pad needs, which nothing fires) are not ways out."""
     from .verify import _placed
     models = hulls.models()
-    return [(e.get("map", ""), e.get("landmark", ""), _placed(models, e)) for e in hulls.entities
-            if e.get("classname") == "trigger_changelevel" and e.get("model", "").startswith("*")]
+    return [(e.get("map", ""), e.get("landmark", ""), _placed(models, e), e.get("hlmap_master") or None)
+            for e in hulls.entities
+            if e.get("classname") == "trigger_changelevel" and e.get("model", "").startswith("*")
+            and not e.get("hlmap_arrivals")]
 
 
 def check_transition(ha, hb, a_name, b_name, reached_a, light_levels=None):
@@ -221,16 +288,24 @@ def check_transition(ha, hb, a_name, b_name, reached_a, light_levels=None):
     Returns (problems, warnings, notes), each a list of strings."""
     from .verify import FloorLight, Walker, _placed, touches_box
     problems, warnings, notes = [], [], []
-    links = [(lm, box_) for target, lm, box_ in changelevels(ha) if target == b_name]
+    portal = {e.get("landmark"): e.get("hlmap_style") == "portal" for e in ha.entities
+              if e.get("classname") == "trigger_changelevel"}
+    links = [(lm, box_, portal[lm]) for target, lm, box_, _ in changelevels(ha) if target == b_name]
     if not links:
         return problems, warnings, notes
     marks_a, marks_b = _landmarks(ha.entities), _landmarks(hb.entities)
     models_a = ha.models()
-    for lm, (lo, hi) in links:
+    for lm, (lo, hi), is_portal in links:
         what = f"{a_name} -> {b_name} ({lm})"
         if len(marks_a.get(lm, [])) != 1 or len(marks_b.get(lm, [])) != 1:
             problems.append(f"{what}: landmark {lm!r} appears {len(marks_a.get(lm, []))} time(s) in {a_name} and "
                             f"{len(marks_b.get(lm, []))} in {b_name}; it must be in each exactly once")
+            continue
+        if not any(e.get("classname") == "trigger_changelevel" and e.get("map") == a_name and e.get("landmark") == lm
+                   for e in hb.entities):
+            problems.append(f"{what}: {b_name} has no trigger_changelevel back to {a_name} with landmark {lm!r}: "
+                            "the engine only brings the player across between maps that link to each other, "
+                            "so they would arrive at their old coordinates (outside the level)")
             continue
         la, lb = marks_a[lm][0], marks_b[lm][0]
         d = tuple(lb[k] - la[k] for k in range(3))
@@ -244,7 +319,7 @@ def check_transition(ha, hb, a_name, b_name, reached_a, light_levels=None):
         if not touch:
             problems.append(f"{what}: no reachable position touches the changelevel")
             continue
-        back = [box_ for target, lm2, box_ in changelevels(hb)]
+        back = [box_ for target, lm2, box_, _ in changelevels(hb)]
         walker = Walker(hb)
         stuck, falling, bounce = [], [], []
         for p in touch:
@@ -264,6 +339,9 @@ def check_transition(ha, hb, a_name, b_name, reached_a, light_levels=None):
                                 f"{tuple(round(c) for c in bad[0])}")
         if not (stuck or falling or bounce):
             notes.append(f"{what}: all {len(touch)} landing spots stand clear in {b_name}")
+        if is_portal:
+            notes.append(f"{what}: a teleporter pad (the rooms around the two pads differ: only landings checked)")
+            continue
         # the zone must look the same in both maps
         zone = volumes[0] if volumes else None
         if zone is None:

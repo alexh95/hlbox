@@ -382,7 +382,10 @@ def playtest(bsp_path, start, script, out_dir, fire=(), prefix="play", width=128
     start = (x, y, feet_z, yaw[, pitch]), `fire` is triggered first (as for cameras), then
     `script` runs: console commands and frame waits, e.g.
         ["+forward", 60, "-forward", "+use", 5, "-use", "snapshot"]
-    (at the default 100 fps, 100 frames = 1 s; walking covers ~320 units/s).
+    Each frame is 10 ms of game time whatever the real frame rate (host_framerate
+    0.01), so 100 frames = 1 s and a run-up is the same every time; walking covers
+    ~320 units/s. sv_cheats is on, so a script can `give item_suit`, `give
+    item_longjump` (in that order: the module goes on the suit), `give weapon_crowbar`.
     Returns (png paths, console log). With developer 2 the log shows everything that
     fired ("Firing: (name)"), e.g. whether an item was picked up."""
     x, y, z, yaw = start[:4]
@@ -398,18 +401,20 @@ def playtest(bsp_path, start, script, out_dir, fire=(), prefix="play", width=128
         b.entities = ents + _fire_entities(ents, fire, (x, y, z + 36))
         b.save(dest)
 
-    lines = ["map hlmap_play", 150, "echo HLMAP_PLAY_START"] + list(script) + [10, "snapshot", 10]
+    lines = (["map hlmap_play", 150, "sv_cheats 1", "host_framerate 0.01", 5, "echo HLMAP_PLAY_START"]
+             + list(script) + [10, "snapshot", 10, "host_framerate 0"])
     return _run_session({"hlmap_play": write}, lines, out_dir, prefix, width, height, timeout, console)
 
 
-def playtest_transition(bsp_path, start, target, out_dir, settle=6, prefix="link", timeout=120):
+def playtest_transition(bsp_path, start, target, out_dir, settle=6, prefix="link", timeout=120, fire=()):
     """Walk into a level change in the real game: the player spawns at start = (x, y,
     feet_z, yaw) and holds forward until the level changes. Nothing may be left
     waiting in the console buffer: the game queues its changelevel, and the new map's
     sign-on, behind it. So a temporary maps/<target>_load.cfg (run by the engine when
     `target` loads) only lets go of forward and echoes a marker; `settle` seconds
     after the marker shows in the log, the window's picture is saved (where the player
-    landed) and the game closed. Returns (png paths, console log): the log has
+    landed) and the game closed. fire: targetnames triggered first, as for cameras
+    (e.g. a teleporter pad's power). Returns (png paths, console log): the log has
     "CHANGE LEVEL: <map> <landmark>" and "HLMAP_ARRIVED <target>" if it worked."""
     x, y, z, yaw = start[:4]
 
@@ -420,7 +425,7 @@ def playtest_transition(bsp_path, start, target, out_dir, settle=6, prefix="link
             if e.get("classname") == "info_player_start":
                 e["origin"] = f"{x:.1f} {y:.1f} {z + 36:.1f}"
                 e["angles"] = f"0 {yaw} 0"
-        b.entities = ents
+        b.entities = ents + _fire_entities(ents, fire, (x, y, z + 36))
         b.save(dest)
 
     # the copy runs under the map's own name: the next map links back to that name,

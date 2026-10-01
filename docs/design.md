@@ -203,9 +203,46 @@ against the level's intended air and refuses to install on failure:
     slide remotes don't multiply the states.
   - Every room, cave stretch and `m.checkpoints` entry must be reached, and the
     shortest line of play is logged with what each step changes.
+- **Jumps, gravity and the void.** In a map with a long jump module or a
+  trigger_gravity, the walker also jumps off edges: from each standing position with
+  the ground dropping away ahead, in 8 directions, a running jump (280 forward, where
+  there's 32 units of run-up; the game allows 320) and, while the player has the
+  module, a long jump (510 forward of the game's 560, up at the speed that rises 56).
+  - Each jump is flown as an arc (pm_shared's sv_gravity 800, times the gravity of
+    the zone it starts in), stopping on walls and ceilings, and settles onto the
+    8-unit grid where it lands. It fails if it lands nowhere, falls further than a
+    safe fall, or passes through a lethal trigger_hurt (100+ damage, on from the
+    start: a void).
+  - A trigger_gravity scales standing jumps, running jumps and safe falls; the
+    walker reads the zone a position is in (the game keeps the last one touched).
+  - Arcs are cached per start, direction and speed, flown without doors, and only
+    flown again with the doors whose boxes they pass through: a long jump on the far
+    side of the map doesn't care about the airlock.
+  - Tests: a 150 gap needs a running jump, 300 needs the module, the same 300 clears
+    in low gravity, a pit with a lethal trigger_hurt isn't a place to go.
+- **Gear and hostiles.** The HEV suit, the long jump module and weapons are
+  inventory in the simulated state (§3.10), picked up like keys (the module only
+  with the suit). A hostile monster, or a monstermaker making one, that the player
+  can get within 256 units of in a state without a weapon fails the map.
 - **Lockout.** Every state of play must still be able to reach the state that sees
   everything. Otherwise the line of play leading there is reported (e.g. a one-shot
   breaker used before the outage, which locks a power-dependent door for good).
+  In a map with round trips (below), a state from which a way out can be used isn't
+  a lockout: the player can leave and come back.
+- **Round trips** (`m.verify_round_trips`). For each distinct state (the global
+  states the map reads, the gear) the player can leave by each way out, and each way
+  the other map offers back (its changelevel's `hlmap_master` evaluated with those
+  states in a World of the other map's compiled entities), the map is played again
+  from the World as it was left (`progression(start_world=...)`: trigger_autos fire
+  again, as on a restore). Back the way first arrivals come in, every checkpoint must
+  be reachable again; any other way, the player must be able to leave again. Every
+  state must have at least one way back that brings the whole map back.
+  - The Xen course: out by the field lab's pad with the crowbar confiscated, back by
+    the station's pad, the station issues a new one and the course plays again; back
+    by the field lab's pad, the player is behind the decontamination airlock and
+    can only leave again (which is right).
+  - Coming back from a later map without round trips: a stranding check (can the
+    player reach a way out from where they land, the rest as on a fresh load).
 - **Darkness.** There's no flashlight without the HEV suit. For every state on the
   way, the way to the next useful objective must be visible.
   - `FloorLight` reads every upward face's lightmap samples per light style.
@@ -260,7 +297,13 @@ against the level's intended air and refuses to install on failure:
   - a diagonal corridor that cuts a room's corner: sealed in every hull, walkable, and
     the cut room stays unreachable (the corridor mustn't break into it);
   - terrain under a sky, with a flat pad and a slope: sealed, walkable, and every face
-    present.
+    present;
+  - glass (func_wall) that blocks the walker, teleporters into a sealed room, a
+    one-way pad that strands the player, a pad landing on another pad;
+  - gaps that need a running jump, the long jump module or low gravity, and a pit
+    with a lethal trigger_hurt;
+  - a door that locks behind the player: a lockout, unless there's a way out of the
+    map to leave by and come back (`come_back`).
   A clean room must pass. `tests/test_logic.py` checks the logic helpers against the
   simulator without compiling (switch positions through an outage, gates, chaining
   past 16 multi_manager targets, locks needing key and power).
@@ -313,6 +356,18 @@ against the level's intended air and refuses to install on failure:
     the map to settle, and saves the Half-Life window's picture (`PrintWindow`, only
     that window, DPI-aware) before closing the game. Both directions of the
     office/labs tunnel arrive standing in the other map's copy of the tunnel.
+    Pads into other maps need their power fired first (`--fire transit_start`).
+    Their first run found what verify can't: the pad fired its changelevel 0.3 s
+    after the player stepped on, and a player still walking was out of the pad's
+    transition volume by then ("Player isn't in the transition volume, aborting").
+    The pads now change level after 0.1 s, with a volume 48 wider than the pad.
+  - Scripted play runs on a fixed clock (`host_framerate 0.01`: a frame is 10 ms of
+    game time), so a run-up is the same length at any real frame rate. Found when a
+    40-frame run-up at 60 fps carried the player off the island before the jump.
+    With `sv_cheats 1`, a script can `give` the suit and the long jump module. The
+    Xen course's 460-unit gap in 0.6 gravity: with the module, crouch and jump at
+    the end of a run lands on the far island; without it, the same run falls into
+    the void. That agrees with verify.
 - **Limitations:**
   - Needs a desktop session and takes over the screen for about 15 s.
   - Movement is scripted input, not a bot. It checks specific walks, not whole
@@ -343,7 +398,12 @@ helpers do, and the verifier runs them:
     toggle, a non-member flips the last input), lights (ShouldToggle), func_wall
     frames, game_counters, env_render, removed entities (items, fire-once relays,
     killtargets), pressed buttons (toggle buttons skip the master on release) and
-    opened doors.
+    opened doors (a toggle door, spawnflags 32, closes on the next fire; one that
+    starts open, 1, starts in the opened set).
+  - The player's inventory: the HEV suit, the long jump module (only taken with the
+    suit), weapons (one of each). player_weaponstrip takes weapons and ammo, never the
+    suit or the module (CBasePlayer::RemoveAllItems(FALSE)); game_player_equip gives
+    the keys it names.
   - Events run in time order (delays, multi_manager timings).
   - `style_levels()` gives every light style's brightness in the current state,
     which feeds the darkness check.
@@ -498,17 +558,26 @@ Quality and budget measures:
     level change; with everything on, every trip has a way back to where it was
     stepped on (a flood from the landing that stops once it finds it), and a trip
     without one fails if it cuts anything off.
-  - In labs, the resonance test brings the network online: pads in the test chamber
-    and the loading bay go to a transit hub, a room with no doors whose window looks
-    out on a Xen sky (a room made of sky, `checkpoints=[]`, with floating rocks). Its
-    three offline pads, SITE 2 to 4, are where the next ideas plug in.
-  - Next: sites in other maps. A campaign Link whose zone holds two pads (each map's
-    changelevel on the pad the other map lands on), with the flash and sound on
-    arrival, would make a pad a level change.
+  - In labs, the resonance test brings the network online: a pad in the test
+    chamber goes to a transit hub, a room with no doors whose window looks out on a
+    Xen sky (a room made of sky, `checkpoints=[]`, with floating rocks). Its two
+    offline pads, SITE 3 and 4, are where the next ideas plug in.
+  - Sites in other maps. Done: a campaign `PadLink` names the pair; each map's pad
+    (`net.pad(..., link=)`) fires a use-only trigger_changelevel after the flash, with
+    an info_landmark half the landing distance in front of it and a
+    trigger_transition around it. The two pads face opposite ways, so the player
+    lands in front of the other pad facing away from it. A global state set on the
+    way out plays the flash and sound on arrival. The hub's pads lead to the office
+    basement and to the Xen field station. The Xen field lab's pad has its own power
+    (`power=`, the course's clearance card) and is one way (`one_way_from`): the hub's
+    end is an arrivals pad, with no trigger.
 - **NPCs and items.**
   - Scientists, security guards and monsters placed on the floor with checks.
   - `scripted_sequence` and `scripted_sentence` using the existing sentences.
-  - Weapons, ammo, health, batteries and the HEV suit.
+  - Weapons, ammo, health, batteries and the HEV suit. Done in the xen map: the
+    field kit (suit, long jump module, crowbar), a player_weaponstrip that
+    confiscates the crowbar, a game_player_equip that gives it back, health and
+    batteries on the course, headcrab monstermakers.
 - **Multi-map campaigns. Done** (`hlmap/campaign.py`, `maps/campaign.py`).
   - One script per map. `maps/campaign.py` lists the maps in order and defines each
     `Link`: a stretch of level (the zone) that both maps build from the same function,
@@ -531,8 +600,8 @@ Quality and budget measures:
     different zone, shifted textures and a landing in a wall.
   - `playtest <map> --links` walks into each changelevel in the game and captures
     the arrival (see §3.9 Playtests for why that needs a window capture).
-  - Not simulated: returning to a map (the game restores it as it was left; only
-    the landing is checked).
+  - Returning to a map: a stranding check, and with `m.verify_round_trips` the map
+    played again from as it was left (§3.8 Round trips).
 - **Narrative and screen effects (all stock):**
   - `game_text` for on-screen notes, triggered by a button on a note or sign.
     Done: `props.hud_message`.
@@ -615,8 +684,12 @@ lint and the budget report (§3.6, §3.8).
   - A verify-based test per geometry generator (rooms, caves).
   - Golden `.map` output for the example maps.
 - **Return paths.** Done for teleporters (every trip needs a way back, or must not
-  cut anything off). Still to do for one-way drops: positions from which the rest of
-  the level can't be reached (strongly connected parts of the walk graph).
+  cut anything off) and for maps you leave and come back to (round trips). Still to
+  do for one-way drops within a map: positions from which the rest of the level
+  can't be reached (strongly connected parts of the walk graph). Jumps made them
+  possible: a long jump down that can't be jumped back up.
+- **Monsters that move.** The hostile check takes spawn points; headcrabs chase and
+  leap. No node graph (info_node) yet: monsters use direct moves.
 - **Performance per view.** Record the `r_speeds` output (world and entity polygon
   counts) during screenshot runs to measure detail at each camera.
 - **Headless renderer.** Render the compiled BSP, with textures and lightmaps, from

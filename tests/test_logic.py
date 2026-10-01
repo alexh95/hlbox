@@ -180,6 +180,39 @@ def _said_after(w, n):
     return [w.ents[i]["targetname"] for i, c, u in w.effects[n:] if c == "ambient_generic" and u == "toggle"]
 
 
+def test_gear_and_the_weapon_strip():
+    from hlmap.mapfile import Entity
+    ents = [props.point("item_longjump", (0, 0, 0)), props.point("item_suit", (0, 0, 0)),
+            props.point("weapon_crowbar", (0, 0, 0)), Entity("player_weaponstrip", targetname="strip", origin=(0, 0, 0)),
+            Entity("game_player_equip", targetname="equip", origin=(0, 0, 0), kv={"weapon_crowbar": 1})]
+    w = World(_lump(ents)).start()
+    w.pickup(0)
+    assert not w.long_jump and 0 not in w.gone             # the module only goes on the suit
+    w.pickup(1)
+    w.pickup(0)
+    w.pickup(2)
+    assert w.long_jump and w.armed
+    w.fire("strip")                                         # weapons go, the suit and the module stay
+    assert not w.armed and w.long_jump and "item_suit" in w.inventory
+    w.fire("equip")
+    assert w.armed
+
+
+def test_toggle_doors_open_and_close():
+    from hlmap.mapfile import Entity
+    ents = [Entity("func_door", targetname="d", spawnflags=32, origin=(0, 0, 0)),
+            Entity("func_door", targetname="open", spawnflags=1, origin=(0, 0, 0)),
+            Entity("func_door", targetname="once", origin=(0, 0, 0))]
+    w = World(_lump(ents)).start()
+    assert not w.door_passable(0) and w.door_passable(1) and not w.door_passable(2)
+    w.fire("d")
+    w.fire("once")
+    assert w.door_passable(0) and w.door_passable(2)
+    w.fire("d")
+    w.fire("once")
+    assert not w.door_passable(0) and w.door_passable(2)    # a toggle door closes; the other stays open
+
+
 def test_a_looping_sound_played_once_is_caught():
     """warn2.wav has loop points: played once (not stoppable) it would never stop."""
     from hlmap import Map
@@ -189,6 +222,22 @@ def test_a_looping_sound_played_once_is_caught():
     m = Map("vsound2")
     m.add(props.sound_effect("alarm", (0, 0, 0), "ambience/warn2.wav", stoppable=True))
     assert not any("loops" in p for p in m.check())
+
+
+def test_a_named_monstermaker_that_never_starts_is_caught():
+    """HLSDK: a monstermaker with a name and "start on" gets no first think (the
+    Xen course's missing headcrabs). props.monster_maker starts a named one itself."""
+    from hlmap import Map
+    from hlmap.mapfile import Entity
+    m = Map("vmaker")
+    m.add(Entity("monstermaker", origin=(0, 0, 0), targetname="crabs", monstertype="monster_headcrab", spawnflags=1))
+    assert any("never starts" in p for p in m.check())
+    m = Map("vmaker2")
+    m.add(props.monster_maker((0, 0, 0), "monster_headcrab", name="crabs"),
+          props.monster_maker((64, 0, 0), "monster_headcrab"))
+    assert not any("never starts" in p for p in m.check())
+    auto = [e for e in m.entities if e.classname == "trigger_auto"]
+    assert len(auto) == 1 and auto[0].get("target") == "crabs"
 
 
 def test_talk_checks_gestures_against_the_model():

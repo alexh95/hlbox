@@ -316,7 +316,7 @@ def _pad_rooms(glass=False, window=False, route="two-way", bad_landing=False):
         pa = net.pad("pa", (192, 200, 0), "south", site="A")
         pb = net.pad("pb", (592, 200, 0), "south", site="B", offline=route == "one-way")
         net.route(pa, pb, two_way=route == "two-way")
-        m.add(net.entities())
+        m.add(net.entities(m))
     if bad_landing:      # a teleporter whose target stands on another teleporter's volume
         m.add(props.Entity("trigger_teleport", brushes=[box((40, 40, 0), (88, 88, 64), "AAATRIGGER")], target="dst"),
               props.Entity("trigger_teleport", brushes=[box((296, 40, 0), (344, 88, 64), "AAATRIGGER")], target="dst"),
@@ -352,6 +352,88 @@ def test_one_way_teleporter_that_strands_is_caught():
 def test_landing_on_a_teleporter_is_caught():
     _, bad = _pad_rooms(route=None, bad_landing=True)
     assert any("on a teleporter" in problem for _, problem in bad), bad
+
+
+def _gap(gap, gear=False, gravity=None, lethal=False):
+    """Two ledges (tops at z 0) with a `gap` between them over a pit 256 deep; the
+    start is on the near ledge. gear: the HEV suit and the long jump module lie on it;
+    gravity: a trigger_gravity over everything; lethal: a trigger_hurt fills the pit."""
+    from hlmap.verify import progression
+    m = Map("vgap")
+    lvl = Level(wall=16)
+    lvl.room("pit", (0, 0, -256), (1024, 256, 256), MAT)
+    lvl.build(m)
+    near, far = 320, 320 + gap
+    m.add(props.detail(box((0, 0, -256), (near, 256, 0), "CRETE4_WALL01B"),
+                       box((far, 0, -256), (1024, 256, 0), "CRETE4_WALL01B")))
+    if gear:
+        m.add(props.point("item_suit", (96, 64, 8)), props.point("item_longjump", (96, 192, 8)))
+    if gravity:
+        m.add(props.Entity("trigger_gravity", brushes=[box((0, 0, -256), (1024, 256, 256), "AAATRIGGER")],
+                           gravity=gravity))
+    if lethal:
+        m.add(props.Entity("trigger_hurt", brushes=[box((near, 0, -256), (far, 256, -200), "AAATRIGGER")],
+                           dmg=1000, damagetype=32))
+    m.add(props.player_start((160, 128, 0), facing="east"), props.light((512, 128, 200)))
+    out = Path(tempfile.mkdtemp()) / "vgap.map"
+    res = compile_map(m.write(out), profile="fast", steps=("csg", "bsp"))
+    assert res.ok, res.summary()
+    checkpoints = [("far ledge", [(far + 200, 128, 37)]), ("pit floor", [(near + gap / 2, 128, -256 + 37)])]
+    return progression(Hulls(res.bsp), checkpoints, jumps=True)
+
+
+def test_running_jump_clears_a_small_gap():
+    p = _gap(150)
+    assert "far ledge" not in [n for n, _ in p.missing], p.missing
+
+
+def test_wide_gap_needs_the_long_jump_module():
+    p = _gap(300)
+    assert "far ledge" in [n for n, _ in p.missing]            # too far for a running jump
+    p = _gap(300, gear=True)
+    assert "far ledge" not in [n for n, _ in p.missing], p.missing
+    assert any("got the long jump module" in step for step in p.log), p.log
+
+
+def test_low_gravity_stretches_a_jump():
+    p = _gap(300, gravity=0.5)
+    assert "far ledge" not in [n for n, _ in p.missing], p.missing
+
+
+def test_a_lethal_pit_is_not_a_place_to_go():
+    p = _gap(300)
+    assert "pit floor" not in [n for n, _ in p.missing]         # a fall you survive
+    p = _gap(300, lethal=True)
+    assert "pit floor" in [n for n, _ in p.missing]             # into a trigger_hurt: death
+
+
+def _one_way_rooms(come_back):
+    """Rooms a and b; the door between opens while a Flag is on, and walking on into b
+    turns it off (the Xen decontamination airlock). A way out of the map is in b."""
+    from hlmap import logic
+    from hlmap.verify import progression
+    m = Map("voneway")
+    lvl = Level(wall=16)
+    a = lvl.room("a", (0, 0, 0), (256, 256, 128), MAT)
+    b = lvl.room("b", (272, 0, 0), (528, 256, 128), MAT)
+    door = lvl.doorway(a, b, width=64, height=96)
+    lvl.build(m)
+    flag = logic.Flag("open", True, (128, 128, 100))
+    m.add(flag.entities(), props.door_sliding(door, master=flag.is_on),
+          props.trigger((400, 0, 0), (528, 256, 128), flag.off),
+          props.player_start((64, 128, 0)), props.light((128, 128, 100)), props.light((400, 128, 100)))
+    out = Path(tempfile.mkdtemp()) / "voneway.map"
+    res = compile_map(m.write(out), profile="fast", steps=("csg", "bsp"))
+    assert res.ok, res.summary()
+    exits = {"out": ((480, 100, 0), (520, 150, 100))}
+    return progression(Hulls(res.bsp), lvl.checkpoints(), exits=exits, come_back=come_back)
+
+
+def test_a_door_that_locks_behind_is_a_lockout_unless_the_player_can_come_back():
+    p = _one_way_rooms(come_back=())
+    assert p.softlocks and "room a" in p.softlocks[0][1], p.softlocks
+    p = _one_way_rooms(come_back=["out"])          # leave by "out" and come back in: not stuck
+    assert not p.softlocks and not p.missing, (p.softlocks, p.missing)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,11 @@ Half-Life game code (HLSDK) does, including its quirks:
   - trigger_relay: triggerstate missing = off
   - trigger_relay, multi_manager: no master; func_button, func_door, game_counter
     and trigger_once/multiple honour one
+  - func_door: a named door opens when fired (a "toggle" one, spawnflags 32, also
+    closes); "starts open" (1) doors start open
+  - gear: the HEV suit, the long jump module (only taken with the suit) and weapons
+    go into the player's inventory; player_weaponstrip takes weapons and ammo (not
+    the suit or the long jump); game_player_equip gives what it names
 """
 from __future__ import annotations
 
@@ -34,6 +39,8 @@ BUTTONS = ("func_button", "func_rot_button")
 DOORS = ("func_door", "func_door_rotating")
 ITEMS = ("item_", "weapon_", "ammo_")
 # fired but only make sounds, messages or effects (recorded, no state)
+GEAR = ("item_suit", "item_longjump")          # kept for good once taken
+GEAR_NAMES = {"item_suit": "HEV suit", "item_longjump": "long jump module", "weapon_crowbar": "crowbar"}
 EFFECTS = {"ambient_generic", "game_text", "env_shake", "env_fade", "env_spark", "env_sprite", "env_beam",
            "env_message", "speaker", "trigger_camera", "env_explosion", "env_funnel", "env_laser",
            "scripted_sequence", "scripted_sentence"}
@@ -56,10 +63,11 @@ def strip_token(key):
 class World:
     """The logic state of a map (from its compiled entity lump) and how it changes."""
 
-    def __init__(self, ents, globals=None):
+    def __init__(self, ents, globals=None, inventory=()):
         """globals: global states carried over from the previous map ({name: 0 off,
         1 on, 2 dead}); env_globals that set an initial state leave those alone, as
-        in the game (the state is only created if it doesn't exist yet)."""
+        in the game (the state is only created if it doesn't exist yet).
+        inventory: the player's gear and weapons on arrival (classnames)."""
         self.ents = ents
         self.names = {}
         for i, e in enumerate(ents):
@@ -88,7 +96,9 @@ class World:
         self.render = {}      # entity -> renderamt set by env_render
         self.gone = set()     # removed: picked-up items, fire-once relays, killtargets
         self.pressed = set()  # toggle buttons in their pressed state; wait -1 buttons used up
-        self.opened = set()   # doors opened by being fired
+        self.opened = {i for i, e in enumerate(ents) if e.get("classname") in DOORS and e.get("targetname")
+                       and int(e.get("spawnflags") or 0) & 1}   # named doors open now (1 = starts open)
+        self.inventory = set(inventory)   # the player's gear and weapons
         self.retarget = {}    # trigger_changetarget
         self.effects = []     # what happened, for logs: (entity, classname, use)
         self.warnings = []
@@ -102,6 +112,7 @@ class World:
         w.lit, w.frame, w.count, w.render = dict(self.lit), dict(self.frame), dict(self.count), dict(self.render)
         w.shown = dict(self.shown)
         w.gone, w.pressed, w.opened = set(self.gone), set(self.pressed), set(self.opened)
+        w.inventory = set(self.inventory)
         w.retarget = dict(self.retarget)
         w.effects, w.warnings = [], []
         w._queue, w._seq, w.time = [], 0, self.time
@@ -154,9 +165,10 @@ class World:
 
     # ------------------------------------------------------------ player actions
     def start(self):
-        """Map start: trigger_autos fire."""
+        """Map start: trigger_autos fire. Called again on a World that was left, it is
+        coming back into the map: the ones still there fire again, as in the game."""
         for i, e in enumerate(self.ents):
-            if e.get("classname") == "trigger_auto":
+            if e.get("classname") == "trigger_auto" and i not in self.gone:
                 gs = e.get("globalstate")
                 if gs and self.globals.get(gs, 0) != 1:
                     continue
@@ -175,9 +187,24 @@ class World:
         return None if until is None else self.time + until
 
     def pickup(self, i, until=None):
+        c = self.cls(i)
+        if c == "item_longjump" and "item_suit" not in self.inventory:
+            return self                   # the module only goes on the suit: it stays put
+        if c.startswith("weapon_") and c in self.inventory:
+            return self                   # already have one (a crowbar has no ammo to give)
         self.gone.add(i)
+        if c in GEAR or c.startswith("weapon_"):
+            self.inventory.add(c)
         self._use_targets(i, TOGGLE, None)
         return self.run(self._until(until))
+
+    @property
+    def armed(self):
+        return any(c.startswith("weapon_") for c in self.inventory)
+
+    @property
+    def long_jump(self):
+        return "item_longjump" in self.inventory
 
     def press(self, i, until=None):
         self._button(i)
@@ -308,7 +335,20 @@ class World:
             self._button(i)
         elif c in DOORS:
             if self.master_ok(e.get("master")):
-                self.opened.add(i)
+                if int(e.get("spawnflags") or 0) & 32 and i in self.opened:
+                    self.opened.discard(i)        # a toggle door closes again
+                else:
+                    self.opened.add(i)
+        elif c == "player_weaponstrip":
+            self.inventory = {g for g in self.inventory if not g.startswith(("weapon_", "ammo_"))}
+            self.effects.append((i, c, USE_NAMES[use]))
+        elif c == "game_player_equip":
+            for k in e:
+                if k.startswith(("weapon_", "item_suit", "item_longjump")):
+                    if k == "item_longjump" and "item_suit" not in self.inventory:
+                        continue
+                    self.inventory.add(k)
+            self.effects.append((i, c, USE_NAMES[use]))
         elif c == "trigger_changetarget":
             for j in self.names.get(self.target(i) or "", ()):
                 self.retarget[j] = e.get("m_iszNewTarget")
@@ -381,13 +421,14 @@ class World:
         return (tuple(sorted((g, self.globals.get(g, 0)) for g in rel_globals)),
                 tuple((i, tuple(self.bits[i])) for i in sorted(rel) if i in self.bits),
                 tuple(sorted(self.gone & rel)), tuple(sorted(self.pressed & rel)),
-                tuple(sorted(self.opened & rel)),
+                tuple(sorted(self.opened & rel)), tuple(sorted(self.inventory)),
                 tuple(sorted((i, v) for i, v in self.count.items() if i in rel)),
                 tuple(sorted((i, v) for i, v in self.retarget.items() if i in rel)))
 
     def describe_change(self, before):
         """Human-readable differences from an earlier World."""
-        out = []
+        out = [f"got the {GEAR_NAMES.get(g, g)}" for g in sorted(self.inventory - before.inventory)]
+        out += [f"lost the {GEAR_NAMES.get(g, g)}" for g in sorted(before.inventory - self.inventory)]
         for g in sorted(set(self.globals) | set(before.globals)):
             a, b = before.globals.get(g, 0), self.globals.get(g, 0)
             if a != b and not g.endswith("_not"):

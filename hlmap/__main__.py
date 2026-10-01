@@ -69,11 +69,20 @@ def cmd_build(a):
         from .campaign import order
         rank = {n: i for i, n in enumerate(order())}
         maps.sort(key=lambda n: rank.get(n, len(rank)))
-    for name in maps:
+    for k, name in enumerate(maps):
         if len(maps) > 1:
             print(f"==================== {name}")
-        a1 = argparse.Namespace(**{**vars(a), "map": name})
+        # maps built after this one in the same run: their compiled copies are stale,
+        # so transitions into them are checked when they're verified (both ways)
+        a1 = argparse.Namespace(**{**vars(a), "map": name, "pending": maps[k + 1:]})
         _build_one(a1)
+    if len(maps) > 1 and not a.no_verify:
+        print("==================== coming back")
+        ok = True
+        for k, name in enumerate(maps[:-1]):
+            ok = returns_from(name, maps[k + 1:]) and ok
+        if not ok:
+            sys.exit("verify failed: a map strands players coming back into it (already installed)")
 
 
 def _build_one(a):
@@ -117,7 +126,7 @@ def _build_one(a):
         print("leak preview:", render(m, d / "leak.png", pointfile=res.pointfile))
     if not res.ok:
         sys.exit(1)
-    if not a.no_verify and not run_verify(m, res.bsp):
+    if not a.no_verify and not run_verify(m, res.bsp, pending=getattr(a, "pending", ())):
         sys.exit("verify failed: not installing (use --no-verify to override)")
     if not a.no_install:
         from . import game
@@ -244,24 +253,32 @@ def cmd_playtest(a):
 def _playtest_links(a, bsp, d):
     """Walk into every trigger_changelevel in the real game: start on open ground a
     little before it, hold forward, and check the game arrived in the other map; the
-    picture (build/<map>/playtest/link_<target>_window.png) shows where the player landed."""
+    picture (build/<map>/playtest/link_<target>_<landmark>_window.png) shows where the player
+    landed. A teleporter pad into another map changes level when stepped on: --fire
+    its power first (e.g. --fire transit_start)."""
     import math
     from . import game
     from .campaign import changelevels
-    from .verify import HALF, Hulls, Walker, _placed, straight_walk, touches_box
+    from .verify import (HALF, Hulls, Walker, _placed, gravity_zones, lethal_volumes, solid_entities,
+                         straight_walk, teleports, touches_box)
     h = Hulls(bsp)
-    w = Walker(h, [_placed(h.models(), e) for e in h.entities if e.get("classname") == "func_ladder"])
+    zones = gravity_zones(h)
+    jumps = bool(zones) or any(e.get("classname") == "item_longjump" for e in h.entities)
+    w = Walker(h, [_placed(h.models(), e) for e in h.entities if e.get("classname") == "func_ladder"],
+               solids=solid_entities(h), zones=zones, lethal=lethal_volumes(h), jumps=jumps)
+    # everywhere the player can get to: doors open, teleporters on, jumps with the module
+    w.configure(teleports=[(box, w.settle(land)) for _, box, land, _ in teleports(h) if land], long_jump=jumps)
     start = next(e for e in h.entities if e.get("classname") == "info_player_start")
     pos0 = w.settle(tuple(float(c) for c in start["origin"].split()))
     links = changelevels(h)
     if not links:
         sys.exit("no trigger_changelevel in this map")
-    for target, lm, (lo, hi) in links:
+    for target, lm, (lo, hi), _ in links:
         mid = ((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2)
         # the side players come from: reachable from the start (doors open) without
         # crossing the trigger; open ground 96-160 units from it, from which walking
         # straight at it gets there
-        w.blockers = [(tuple(lo[k] - HALF[k] for k in range(3)), tuple(hi[k] + HALF[k] for k in range(3)))]
+        w.configure(blockers=[(tuple(lo[k] - HALF[k] for k in range(3)), tuple(hi[k] + HALF[k] for k in range(3)))])
         comp = w.flood([pos0])
         best = None
         for p in sorted(comp, key=lambda p: abs(math.hypot(p[0] - mid[0], p[1] - mid[1]) - 128)):
@@ -276,8 +293,8 @@ def _playtest_links(a, bsp, d):
         yaw = math.degrees(math.atan2(mid[1] - best[1], mid[0] - best[0]))
         at = (best[0], best[1], best[2] - 36, round(yaw))
         print(f"to {target} ({lm}): walking in from {tuple(round(c) for c in best[:2])}, facing {round(yaw)}")
-        pngs, log = game.playtest_transition(bsp, at, target, d, prefix=f"link_{target}_")
-        (d / f"link_{target}.log").write_text(log, encoding="utf-8")
+        pngs, log = game.playtest_transition(bsp, at, target, d, prefix=f"link_{target}_{lm}_", fire=a.fire or ())
+        (d / f"link_{target}_{lm}.log").write_text(log, encoding="utf-8")
         after = log[log.find("HLMAP_PLAY_START"):] if "HLMAP_PLAY_START" in log else ""
         changed = next((line.strip() for line in after.splitlines() if line.startswith("CHANGE LEVEL")), None)
         arrived = f"HLMAP_ARRIVED {target}" in after
@@ -325,15 +342,17 @@ def _playtest_teleports(a, bsp, d):
         yaw = round(math.degrees(math.atan2(mid[1] - best[1], mid[0] - best[0])))
         print(f"teleporter to {target}: walking on from {tuple(round(c) for c in best[:2])}, "
               f"should land at {tuple(round(c) for c in land) if land else '?'}")
-        pngs, log = game.playtest(bsp, (best[0], best[1], best[2] - 36, yaw), ["+forward", 30, "-forward", 150], d,
+        pngs, log = game.playtest(bsp, (best[0], best[1], best[2] - 36, yaw), ["+forward", 60, "-forward", 150], d,
                                   fire=a.fire or (), prefix=f"teleport_{target}_")
         (d / f"teleport_{target}.log").write_text(log, encoding="utf-8")
         for p in pngs:
             print(f"  shot {p}")
 
 
-def run_verify(m, bsp_path, coverage_check=True):
-    """Collision/visibility checks of a compiled BSP. Returns True if everything passed."""
+def run_verify(m, bsp_path, coverage_check=True, pending=()):
+    """Collision/visibility checks of a compiled BSP. Returns True if everything passed.
+    pending: maps about to be rebuilt (their transitions with this one are checked then)."""
+    from .sim import GEAR_NAMES
     from .verify import (DARK_LIMIT, HULL_NAMES, FloorLight, Hulls, coverage, invisible_walls, item_rest,
                          leaks_into_solid, pickup_approaches, progression)
     level = getattr(m, "level", None)
@@ -401,16 +420,15 @@ def run_verify(m, bsp_path, coverage_check=True):
         else:
             print(f"verify ok   hull {hull} ({HULL_NAMES[hull]}): no invisible walls")
     from . import campaign
-    exits = {(target, lm): b for target, lm, b in campaign.changelevels(h)}
+    exits = {(target, lm): (b[0], b[1], master) for target, lm, b, master in campaign.changelevels(h)}
     checkpoints = level.checkpoints() + [(name, [(p[0], p[1], p[2] + 37)])
                                          for name, p in getattr(m, "checkpoints", [])]
-    # every way out must be reachable (the middle of its floor)
-    checkpoints += [(f"way to {target}", [((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, lo[2] + 37)])
-                    for (target, _), (lo, hi) in exits.items()]
     light = FloorLight(h.bsp) if h.bsp.lumps["lighting"] else None
-    # arriving from an earlier map of the campaign: start where the player lands, with
-    # the global states they can bring (one run per distinct state this map reads)
-    runs = [("", None, None)]
+    # how players come in: from the player start (the first map), arriving from earlier
+    # maps with the global states and gear they can bring (a full run for each distinct
+    # arrival this map tells apart), and coming back from later maps (are they stranded?)
+    runs = [("", None, None, ())]
+    returns = []
     arrivals = campaign.entries(m.name)
     if arrivals is None:
         earlier = campaign.order()[:campaign.order().index(m.name)]
@@ -418,33 +436,47 @@ def run_verify(m, bsp_path, coverage_check=True):
               "unknown; checking from the player start with the map's own starting state")
     elif arrivals:
         read = {e["globalstate"] for e in h.entities if e.get("globalstate")}
+        brought = {g for a in arrivals if a[5] == "arrive" for g in a[2]}   # from earlier maps
         seen = {}
-        for prev, lm, glob, pos in arrivals:
-            key = tuple(sorted((g, glob.get(g, 0)) for g in read))
-            seen.setdefault(key, (prev, lm, glob, pos))
-        runs = []
-        brought = {g for a in arrivals for g in a[2]}
-        for key, (prev, lm, glob, pos) in seen.items():
-            state = ", ".join(f"{g} {'on' if v == 1 else 'off'}" for g, v in key
-                              if g in brought and not g.endswith("_not"))
-            runs.append((f"from {prev}{': ' + state if state else ''}", glob, pos))
-        print(f"verify      campaign: players arrive from {', '.join(sorted({a[0] for a in arrivals}))} "
-              f"in {len(arrivals)} global state(s), {len(runs)} different for this map")
-        carried = set(campaign.carried(m.name))
+        deferred = sorted({a[0] for a in arrivals if a[5] == "return" and a[0] in pending})
+        if deferred:
+            print(f"verify      campaign: coming back from {', '.join(deferred)} is checked after "
+                  f"{'it is' if len(deferred) == 1 else 'they are'} rebuilt")
+        for prev, lm, glob, pos, inv, kind in arrivals:
+            if kind == "return" and prev in pending:
+                continue
+            key = (kind, prev, lm, tuple(sorted((g, glob.get(g, 0)) for g in read)), tuple(sorted(inv)))
+            seen.setdefault(key, (prev, lm, glob, pos, inv, kind))
+        forward = [v for v in seen.values() if v[5] == "arrive"]
+        if forward:
+            runs = []
+        for prev, lm, glob, pos, inv, kind in seen.values():
+            state = [f"{g} {'on' if glob.get(g, 0) == 1 else 'off'}" for g in sorted(read & brought)
+                     if not g.endswith("_not")]
+            state += [f"with {GEAR_NAMES.get(g, g)}" for g in sorted(inv)]
+            label = f"{prev} via {lm}{': ' + ', '.join(state) if state else ''}"
+            (runs if kind == "arrive" else returns).append((f"from {label}" if kind == "arrive" else label, glob,
+                                                             pos, inv))
+        print(f"verify      campaign: players arrive from {', '.join(sorted({a[0] for a in arrivals}))}: "
+              f"{len(forward)} different first arrivals, {len(returns)} ways back in")
+        carried = set(campaign.carried(m.name)) | set(campaign.passing(m.name))
         mine = {e["globalstate"] for e in h.entities if e.get("classname") == "env_global" and e.get("globalstate")}
         for g in sorted(read & brought - carried - {f"{c}_not" for c in carried}):
             print(f"verify WARN campaign: this map reads global state {g!r}, which "
-                  f"{'both maps set' if g in mine else 'comes from the previous map'}, but no link "
-                  "carries it: its value on arrival wasn't explored (list it in the Link's carries, or rename "
+                  f"{'both maps set' if g in mine else 'comes from the other map'}, but no link "
+                  "carries it: its value on arrival wasn't explored (list it in the link's carries, or rename "
                   "it if the maps mean different things by it)")
-    reached, found, tele_report = set(), {}, []
-    for k, (label, glob, start) in enumerate(runs):
+    reached, found, tele_report, unarmed = set(), {}, [], []
+    # a map the player can come back into (round trips): leaving isn't a lockout
+    come_back = list(exits) if getattr(m, "verify_round_trips", False) else ()
+    for k, (label, glob, start, inv) in enumerate(runs):
         prog = progression(h, checkpoints, light=light, globals=glob, start=start, exits=exits,
-                           watch=campaign.carried(m.name))
+                           watch=campaign.carried(m.name), inventory=inv, come_back=come_back)
         reached |= prog.reached
         for key, states in prog.exits.items():
             have = found.setdefault(key, [])
-            have += [s for s in states if s[0] not in [x[0] for x in have]]
+            have += [s for s in states if (s[0], s[3]) not in [(x[0], x[3]) for x in have]]
+        unarmed += [u for u in prog.unarmed if u[:2] not in [x[:2] for x in unarmed]]
         tag = f" [{label}]" if label else ""
         if k == 0:
             tele_report = prog.teleports
@@ -489,6 +521,11 @@ def run_verify(m, bsp_path, coverage_check=True):
                 print(f"verify ok   darkness{tag}: every way forward is lit (worst {worst[2]} units in the dark, "
                       f"after {len(worst[0])} step{'s' if len(worst[0]) != 1 else ''}, "
                       f"to {worst[1].split(' -> ')[0]})")
+    ok = _check_returns(h, returns, exits) and ok
+    for kind, at, path in unarmed:
+        ok = False
+        print(f"verify FAIL hostiles: the player can meet {kind} at {at} unarmed, after: "
+              f"{' / '.join(path) or '(start)'}")
     from .verify import teleport_landings
     bad, n_tele = teleport_landings(h)
     for name, problem in bad:
@@ -506,12 +543,26 @@ def run_verify(m, bsp_path, coverage_check=True):
         print(f"verify ok   teleport: every trip has a way back ({len(tele_report)} teleporters, all on)")
     if exits:
         campaign.save_exits(m.name, h, found, reached)
-        for (target, lm), states in found.items():
-            names = {g for glob, _, _ in states for g in glob if not g.endswith("_not")}
-            differ = sorted(g for g in names if len({s[0].get(g, 0) for s in states}) > 1)
-            print(f"verify ok   exit to {target} ({lm}): the player can leave in {len(states)} global state(s)"
-                  + (f", differing in {', '.join(differ)}" if differ else ""))
-    ok = _verify_links(m.name, h, reached) and ok
+        for target in sorted({t for t, _ in exits}):
+            usable = [(lm, found.get((t, lm), [])) for t, lm in exits if t == target]
+            if not any(states for _, states in usable):
+                ok = False
+                print(f"verify FAIL exit to {target}: no way to it works in any state of play")
+            for lm, states in usable:
+                if not states:
+                    master = exits[(target, lm)][2]
+                    print(f"verify      exit to {target} ({lm}): not usable on a first visit"
+                          + (f" ({master} is off); it can be on when players come back" if master else ""))
+                    continue
+                names = {g for st in states for g in st[0] if not g.endswith("_not")}
+                differ = sorted(g for g in names if len({s[0].get(g, 0) for s in states}) > 1)
+                gear = sorted({g for st in states for g in st[3]})
+                print(f"verify ok   exit to {target} ({lm}): the player can leave in {len(states)} state(s)"
+                      + (f", differing in {', '.join(differ)}" if differ else "")
+                      + (f"; gear: {', '.join(GEAR_NAMES.get(g, g) for g in gear)}" if gear else ""))
+    if getattr(m, "verify_round_trips", False) and found:
+        ok = _round_trips(h, m, checkpoints, exits, found) and ok
+    ok = _verify_links(m.name, h, reached, pending) and ok
     prog.reached = reached
     items = [e for e in h.entities if e.get("classname", "").startswith(("item_", "weapon_", "ammo_"))
              and e.get("origin")]
@@ -563,14 +614,142 @@ def run_verify(m, bsp_path, coverage_check=True):
     return ok
 
 
-def _verify_links(name, h, reached):
+def _check_returns(h, returns, exits):
+    """Coming back from later maps: [(label, globals, position, gear)]. Can the player
+    leave again from where they land? Returns True unless they're stranded."""
+    from .verify import stranded_check
+    ok = True
+    for label, glob, pos, inv in returns:
+        way = stranded_check(h, pos, glob, inv, exits)
+        if way:
+            print(f"verify ok   coming back from {label}: the player can leave again ({way})")
+        else:
+            ok = False
+            print(f"verify FAIL coming back from {label}: the player is stranded (no way out works from "
+                  f"{tuple(round(c) for c in pos)})")
+    return ok
+
+
+def returns_from(name, later):
+    """After a campaign build: the coming-back checks of map `name` from the maps in
+    `later` (rebuilt after it, so their exits weren't known when it was verified)."""
+    from . import campaign
+    from .sim import GEAR_NAMES
+    from .verify import Hulls
+    h = Hulls(config.BUILD_DIR / name / f"{name}.bsp")
+    exits = {(t, lm): (b[0], b[1], master) for t, lm, b, master in campaign.changelevels(h)}
+    read = {e["globalstate"] for e in h.entities if e.get("globalstate")}
+    seen = {}
+    for prev, lm, glob, pos, inv, kind in campaign.entries(name) or ():
+        if kind == "return" and prev in later:
+            key = (prev, lm, tuple(sorted((g, glob.get(g, 0)) for g in read)), tuple(sorted(inv)))
+            state = [f"{g} {'on' if glob.get(g, 0) == 1 else 'off'}" for g in sorted(read & set(glob))
+                     if not g.endswith("_not")] + [f"with {GEAR_NAMES.get(g, g)}" for g in sorted(inv)]
+            seen.setdefault(key, (f"{prev} via {lm}{': ' + ', '.join(state) if state else ''}", glob, pos, inv))
+    return _check_returns(h, list(seen.values()), exits)
+
+
+def _round_trips(h, m, checkpoints, exits, found):
+    """Leaving by a way out and coming straight back in by one to the same map, the
+    map is as the player left it: play it again from there (m.verify_round_trips, e.g.
+    a course the player may run again). Coming back the way first arrivals come in,
+    every checkpoint must be reachable again; by any other way (e.g. a pad into the
+    course's end, behind a one-way door), the player must be able to leave again.
+    A way back the other map doesn't offer with the states the player left with (its
+    pad's power is off) isn't tried. Returns True unless a round trip fails."""
+    from . import campaign
+    from .sim import GEAR_NAMES, World
+    from .verify import Hulls, progression
+    marks = {e["targetname"]: tuple(float(c) for c in e["origin"].split()) for e in h.entities
+             if e.get("classname") == "info_landmark" and e.get("targetname") and e.get("origin")}
+    portal = {e.get("landmark"): e.get("hlmap_style") == "portal" for e in h.entities
+              if e.get("classname") == "trigger_changelevel"}
+    read = {e["globalstate"] for e in h.entities if e.get("globalstate")}
+    first = {a[1] for a in campaign.entries(m.name) or () if a[5] == "arrive"}   # ways first arrivals come in
+    if not first:
+        print("verify WARN round trips: not checked (how players first arrive here is unknown: verify the maps "
+              "before this one)")
+        return True
+    others = {}                                    # other map -> (its entities, its ways back here)
+    ok, shown = True, False
+    for (target, out_lm), states in found.items():
+        if target not in others:
+            bsp = config.BUILD_DIR / target / f"{target}.bsp"
+            ho = Hulls(bsp) if bsp.exists() else None
+            others[target] = (ho.entities if ho else None,
+                              {lm: master for t, lm, _, master in campaign.changelevels(ho) if t == m.name}
+                              if ho else {})
+        other_ents, back = others[target]
+        done = set()
+        for st in states:
+            glob, inv, world = st[0], st[3], st[4]
+            key = (tuple(sorted((g, glob.get(g, 0)) for g in read)), tuple(inv))
+            if key in done:
+                continue
+            done.add(key)
+            there = World(other_ents, glob) if other_ents is not None else None
+            restored = False               # back in some way with everything reachable again
+            for (t2, in_lm), ex in exits.items():
+                if t2 != target or in_lm not in marks:
+                    continue
+                if there is not None and (in_lm not in back or not there.master_ok(back[in_lm])):
+                    continue               # the other map has no way back by in_lm in this state
+                lx, ly, lz = marks[in_lm]
+                if portal.get(in_lm):          # arrivals land as far in front of the pad as the landmark is
+                    cx, cy = (ex[0][0] + ex[1][0]) / 2, (ex[0][1] + ex[1][1]) / 2
+                    arrive = (2 * lx - cx, 2 * ly - cy, lz + 8)
+                else:
+                    arrive = (lx, ly, lz + 8)
+                prog = progression(h, checkpoints, start=arrive, exits=exits, start_world=world,
+                                   watch=campaign.carried(m.name), come_back=list(exits))
+                gear = ", ".join(GEAR_NAMES.get(g, g) for g in inv) or "no gear"
+                what = f"out by {out_lm}, back by {in_lm} ({gear})"
+                problems = []
+                full = in_lm in first
+                if prog.missing and full:
+                    problems.append(f"{len(prog.missing)} places out of reach: "
+                                    + ", ".join(n for n, _ in prog.missing[:6]))
+                if prog.softlocks:
+                    problems.append(f"{len(prog.softlocks)} lines of play lock the player out")
+                if prog.unarmed:
+                    problems.append("meets " + ", ".join(f"{k} at {at}" for k, at, _ in prog.unarmed[:3]) + " unarmed")
+                if not any(prog.exits.values()):
+                    problems.append("no way out works")
+                if problems:
+                    ok = False
+                    print(f"verify FAIL round trip {what}: " + "; ".join(problems))
+                elif full:
+                    print(f"verify ok   round trip {what}: all {len(checkpoints)} checkpoints again, "
+                          f"{prog.states} states of play")
+                    if not shown:
+                        for i, line in enumerate(prog.log, 1):
+                            print(f"verify      round trip {i}. {line}")
+                        shown = True
+                else:
+                    ways = sorted(f"{t} ({lm})" for (t, lm), s in prog.exits.items() if s)
+                    print(f"verify ok   round trip {what}: the player can leave again (by {', '.join(ways)}); "
+                          f"{len(checkpoints) - len(prog.missing)} of {len(checkpoints)} checkpoints in reach")
+                restored = restored or (full and not problems)
+            if not restored:
+                ok = False
+                print(f"verify FAIL round trip out by {out_lm} ({', '.join(GEAR_NAMES.get(g, g) for g in inv) or 'no gear'}"
+                      f"): no way back in brings the whole map back (the player may be locked out of it)")
+    return ok
+
+
+def _verify_links(name, h, reached, pending=()):
     """Level changes out of `name` and into it from other compiled maps (see
-    campaign.check_transition). Returns True unless a transition is broken."""
+    campaign.check_transition), except maps in `pending` (rebuilt next: they check
+    them). Returns True unless a transition is broken."""
     from . import campaign
     from .verify import Hulls
     ok = True
-    out = {t for t, _, _ in campaign.changelevels(h)}
+    out = {t for t, _, _, _ in campaign.changelevels(h)}
     for other in sorted((out | set(campaign.order())) - {name}):
+        if other in pending:
+            if other in out:
+                print(f"verify      campaign: {other} is rebuilt next; the way from {name} is checked then")
+            continue
         bsp = config.BUILD_DIR / other / f"{other}.bsp"
         if not bsp.exists():
             if other in out:
@@ -578,7 +757,7 @@ def _verify_links(name, h, reached):
             continue
         ho = Hulls(bsp)
         pairs = [(h, ho, name, other, reached)] if other in out else []
-        if any(t == name for t, _, _ in campaign.changelevels(ho)):
+        if any(t == name for t, _, _, _ in campaign.changelevels(ho)):
             touch = campaign.touched_from(other, name)
             if touch is None:
                 print(f"verify WARN campaign: verify {other} to check its way into {name}")

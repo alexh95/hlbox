@@ -502,14 +502,16 @@ def screen(lo, hi, facing, slide_tex, name=None, frame="FIFTIES_DSK5B"):
 
 
 def pickup(classname, pos, fires=(), message=None, sound="buttons/bell1.wav", name=None, facing=0,
-           hide=(), invisible=False):
+           hide=(), invisible=False, **extra):
     """An item (e.g. item_security = access card) that, when picked up, fires every
     targetname in `fires` (e.g. a lock's '<lock>_key'), shows `message`, plays `sound`
     and removes the entities named in `hide` (e.g. a visible prop standing in for the
     item). invisible=True hides the item's own model (use with a stand-in prop).
-    Items drop onto the floor/table below `pos` when the map starts."""
+    Items drop onto the floor/table below `pos` when the map starts. extra: the
+    item's own keys (item_suit spawnflags 1: the short logon).
+    Gear (item_suit, item_longjump, weapon_*) says its own words: pass sound=None."""
     name = name or f"{classname}_{round(pos[0])}_{round(pos[1])}"
-    kv = {"target": name}
+    kv = {"target": name, **extra}
     if invisible:
         kv.update(rendermode=2, renderamt=0)
     ents = [point(classname, pos, facing, **kv)]
@@ -546,6 +548,14 @@ def sound_effect(name, pos, wav, volume=10, everywhere=False, radius="medium", s
     flags = 16 | (0 if stoppable else 32) | (1 if everywhere else {"small": 2, "medium": 4, "large": 8}[radius])
     return Entity("ambient_generic", targetname=name, origin=tuple(pos), message=wav, health=volume,
                   pitch=100, spawnflags=flags)   # 16 = start silent, 32 = not looped (can't be stopped)
+
+
+def ambient_loop(pos, wav, volume=5, radius="large", everywhere=False):
+    """A sound that plays for ever from `pos` (a looped ambient_generic, on from the
+    start). The WAV must loop by itself (loop points, e.g. ambience/aliencave1.wav,
+    alienwind1.wav, alien_zonerator.wav); build checks."""
+    flags = 1 if everywhere else {"small": 2, "medium": 4, "large": 8}[radius]
+    return Entity("ambient_generic", origin=tuple(pos), message=wav, health=volume, pitch=100, spawnflags=flags)
 
 
 def flat_prop(pos, w, d, texture, name=None, thick=1, sides="FIFTIES_DSK5B"):
@@ -737,6 +747,40 @@ def trigger(mins, maxs, target, once=True, master=None, **kv):
                   brushes=[box(mins, maxs, "AAATRIGGER", comment="trigger")], kv=kv)
 
 
+def gravity_zone(mins, maxs, gravity):
+    """trigger_gravity: a player who touches it gets `gravity` times the normal pull
+    (sv_gravity 800) and keeps it after leaving, until another zone changes it; so
+    give the way back a zone of 1.0. Jumps go higher and further, falls hurt less.
+    verify's walker reads the zone a position is in (1.0 outside them all)."""
+    return Entity("trigger_gravity", brushes=[box(mins, maxs, "AAATRIGGER", comment="gravity zone")],
+                  gravity=gravity)
+
+
+def hurt_zone(mins, maxs, dmg, damagetype=0, name=None):
+    """trigger_hurt: `dmg` per second to whoever is in it. dmg >= 100 (verify.LETHAL)
+    kills outright, e.g. under a void: the walker takes it as death. damagetype:
+    1048576 acid, 256 shock, 8 burn (the HUD shows its icon)."""
+    kv = {"dmg": dmg, "damagetype": damagetype}
+    if name:
+        kv["targetname"] = name
+    return Entity("trigger_hurt", brushes=[box(mins, maxs, "AAATRIGGER", comment="hurt")], kv=kv)
+
+
+def monster_maker(pos, monster, live=1, delay=6, count=-1, name=None, facing=0):
+    """A monstermaker that keeps up to `live` of `monster` about: another comes
+    `delay` seconds after one dies (count -1: for ever), appearing at pos and dropping
+    to the ground (not while the player or a monster stands below). verify's
+    hostile check counts it: the player must not be able to get near it unarmed.
+    Without a name it starts with the map. With one (to switch it off and on), a
+    trigger_auto turns it on: a named monstermaker's own "start on" flag never
+    starts it (HLSDK schedules no first think), and build flags one that has it."""
+    kv = dict(monstertype=monster, monstercount=count, m_imaxlivechildren=live, delay=delay)
+    if not name:
+        return point("monstermaker", pos, facing, **kv)
+    return [point("monstermaker", pos, facing, targetname=name, **kv),
+            point("trigger_auto", pos, target=name, triggerstate=1)]    # on (ignored when already on)
+
+
 # ---------------------------------------------------------------- outdoors
 
 def _textured(ent, textures):
@@ -892,3 +936,115 @@ def bay_lines(x0, x1, y0, y1, bay=96, width=4, texture="PAINTW", z=0):
         x += bay
     return Entity("func_illusionary", brushes=lines)
 
+
+
+def floating_island(center, radius, top, depth=None, seed=0, top_tex="-0XENO_2WA", side_tex="XENO_2W1B", sides=10):
+    """A floating Xen island: a flat, walkable top (a rough `sides`-gon about `radius`
+    across, at height `top`) over a lumpy cone of rock `depth` deep, as one convex brush
+    (func_detail). Points sit on an 8-unit grid (no sliver faces). The top's edge wanders
+    between 0.9 and 1.05 of the radius: plan gaps on 0.9, verify checks the jumps."""
+    import random
+    from .geometry import hull
+    rnd = random.Random(seed)
+    cx, cy = center
+    depth = depth or radius * 1.6
+    snap = lambda v: 8 * round(v / 8)
+    pts = []
+    for k in range(sides):
+        a = 2 * math.pi * k / sides + rnd.uniform(-0.12, 0.12)
+        r = radius * rnd.uniform(0.9, 1.05)
+        pts.append((snap(cx + r * math.cos(a)), snap(cy + r * math.sin(a)), top))
+    for k in range(5):
+        a = 2 * math.pi * k / 5 + rnd.uniform(-0.3, 0.3)
+        r = radius * rnd.uniform(0.55, 0.7)
+        pts.append((snap(cx + r * math.cos(a)), snap(cy + r * math.sin(a)), snap(top - depth * rnd.uniform(0.35, 0.5))))
+    pts.append((snap(cx + rnd.uniform(-0.2, 0.2) * radius), snap(cy + rnd.uniform(-0.2, 0.2) * radius), snap(top - depth)))
+    return detail(hull(pts, {"top": top_tex, "default": side_tex}, comment="floating island"))
+
+
+def xen_rock(center, size, seed=0):
+    """A floating Xen rock to look at (not a place to stand on: see floating_island):
+    a lumpy convex hull with a flat top, and crystals on it."""
+    import random
+    from .geometry import hull
+    rnd = random.Random(seed)
+    cx, cy, cz = center
+    snap = lambda v: 8 * round(v / 8)                 # a coarse grid: no sliver faces
+    pts = []
+    for k in range(9):                                 # a flat, lumpy-edged top (crystals sit on it)
+        a = 2 * math.pi * k / 9 + rnd.uniform(-0.15, 0.15)
+        r = size * rnd.uniform(0.7, 1.0)
+        pts.append((snap(cx + r * math.cos(a)), snap(cy + r * math.sin(a)), snap(cz)))
+    for k in range(3):
+        a = 2 * math.pi * k / 3 + rnd.uniform(-0.3, 0.3)
+        r = size * rnd.uniform(0.2, 0.4)
+        pts.append((snap(cx + r * math.cos(a)), snap(cy + r * math.sin(a)), snap(cz - size * rnd.uniform(0.8, 1.1))))
+    rock = detail(hull(pts, {"top": "-0XENO_2WA", "default": "-0XENO_2W1"}, comment="xen rock"))
+    n = 2 if size > 100 else 1                         # apart from each other (touching ones lose faces)
+    a0 = rnd.uniform(0, 2 * math.pi)
+    crystals = [crystal((round(cx + math.cos(a0 + j * math.pi) * size * 0.3 * (n > 1)),
+                         round(cy + math.sin(a0 + j * math.pi) * size * 0.3 * (n > 1)), snap(cz) + 8),
+                        height=round(size * rnd.uniform(0.4, 0.7)), radius=round(size * 0.08),
+                        lean=(rnd.randint(-8, 8), rnd.randint(-8, 8)), seed=seed * 7 + j)
+                for j in range(n)]
+    return [rock] + crystals
+
+
+XEN_ROCK = {"top": "-0XENO_2WA", "default": "-0XENO_2W1"}
+
+
+def rock_wall(axis, back, front, u_cuts, z_cuts, holes=(), jitter=24, seed=0, tex=XEN_ROCK):
+    """A rough rock face in front of a wall (a room's sky wall, say): a grid of convex
+    chunks, flat against the wall at `back` (an x for axis "x", a y for axis "y"), their
+    faces at `front`, give or take `jitter` (multiples of 8), drawn back toward the wall
+    round the edge. u_cuts, z_cuts: the grid lines along the wall and up it. holes:
+    [(u0, u1, z0, z1)], openings through it (a doorway's passage, a window), each on
+    grid lines: the cells inside are left out and the nodes round them stay exactly at
+    `front`, so each passage is a clean box. Returns a func_detail."""
+    import random
+    from .geometry import hull
+    rnd = random.Random(seed)
+    sign = 1 if front > back else -1
+    inside = lambda u, z: any(h[0] <= u <= h[1] and h[2] <= z <= h[3] for h in holes)
+    face = {}
+    for i, u in enumerate(u_cuts):
+        for j, z in enumerate(z_cuts):
+            if i in (0, len(u_cuts) - 1) or j in (0, len(z_cuts) - 1):
+                face[(u, z)] = back + sign * 16                  # the rim: rounded off
+            elif inside(u, z):
+                face[(u, z)] = front
+            else:
+                face[(u, z)] = front + 8 * round(rnd.uniform(-jitter, jitter) / 8)
+    pt = (lambda a, u, z: (a, u, z)) if axis == "x" else (lambda a, u, z: (u, a, z))
+    brushes = []
+    for i in range(len(u_cuts) - 1):
+        for j in range(len(z_cuts) - 1):
+            u0, u1, z0, z1 = u_cuts[i], u_cuts[i + 1], z_cuts[j], z_cuts[j + 1]
+            if any(h[0] <= u0 and u1 <= h[1] and h[2] <= z0 and z1 <= h[3] for h in holes):
+                continue
+            pts = [pt(back, u, z) for u in (u0, u1) for z in (z0, z1)]
+            pts += [pt(face[(u, z)], u, z) for u in (u0, u1) for z in (z0, z1)]
+            brushes.append(hull(pts, tex, comment="rock wall"))
+    return detail(*brushes)
+
+
+def rock_shelf(axis, back, front, u0, u1, top, depth=300, jitter=16, seed=0, tex=XEN_ROCK):
+    """A flat-topped shelf of rock sticking out of a rock face: its top runs from `back`
+    (inside the face) to its edge at `front` (x for axis "x", y for "y"), u0..u1 across,
+    at height `top`, and narrows underneath to a point `depth` below. The edge wanders
+    by up to `jitter`; its sides don't (that's where jumps along a row of ledges are
+    measured). A ledge on a cliff, the landing outside a door. Returns a func_detail."""
+    import random
+    from .geometry import hull
+    rnd = random.Random(seed)
+    pt = (lambda a, u, z: (a, u, z)) if axis == "x" else (lambda a, u, z: (u, a, z))
+    w = u1 - u0
+    n = max(2, int(abs(w) // 96))
+    pts = [pt(back, u0, top), pt(back, u1, top)]
+    for k in range(n + 1):
+        j = 0 if k in (0, n) else 8 * round(rnd.uniform(-jitter, jitter) / 8)
+        pts.append(pt(front + j, round(u0 + w * k / n), top))
+    pts += [pt(back, round(u0 + w * 0.15), round(top - depth * 0.6)),
+            pt(back, round(u1 - w * 0.15), round(top - depth * 0.6)),
+            pt(round(back + (front - back) * 0.35), round((u0 + u1) / 2), round(top - depth))]
+    return detail(hull(pts, tex, comment="rock shelf"))

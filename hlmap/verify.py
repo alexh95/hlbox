@@ -391,6 +391,17 @@ STEP_HEIGHT = 18      # sv_stepsize
 JUMP_HEIGHT = 45      # standing jump
 MAX_FALL = 600        # ~ where falling damage becomes lethal
 HALF = (16, 16, 36)   # standing player half extents (hull 1)
+# jumping (pm_shared.c): sv_gravity 800; a jump leaves the ground at the speed that
+# rises 45 units, a long jump (the module, crouch + jump while moving) at 560 forward
+# and the speed that rises 56. A player's own gravity (trigger_gravity) scales the
+# pull, not the take-off, so in 0.5 gravity a jump rises twice as high.
+GRAVITY = 800.0
+JUMP_SPEED = (2 * GRAVITY * 45.0) ** 0.5
+RUN_JUMP = 280        # forward speed credited to a running jump (the game allows 320)
+LONG_JUMP = (510, (2 * GRAVITY * 56.0) ** 0.5)   # forward (the game gives 560), up
+LETHAL = 100          # trigger_hurt damage that kills outright (a fall into the void)
+DIRS8 = [(1, 0), (0.7071, 0.7071), (0, 1), (-0.7071, 0.7071), (-1, 0), (-0.7071, -0.7071), (0, -1),
+         (0.7071, -0.7071)]
 
 
 SOLID_ENTITIES = ("func_wall", "func_breakable", "func_button", "func_rot_button")
@@ -412,6 +423,23 @@ def solid_entities(hulls):
             o = tuple(float(c) for c in e["origin"].split()) if e.get("origin") else (0.0, 0.0, 0.0)
             out.append((hulls.model_head(int(e["model"][1:]), 1), o, _grow(*_placed(models, e))))
     return out
+
+
+def gravity_zones(hulls):
+    """trigger_gravity volumes: [(grown box, gravity multiplier)]. The game sets the
+    player's gravity when they touch one, and it stays until another changes it; the
+    walker reads the zone a position is in (1.0 outside them all)."""
+    models = hulls.models()
+    return [(_grow(*_placed(models, e)), float(e.get("gravity") or 1) or 1.0) for e in hulls.entities
+            if e.get("classname") == "trigger_gravity" and e.get("model", "").startswith("*")]
+
+
+def lethal_volumes(hulls):
+    """trigger_hurts that kill (damage >= LETHAL, on from the start): grown boxes."""
+    models = hulls.models()
+    return [_grow(*_placed(models, e)) for e in hulls.entities
+            if e.get("classname") == "trigger_hurt" and e.get("model", "").startswith("*")
+            and float(e.get("dmg") or 0) >= LETHAL and not int(e.get("spawnflags") or 0) & 2]
 
 
 def teleports(hulls):
@@ -436,11 +464,20 @@ class Walker:
     up to MAX_FALL, ladders (func_ladder volumes), doors (locked doors block until their
     lock opens), solid brush entities (glass, func_walls: their own collision hulls)
     and teleporters (walking into an active one moves the player to its landing).
-    Positions are standing-player origins on an 8-unit grid."""
+    With jumps=True, also running jumps across gaps and down, and long jumps while
+    `long_jump` is set, flown as arcs; gravity zones (trigger_gravity) scale jumps and
+    safe falls, and lethal trigger_hurts are death (nothing lands in them).
+    Positions are standing-player origins on a grid of `step` units (x, y multiples)."""
 
-    def __init__(self, hulls, ladders=(), step=8, solids=()):
+    def __init__(self, hulls, ladders=(), step=8, solids=(), zones=(), lethal=(), jumps=False):
         self.h = hulls
         self.step = step
+        self.zones = list(zones)
+        self.lethal = list(lethal)
+        self.jumps = jumps
+        self.long_jump = False
+        self._arcs = {}              # (p, dir, speed) -> (landing, box the flight passed through)
+        self._arcs_blocked = {}      # ...flown again with doors in the way
         self.ladders = [(tuple(lo[k] - HALF[k] for k in range(3)), tuple(hi[k] + HALF[k] for k in range(3)))
                         for lo, hi in ladders]
         self.blockers = []
@@ -466,6 +503,16 @@ class Walker:
             return True
         return any(all(lo[k] < p[k] < hi[k] for k in range(3)) for lo, hi in self.blockers)
 
+    def gravity(self, p):
+        g = 1.0
+        for (lo, hi), zg in self.zones:
+            if all(lo[k] <= p[k] <= hi[k] for k in range(3)):
+                g = zg
+        return g
+
+    def deadly(self, p):
+        return any(all(lo[k] <= p[k] <= hi[k] for k in range(3)) for lo, hi in self.lethal)
+
     def teleport_at(self, p):
         """Where an active teleporter the player at p touches sends them, or None."""
         for (lo, hi), land in self.teleports:
@@ -476,18 +523,21 @@ class Walker:
     def _on_ladder(self, p):
         return any(all(lo[k] <= p[k] <= hi[k] for k in range(3)) for lo, hi in self.ladders)
 
-    def _drop(self, x, y, z):
+    def _drop(self, x, y, z, fell=0.0):
         """Fall from (x, y, z) to the ground (or onto a ladder); None if blocked, lethal
-        or bottomless."""
+        or bottomless. fell: how far the player was already falling (from a jump)."""
         start = z
         if self._solid((x, y, z)):
             return None
+        limit = MAX_FALL / self.gravity((x, y, z)) - fell
         while True:
+            if self.lethal and self.deadly((x, y, z)):
+                return None
             if z != start and self._on_ladder((x, y, z)):
                 return (x, y, z)
             if self._solid((x, y, z - 1)):
                 return (x, y, z)
-            if start - z > MAX_FALL:
+            if start - z > limit:
                 return None
             # hull-1 solids are >= 72 thick vertically, so 8-unit strides can't skip one
             z -= 8 if not (self._solid((x, y, z - 8)) or self._on_ladder((x, y, z - 8))) else 1
@@ -499,10 +549,11 @@ class Walker:
         x, y, z = p
         on_ladder = self._on_ladder(p)
         out = []
+        jump = JUMP_HEIGHT / self.gravity(p) if self.zones else JUMP_HEIGHT
         for dx, dy in ((self.step, 0), (-self.step, 0), (0, self.step), (0, -self.step)):
             nx, ny = x + dx, y + dy
             dest = None
-            for lift in (STEP_HEIGHT, 0, JUMP_HEIGHT):
+            for lift in (STEP_HEIGHT, 0, jump):
                 if not self._solid((x, y, z + lift)) and not self._solid((nx, ny, z + lift)):
                     dest = self._drop(nx, ny, z + lift)
                     if dest:
@@ -514,14 +565,122 @@ class Walker:
                 q = (x, y, z + dz)
                 if not self._solid(q):
                     out.append(q if self._on_ladder(q) else (self._drop(x, y, z + dz) or q))
+        if self.jumps and not on_ladder and self._solid((x, y, z - 1)):
+            out += self._jump_moves(p)
         return out
 
-    def settle(self, p):
-        x, y, z = (round(c) for c in p)
-        for up in range(64):
-            if not self._solid((x, y, z + up)):
-                return self._drop(x, y, z + up) or (x, y, z + up)
-        return (x, y, z)
+    # ------------------------------------------------------------------ jumping
+    def _jump_moves(self, p):
+        """Landings of running jumps (and long jumps) from p off an edge: in each of 8
+        directions where the ground drops away in front of the player."""
+        out = []
+        x, y, z = p
+        for d in DIRS8:
+            ahead = (x + d[0] * 12, y + d[1] * 12, z)
+            if self._solid(ahead):
+                continue                       # a wall: stepping and jumping up cover it
+            below = self._drop(*ahead)
+            if below is not None and z - below[2] <= STEP_HEIGHT:
+                continue                       # flat ground ahead: walking covers it
+            kinds = []
+            behind = (x - d[0] * 32, y - d[1] * 32, z)
+            if not self._solid(behind) and self._solid((behind[0], behind[1], z - STEP_HEIGHT - 1)):
+                kinds.append((RUN_JUMP, JUMP_SPEED))          # room for a run-up
+            if self.long_jump:
+                kinds.append(LONG_JUMP)
+            for vh, vz in kinds:
+                spot = self._jump(p, d, vh, vz)
+                if spot:
+                    out.append(spot)
+        return out
+
+    def _jump(self, p, d, vh, vz):
+        """A jump's landing, flown once without doors; flown again only for the doors
+        in its way (a jump on the far side of the map doesn't care about the airlock)."""
+        key = (p, d, vh)
+        if key not in self._arcs:
+            saved, self.blockers = self.blockers, []
+            try:
+                self._arcs[key] = (self._arc(p, d, vh, vz), self._flown)
+            finally:
+                self.blockers = saved
+        spot, (lo, hi) = self._arcs[key]
+        if not any(all(blo[k] < hi[k] and bhi[k] > lo[k] for k in range(3)) for blo, bhi in self.blockers):
+            return spot
+        key = (p, d, vh, self._token)
+        if key not in self._arcs_blocked:
+            self._arcs_blocked[key] = self._arc(p, d, vh, vz)
+        return self._arcs_blocked[key]
+
+    _token = 0
+
+    def configure(self, blockers=None, teleports=None, long_jump=None):
+        """Set what changes between states of play (arcs are re-flown when it does)."""
+        if blockers is not None:
+            self.blockers = blockers
+        if teleports is not None:
+            self.teleports = teleports
+        if long_jump is not None:
+            self.long_jump = long_jump
+        self._token = tuple(self.blockers)
+
+    def _arc(self, p, d, vh, vz):
+        """Fly a jump from p in direction d: returns the standing position it lands on,
+        or None (lands nowhere, lands deadly, falls too far)."""
+        g = self.gravity(p)
+        a = GRAVITY * g
+        dt = min(0.02, 6.0 / vh)
+        x, y, z = p
+        top = z
+        lo, hi = list(p), list(p)
+        # the box the flight passes through (and the landing search around its end)
+        self._flown = (tuple(c - 24 for c in p), tuple(c + 24 for c in p))
+        for _ in range(int(3.0 / dt)):
+            nz = z + vz * dt - 0.5 * a * dt * dt
+            vz -= a * dt
+            if self._solid((x, y, nz)):
+                if vz < 0:                     # came down on something
+                    break
+                vz, nz = 0.0, z                # head hit a ceiling
+            nx, ny = x + d[0] * vh * dt, y + d[1] * vh * dt
+            if vh and self._solid((nx, ny, nz)):
+                vh, nx, ny = 0.0, x, y         # hit a wall: drop down along it
+            x, y, z = nx, ny, nz
+            top = max(top, z)
+            for k, c in enumerate((x, y, z)):
+                lo[k], hi[k] = min(lo[k], c), max(hi[k], c)
+            self._flown = (tuple(c - 24 for c in lo[:2]) + (lo[2] - MAX_FALL,), tuple(c + 24 for c in hi))
+            if self.lethal and self.deadly((x, y, z)):
+                return None
+            if top - z > MAX_FALL / g:
+                return None
+        else:
+            return None
+        spot = self.settle((x, y, z), max_up=4)
+        if spot is None or self._solid(spot) or (self.lethal and self.deadly(spot)):
+            return None
+        if top - spot[2] > MAX_FALL / g or spot == p:
+            return None
+        return spot
+
+    def settle(self, p, max_up=64):
+        """The standing position at p: on the grid (x, y multiples of `step`, the
+        nearest clear one), dropped onto the ground. None if there is none nearby."""
+        z0 = round(p[2])
+        s = self.step
+        bx, by = s * round(p[0] / s), s * round(p[1] / s)
+        cands = sorted(((bx + i * s, by + j * s) for i in (-1, 0, 1) for j in (-1, 0, 1)),
+                       key=lambda c: (c[0] - p[0]) ** 2 + (c[1] - p[1]) ** 2)
+        for x, y in cands:
+            for up in range(max_up):
+                if not self._solid((x, y, z0 + up)):
+                    got = self._drop(x, y, z0 + up)
+                    if got is not None:
+                        return got
+                    break
+        if max_up < 64:
+            return None
+        return (bx, by, z0)
 
     def flood(self, seeds, limit=400000, known=(), goal=None):
         """Every position reachable from `seeds`. known: positions already known to be
@@ -616,11 +775,15 @@ def pickup_approaches(hulls, comp, item, near=72, far=104, clear=40):
         d = math.hypot(p[0] - item[0], p[1] - item[1])
         if not near <= d <= far or not -48 <= p[2] - HALF[2] - item[2] <= 2:   # standing below/level
             continue
-        sector = round(math.degrees(math.atan2(p[1] - item[1], p[0] - item[0])) / 45) % 8
-        best.setdefault(sector, []).append((abs(d - (near + far) / 2), p))
+        ang = math.degrees(math.atan2(p[1] - item[1], p[0] - item[0]))
+        sector = round(ang / 45) % 8
+        # straight down the sector's middle first (positions are on a grid), then the
+        # distance nearest the middle of near..far
+        off = abs(d * math.sin(math.radians(ang - sector * 45)))
+        best.setdefault(sector, []).append((off // 8, abs(d - (near + far) / 2), p))
     out = []
     for sector, cands in sorted(best.items()):
-        for _, p in sorted(cands)[:12]:
+        for *_, p in sorted(cands)[:12]:
             near_item = lambda q: math.hypot(q[0] - item[0], q[1] - item[1]) <= clear
             ok, _, _ = straight_walk(hulls, p, item, near_item)
             if not ok:
@@ -718,6 +881,7 @@ class Progress:
         self.warnings = []
         self.exits = {}          # exit name -> [(globals, position, path)]
         self.teleports = []      # (teleporter, can the player get back, checkpoints lost if not)
+        self.unarmed = []        # (monster, position, path): met without a weapon
         self.states = 0
         self.truncated = False
 
@@ -737,18 +901,34 @@ def _describe(ents, i, models):
     return f"{verb} {c} at {at} -> {e.get('target')}"
 
 
+HOSTILE = {"monster_headcrab", "monster_zombie", "monster_houndeye", "monster_bullchicken", "monster_alien_slave",
+           "monster_alien_grunt", "monster_human_grunt", "monster_human_assassin", "monster_snark",
+           "monster_babycrab", "monster_alien_controller", "monster_gargantua"}
+
+
 def progression(hulls, checkpoints, radius=24, light=None, max_states=300, globals=None, start=None,
-                exits=None, watch=()):
+                exits=None, watch=(), inventory=(), jumps=None, start_world=None, come_back=()):
     """Play the map's logic on foot. From the player start, every progress-relevant
     thing the player can reach (pickups, buttons, trigger volumes) is tried in every
     order, with its effects simulated through the entity logic (hlmap/sim.py: relays,
     multi_managers, locks, global state, gates...). Doors block while locked.
 
-    globals, start: arriving from another map, the global states carried over and
-    where the player lands (a standing origin) instead of the player start.
-    exits: {name: (mins, maxs)} volumes that leave the map (trigger_changelevel).
+    globals, start, inventory: arriving from another map, the global states carried
+    over, where the player lands (a standing origin) instead of the player start, and
+    the gear and weapons they bring (classnames).
+    exits: {name: (mins, maxs[, master])} volumes that leave the map
+    (trigger_changelevel); with a master, only while it is on (a pad's power).
+    start_world: a World the map was left in (from `exits`): coming back into it as
+    it was, rather than as on a fresh load (with `start`, where the player lands).
+    jumps: fly running jumps and long jumps (default: when the map has a long jump
+    module or gravity zones). Gear (the HEV suit, the long jump module, weapons) is
+    picked up like keys and is part of the state of play.
     watch: global states worth telling apart even if no door here depends on them
     (the ones the next map reads), so every way to set them is explored.
+    come_back: exits (names in `exits`) the player can leave by and come back in to
+    play the map again (another map leads back): a state from which one of them can be
+    used isn't a lockout, even with areas closed behind the player (a course that
+    ends behind a one-way door). Check the coming back with round trips.
 
     Returns a Progress:
       missing    checkpoints no order of play reaches
@@ -758,18 +938,30 @@ def progression(hulls, checkpoints, radius=24, light=None, max_states=300, globa
       darkness   (with `light`, a FloorLight) for each state along the way: how much
                  darkness the best way to the next objective crosses. There is no
                  flashlight without the HEV suit, so dark stretches are real.
-      exits      {name: [(globals, position, path)]}: every distinct global state the
-                 player can leave through each exit with, where they touch it, and a
-                 line of play that gets there
+      exits      {name: [(globals, position, path, inventory, world)]}: every distinct
+                 global state and inventory the player can leave through each exit
+                 with, where they touch it, a line of play that gets there, and the
+                 map's state then (a World)
+      unarmed    [(monster, position, path)]: hostiles the player can meet unarmed
     """
     from .sim import BUTTONS, DOORS, ITEMS, World
     res = Progress()
     ents = hulls.entities
     models = hulls.models()
-    world0 = World(ents, globals).start()
+    if start_world is not None:
+        world0 = start_world.copy()
+        if globals:
+            world0.globals.update(globals)
+        world0.start()
+    else:
+        world0 = World(ents, globals, inventory).start()
     res.warnings += world0.warnings
     ladders = [_placed(models, e) for e in ents if e.get("classname") == "func_ladder"]
-    w = Walker(hulls, ladders, solids=solid_entities(hulls))
+    zones = gravity_zones(hulls)
+    if jumps is None:
+        jumps = bool(zones) or any(e.get("classname") == "item_longjump" for e in ents)
+    w = Walker(hulls, ladders, solids=solid_entities(hulls), zones=zones, lethal=lethal_volumes(hulls),
+               jumps=jumps)
     tele = [(i, box, w.settle(land)) for i, box, land, _ in teleports(hulls) if land is not None]
     doors = []
     for i, e in enumerate(ents):
@@ -777,10 +969,13 @@ def progression(hulls, checkpoints, radius=24, light=None, max_states=300, globa
             lo, hi = _placed(models, e)
             doors.append((i, (tuple(lo[k] - HALF[k] for k in range(3)), tuple(hi[k] + HALF[k] for k in range(3)))))
     actions = []    # (entity, method, reach test)
+    gear = set()
     for i, e in enumerate(ents):
         cls = e.get("classname", "")
-        if not e.get("target"):
+        if not e.get("target") and not (cls in ("item_suit", "item_longjump") or cls.startswith("weapon_")):
             continue
+        if not e.get("target"):
+            gear.add(i)                  # gear: picked up like a key, whether or not it fires anything
         if cls.startswith(ITEMS) and e.get("origin"):
             o = tuple(float(c) for c in e["origin"].split())
             actions.append((i, "pickup", lambda p, o=o: abs(p[0] - o[0]) <= 32 and abs(p[1] - o[1]) <= 32
@@ -794,28 +989,29 @@ def progression(hulls, checkpoints, radius=24, light=None, max_states=300, globa
             actions.append((i, "touch", lambda p, lo=lo, hi=hi:
                             all(lo[k] - HALF[k] < p[k] < hi[k] + HALF[k] for k in range(3))))
     rel = world0.relevance([i for i, _ in doors] + [i for i, _, _ in tele], watch)
-    actions = [a for a in actions if a[0] in rel[0]]
+    actions = [a for a in actions if a[0] in rel[0] or a[0] in gear]
 
     cache = {}
 
-    def configure(blocked, enabled):
-        w.blockers = [b for i, b in doors if i in blocked]
-        w.teleports = [(box, land) for i, box, land in tele if i in enabled]
+    def configure(blocked, enabled, lj=False):
+        w.configure(blockers=[b for i, b in doors if i in blocked],
+                    teleports=[(box, land) for i, box, land in tele if i in enabled], long_jump=lj)
 
     def flood(world, pos):
         blocked = tuple(i for i, _ in doors if not world.door_passable(i))
         enabled = tuple(i for i, _, _ in tele if world.teleport_enabled(i))
-        cfg = (blocked, enabled)
+        lj = jumps and world.long_jump
+        cfg = (blocked, enabled, lj)
         for comp in cache.get(cfg, ()):
             if pos in comp:
                 return comp, cfg
-        configure(blocked, enabled)
+        configure(blocked, enabled, lj)
         # a door (or more) opened since an earlier flood that reached pos: everything it
         # reached is still reachable, so only grow it from the doors that opened (with
         # the same teleporters on: one that switches on also stops walks across it)
         base = None
-        for (b_other, e_other), comps in cache.items():
-            if e_other == enabled and set(blocked) <= set(b_other):
+        for (b_other, e_other, lj_other), comps in cache.items():
+            if e_other == enabled and lj_other == lj and set(blocked) <= set(b_other):
                 for comp in comps:
                     if pos in comp and (base is None or len(comp) > len(base[1])):
                         base = (b_other, comp)
@@ -843,7 +1039,7 @@ def progression(hulls, checkpoints, radius=24, light=None, max_states=300, globa
     queue = deque([(world0, pos0, [], None)])
     while queue:
         world, pos, path, via = queue.popleft()
-        comp, (blocked, enabled) = flood(world, pos)
+        comp, (blocked, enabled, lj) = flood(world, pos)
         key = (world.key(rel), min(comp))
         if via:
             nodes[via[0]]["children"].append((via[1], key))
@@ -852,8 +1048,8 @@ def progression(hulls, checkpoints, radius=24, light=None, max_states=300, globa
         if len(nodes) >= max_states:
             res.truncated = True
             continue
-        node = {"world": world, "comp": comp, "blocked": blocked, "enabled": enabled, "entry": pos, "path": path,
-                "children": []}
+        node = {"world": world, "comp": comp, "blocked": blocked, "enabled": enabled, "lj": lj, "entry": pos,
+                "path": path, "children": [], "parent": via[0] if via else None}
         nodes[key] = node
         order.append(key)
         base = world.key(rel)
@@ -906,11 +1102,27 @@ def progression(hulls, checkpoints, radius=24, light=None, max_states=300, globa
     opened = {d for k in order for d, _ in doors if d not in nodes[k]["blocked"]}
     res.never = sorted({lock_name(d) for d, _ in doors if d not in opened})
 
+    # states from which the player can leave and come back (come_back), and what a
+    # line of play has seen on the way to each state
+    back = set()
+    for name in come_back:
+        ex = (exits or {}).get(name)
+        if ex is None:
+            continue
+        master = ex[2] if len(ex) > 2 else None
+        back |= {k for k in order if nodes[k]["world"].master_ok(master)
+                 and any(touches_box(p, ex[0], ex[1]) for p in nodes[k]["comp"])}
+    seen_on_way = {}
+    for k in order:                   # parents come first (breadth first)
+        par = nodes[k]["parent"]
+        seen_on_way[k] = cov[k] | (seen_on_way[par] if par in seen_on_way else frozenset())
     goals = {k for k in order if cov[k] == reachable}
+    if not goals and back:            # a one-way course: all of it on the way to leaving
+        goals = {k for k in order if k in back and seen_on_way[k] == reachable}
     if not goals:
         res.warnings.append("no single state of play reaches every area (areas that close behind you?)")
         goals = {max(order, key=lambda k: len(cov[k]))}
-    finish = set(goals)
+    finish = set(goals) | back
     changed = True
     while changed:
         changed = False
@@ -929,7 +1141,7 @@ def progression(hulls, checkpoints, radius=24, light=None, max_states=300, globa
     if tele:
         best = max(goals, key=lambda k: len(nodes[k]["enabled"]))
         node = nodes[best]
-        configure(node["blocked"], node["enabled"])
+        configure(node["blocked"], node["enabled"], node["lj"])
         for t, (lo, hi), land in tele:
             if t not in node["enabled"]:
                 continue
@@ -940,18 +1152,37 @@ def progression(hulls, checkpoints, radius=24, light=None, max_states=300, globa
             lost = sorted(checkpoints[c][0] for c in cov[best] - covers(seen)) if not back else []
             res.teleports.append((tele_name(t), back, lost))
 
-    for name, (lo, hi) in (exits or {}).items():     # what the player can leave with
+    for name, ex in (exits or {}).items():     # what the player can leave with
+        lo, hi = ex[0], ex[1]
+        master = ex[2] if len(ex) > 2 else None
         out, seen = [], set()
         for k in order:
             node = nodes[k]
-            g = tuple(sorted(node["world"].globals.items()))
-            if g in seen:
+            g = (tuple(sorted(node["world"].globals.items())), tuple(sorted(node["world"].inventory)))
+            if g in seen or not node["world"].master_ok(master):
                 continue
             spot = next((p for p in node["comp"] if touches_box(p, lo, hi)), None)
             if spot is not None:
                 seen.add(g)
-                out.append((dict(g), spot, node["path"]))
+                out.append((dict(g[0]), spot, node["path"], sorted(g[1]), node["world"]))
         res.exits[name] = out
+
+    # hostiles the player can walk up to without a weapon
+    spawns = []
+    for e in ents:
+        cls = e.get("classname", "")
+        kind = e.get("monstertype") if cls == "monstermaker" else cls
+        if kind in HOSTILE and e.get("origin"):
+            spawns.append((kind, tuple(float(c) for c in e["origin"].split())))
+    for kind, o in spawns:
+        for k in order:
+            node = nodes[k]
+            if node["world"].armed:
+                continue
+            if any(abs(p[0] - o[0]) <= 256 and abs(p[1] - o[1]) <= 256 and abs(p[2] - o[2]) <= 160
+                   for p in node["comp"]):
+                res.unarmed.append((kind, tuple(round(c) for c in o), node["path"]))
+                break
 
     if light is not None:
         seeable_cache, walk_cache = {}, {}
@@ -959,6 +1190,8 @@ def progression(hulls, checkpoints, radius=24, light=None, max_states=300, globa
             if k not in finish or k in goals:
                 continue
             node = nodes[k]
+            if "item_suit" in node["world"].inventory:
+                continue                  # the suit has a flashlight
             useful = [(a, c) for a, c in node["children"] if c in finish]
             if not useful:
                 continue
@@ -967,12 +1200,12 @@ def progression(hulls, checkpoints, radius=24, light=None, max_states=300, globa
             if sig not in seeable_cache:
                 seeable_cache[sig] = _seeable(node["comp"], light, levels)
             seeable = seeable_cache[sig]
-            configure(node["blocked"], node["enabled"])
+            configure(node["blocked"], node["enabled"], node["lj"])
             best_cost, best_a = None, None
             for a, _ in useful:
                 # states that differ only in things that don't move doors or lights
                 # (e.g. who has said what) walk the same way
-                wk = (sig, node["blocked"], node["enabled"], node["entry"], a[0])
+                wk = (sig, node["blocked"], node["enabled"], node["lj"], node["entry"], a[0])
                 if wk not in walk_cache:
                     walk_cache[wk] = _dark_walk(w, node["comp"], seeable, node["entry"], a[2])
                 cost = walk_cache[wk]
@@ -1029,7 +1262,7 @@ def teleport_landings(hulls):
     from .campaign import changelevels
     tele = teleports(hulls)
     w = Walker(hulls, solids=solid_entities(hulls))
-    changes = [_grow(*b) for _, _, b in changelevels(hulls)]
+    changes = [_grow(*b) for _, _, b, _ in changelevels(hulls)]
     out = []
     for i, _, land, target in tele:
         name = f"teleporter to {target}"
@@ -1049,3 +1282,37 @@ def teleport_landings(hulls):
         if any(all(lo[k] <= ground[k] <= hi[k] for k in range(3)) for lo, hi in changes):
             out.append((name, f"puts the player in a level change at {spot}"))
     return out, len(tele)
+
+
+def stranded_check(hulls, pos, globals_=None, inventory=(), exits=None):
+    """Coming back into a map from a later one: from `pos`, with the carried global
+    states and gear, can the player reach a way out that works (e.g. the pad they came
+    by)? The rest of the map is taken as on a fresh load, an approximation: the game
+    restores it as it was left. Returns the name of the way out, or None."""
+    from .sim import DOORS, World
+    ents = hulls.entities
+    models = hulls.models()
+    world = World(ents, globals_, inventory).start()
+    zones = gravity_zones(hulls)
+    jumps = bool(zones) or any(e.get("classname") == "item_longjump" for e in ents)
+    w = Walker(hulls, [_placed(models, e) for e in ents if e.get("classname") == "func_ladder"],
+               solids=solid_entities(hulls), zones=zones, lethal=lethal_volumes(hulls), jumps=jumps)
+    blockers = [_grow(*_placed(models, e)) for i, e in enumerate(ents)
+                if e.get("classname") in DOORS and (e.get("master") or e.get("targetname"))
+                and e.get("model", "").startswith("*") and not world.door_passable(i)]
+    tele = [(box, w.settle(land)) for i, box, land, _ in teleports(hulls) if land and world.teleport_enabled(i)]
+    w.configure(blockers=blockers, teleports=tele, long_jump=world.long_jump)
+    ways = [(f"{name[0]} ({name[1]})" if isinstance(name, tuple) else str(name), ex[0], ex[1])
+            for name, ex in (exits or {}).items() if world.master_ok(ex[2] if len(ex) > 2 else None)]
+    if not ways:
+        return None
+    hit = []
+
+    def out(p):
+        for label, lo, hi in ways:
+            if touches_box(p, lo, hi):
+                hit.append(label)
+                return True
+        return False
+    found, _ = w.flood([w.settle(pos)], goal=out)
+    return hit[0] if found else None
