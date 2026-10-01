@@ -39,7 +39,7 @@ def build():
 ```
 python -m hlmap setup                 # download the SDHLT compilers (checksum-verified)
 python -m hlmap build office          # maps/office.py -> compile -> install -> build/office/plan.png
-python -m hlmap build office labs xen # the whole campaign, in order
+python -m hlmap build office labs xen pumps   # the whole campaign, in order
 python -m hlmap build office --shots  # + in-engine screenshots from the map's CAMERAS
 python -m hlmap play office           # launch Half-Life into the map
 python -m hlmap tex FIFTIES --sheet   # search textures, render a contact sheet
@@ -74,14 +74,24 @@ playing it:
   `verify` walks through teleporters and checks each trip has a way back.
 - The third map, `xen`, is a long jump course. A field station hands out the HEV
   suit, the long jump module and a crowbar, and its airlock won't cycle without
-  them; it's one way, sealing behind you. Outside, in 60% gravity, floating islands and cliff ledges run over a void,
-  with two gaps only the long jump clears, headcrabs that keep coming, an acid pool
+  them; it's one way, sealing behind you. Outside, in 60% gravity, floating islands
+  and cliff ledges run over a void, with two gaps only the long jump clears,
+  headcrabs that keep coming, an acid pool
   and an arc between two crystals. At the far end a decontamination airlock keeps
   the crowbar and locks the way back; the field lab behind it has the card that
   powers its pad home (one way, onto the hub's arrivals pad). Come back through the
-  station and you get a new crowbar and can run it again. `verify` flies every running jump and long jump in the low
-  gravity, treats the void as death, tracks the gear, fails if you could meet a
-  headcrab unarmed, and plays the course again after a round trip through the hub.
+  station and you get a new crowbar and can run it again. `verify` flies every
+  running jump and long jump in the low gravity, treats the void as death, tracks
+  the gear, fails if you could meet a headcrab unarmed, and plays the course again
+  after a round trip through the hub.
+- The field lab's card powers the hub's pad to the fourth map, `pumps`: a flooded
+  pump station. Dive into the hall past barnacles and leeches, hold your breath
+  through a flooded corridor with an air pocket half way, drain a settling tank to
+  unlock its hatch, smash a grate past houndeyes, flood a cistern to swim up to its
+  exit, ride a lift to the pump control and restart the pumps. `verify` swims,
+  holds its breath (no way may keep the head under too long), moves the water with
+  the valves, rides the lift and breaks the grate; the build places the monsters'
+  navigation nodes.
 - `hlmap/terrain.py` builds open terrain for outdoor areas under a sky: hills and
   lawns as watertight triangle columns (GoldSrc has no displacements). The office's
   cafeteria opens onto a patio and a staff car park with brush-built cars and painted

@@ -25,7 +25,7 @@ screenshots. There is no GUI editor in the loop.
 ```
 python -m hlmap setup                  # once per checkout: fetch the compilers
 python -m hlmap build <map>            # script -> .map -> compile (normal) -> install -> build/<map>/plan.png
-python -m hlmap build office labs xen  # several maps, in campaign order (each verified with how you arrive)
+python -m hlmap build office labs xen pumps  # several maps, in campaign order (each verified with how you arrive)
 python -m hlmap build <map> --shots    # ...and take in-engine screenshots of CAMERAS
 python -m hlmap build <map> --profile fast|final
 python -m hlmap preview <map> [--view top|x|y] [--cut N]   # cutaway PNG only, no compile
@@ -42,7 +42,8 @@ python -m hlmap playtest <map> --links # walk into every level change: does the 
 python -m hlmap playtest <map> --teleports [--fire transit_start]   # step onto every teleporter (snapshot)
 python -m hlmap info <map>             # BSP stats + entity lump
 python tests/test_verify.py            # the verifier must catch holes, invisible walls, missing faces,
-                                       # lockouts and dark routes; jumps, long jumps, low gravity, pits
+                                       # lockouts and dark routes; jumps, long jumps, low gravity, pits;
+                                       # swimming and breath, flooding, lifts, grates
 python tests/test_logic.py             # logic helpers behave as intended (simulated, no compile)
 python tests/test_office.py            # the office's story: briefing, power cut, welcome back (simulated)
 python tests/test_campaign.py          # level transitions must match up; what office hands to labs;
@@ -72,6 +73,14 @@ The verification loop after every change:
        jump clears about 340 units edge to edge, its long jump about 670). A
        trigger_hurt of 100+ damage (a void) is death: nothing lands in it. So a gap
        only the long jump clears is really checked, both ways.
+     - **Water.** The player swims in any direction where their waist is in water
+       (the world's, or a func_water where the simulated state has moved it), falls
+       into water don't hurt, and a ledge level with the surface can be climbed onto.
+       No way may keep the head under for more than 1,800 units at a stretch (the game
+       gives 12 s of air, about 3,000 units of swimming): a place reached only by a
+       longer swim counts as out of reach. An air pocket on the way resets it.
+     - **Lifts** (func_plat) are ridden up and down; **breakables** (func_breakable)
+       block until an armed player next to one breaks it.
      - **Gear** is part of the state of play: the HEV suit, the long jump module
        (only taken with the suit) and weapons are picked up like keys.
        player_weaponstrip takes weapons and ammo (not the suit or the module),
@@ -84,9 +93,11 @@ The verification loop after every change:
    - **Lockout:** no order of play may leave an area unreachable for good. For
      example, a one-shot breaker used before the power fails.
    - **Hostiles:** a monster from `verify.HOSTILE` (headcrabs, zombies, ...), or a
-     monstermaker making one, that the player can get within 256 units of without a
-     weapon fails. Hand out the crowbar first, and gate the way on it (the Xen
-     airlock won't cycle without it).
+     monstermaker making one, that the player can get at without a weapon fails:
+     within 256 units with nothing solid between; a barnacle only from right under
+     it; a leech only in the water. Hand out a weapon first, and gate the way on it
+     (the Xen airlock won't cycle without one; the pump station's door to the hall
+     opens for an armed player).
    - **Teleporters:** each lands the player standing, clear of solid, not in mid-air,
      not on another teleporter (that would bounce them on) and not in a level change.
      With them all on, every trip must have a way back to where it was stepped on. A
@@ -113,7 +124,9 @@ The verification loop after every change:
      in a wall or the air, not touching a trigger back), the shared stretch surface
      by surface (plane, texture, alignment), and the light where the player lands.
      Coming back from a later map, the player must be able to leave again (not
-     stranded).
+     stranded). A way out nobody can use on a first visit (the hub's pad to the pump
+     station needs the Xen card) is looked for coming back: the map is played from
+     where returning players land, and what they can leave with is recorded too.
    - **Round trips** (`m.verify_round_trips = True`, for a map the player can
      come back to and play again, like the Xen course): for every state the
      player can leave in, by every way the other map offers back (its pad's power
@@ -310,6 +323,24 @@ def build():
     Flag of the pad's own (a clearance card): dark and dead until it's on. Each map
     lights its pads the first time it finds their power on (at load or on coming
     back); after turning a power on during play, fire `net.sync` too.
+- **Water, lifts, valves (the pump station).**
+  - `lvl.room(..., water=192)` fills a room with water that deep (`water=` its height
+    floods it); a doorway between two watered rooms is filled to the lower level.
+    The texture is `!C2A5` (liquids.wad; any `!` texture is water). Lights work
+    under water.
+  - `props.water_mover(mins, maxs, name, direction="down", travel=)`: water that moves
+    like a door when `name` fires (a func_water); mins..maxs is the water where it's
+    full. "down": a tank that drains; "up": a room that floods (the water waits
+    lowered, a "starts open" door, and rises into place). Give `travel` 16 past its
+    height so a surface left level with a floor doesn't show.
+  - `props.valve(pos, facing, target)`: a wheel on a wall or standpipe, turned once
+    with +use (a func_rot_button).
+  - `props.lift(center, size, z_top, rise)`: a func_plat, its top level with the
+    upper floor; it waits `rise` lower and rises when stood on.
+  - `props.breakable(mins, maxs, "{GRATE2")`: a grate to smash (func_breakable).
+  - `m.auto_nodes = True`: after verify, info_nodes go into the compiled map on the
+    floor the player can walk (one per 192), so monsters like houndeyes can find
+    their way; the game builds its node graph from them at the first load.
 - **Stairs between floors.** `steps, hole = lvl.stairs(name, lower, upper, top=(x, y),
   down="north")` makes a staircase from `upper`'s floor down into `lower`, which must
   sit directly below (`wall` units of slab).
@@ -653,6 +684,17 @@ def build():
   start from `map <name>` or the level change into it, not an older save.
   (`playtest` checked: saving and loading on the same build keeps the pads as they
   were, in the hub and in the Xen station.)
+- The clip hulls keep water as contents of their own (-3), grown like solid; hull 0
+  has the true surface (where a player's waist and eyes are). Anything that asks
+  "is this solid?" of a clip hull must let water through.
+- A func_water built outside the level (in the void, waiting under a floor) never
+  shows or fills, though it's fired: build it full, where it's seen, and let it
+  start lowered (`water_mover(direction="up")`). A playtest found the cistern dry.
+- A func_water drains by moving down, rigidly: under it there must be solid, or the
+  room below floods (`build` checks: water may only ever fill one room).
+- A func_plat is placed at its top; unnamed, it starts `height` lower and rises when
+  stood on (a named one waits at the top for a trigger). At the top floor, a player
+  can walk into its empty shaft while it's down.
 - Items don't respawn in single player. `player_weaponstrip` removes weapons and
   ammo, never the HEV suit or the long jump module (no stock entity takes those).
   To give a weapon back, fire a `game_player_equip` (`spawnflags` 1, a key per

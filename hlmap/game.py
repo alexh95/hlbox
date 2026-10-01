@@ -331,6 +331,9 @@ def _run_session(variants, script, out_dir, prefix, width=1280, height=720, time
         restored = _reg_restore(reg)
         for name in variants:
             (maps_dir / f"{name}.bsp").unlink(missing_ok=True)
+            if maps_dir / f"{name}.bsp" not in backups:       # a temporary copy: its node graph too
+                for ext in ("nod", "nrp"):
+                    (maps_dir / "graphs" / f"{name}.{ext}").unlink(missing_ok=True)
         for dest, backup in backups.items():
             shutil.move(backup, dest)
         cfg_path.unlink(missing_ok=True)

@@ -17,6 +17,7 @@ so a map is only trusted after these checks pass:
 """
 from __future__ import annotations
 
+import heapq
 import math
 import struct
 from collections import deque
@@ -199,10 +200,10 @@ def _has_volume(poly, min_extent=0.05):
 # ---------------------------------------------------------------- checks
 
 def leaks_into_solid(hulls, is_air, hull, tol=1.0, limit=20):
-    """EMPTY leaves of `hull` that reach more than `tol` units into intended solid.
-    Returns (problem list, leaves checked)."""
+    """EMPTY (and liquid) leaves of `hull` that reach more than `tol` units into
+    intended solid. Returns (problem list, leaves checked)."""
     problems, checked = [], 0
-    for verts in hulls.empty_leaves(hull):
+    for verts in (v for c in PASSABLE for v in hulls.leaves_with(hull, c)):
         checked += 1
         bad = [p for p in verts if not is_air(p, tol)]
         if not bad:
@@ -400,11 +401,23 @@ JUMP_SPEED = (2 * GRAVITY * 45.0) ** 0.5
 RUN_JUMP = 280        # forward speed credited to a running jump (the game allows 320)
 LONG_JUMP = (510, (2 * GRAVITY * 56.0) ** 0.5)   # forward (the game gives 560), up
 LETHAL = 100          # trigger_hurt damage that kills outright (a fall into the void)
+# Water: the clip hulls keep liquids (-3 water, -4 slime, -5 lava) as contents of
+# their own, grown like solid; hull 0 has the true surface. A player whose origin
+# (waist) is in water swims (pm_shared: 0.8 of 320 = 256 units/s, any direction); with
+# the eyes 28 over the origin under water they hold their breath: 12 s before drowning
+# damage (AIRTIME), about 3,000 units. Out of water at a ledge: the water jump climbs
+# onto a top level with the surface.
+PASSABLE = (-1, -3, -4, -5)
+LIQUID = (-3, -4, -5)
+SWIM = 16             # swimming moves: a lattice coarser than walking's
+EYES = 28
+BREATH = 1800         # units a player may swim with their head under (a margin on 12 s)
+WATER_CLIMB = 64      # how far above a swimming origin a ledge's standing origin may be
 DIRS8 = [(1, 0), (0.7071, 0.7071), (0, 1), (-0.7071, 0.7071), (-1, 0), (-0.7071, -0.7071), (0, -1),
          (0.7071, -0.7071)]
 
 
-SOLID_ENTITIES = ("func_wall", "func_breakable", "func_button", "func_rot_button")
+SOLID_ENTITIES = ("func_wall", "func_breakable", "func_button", "func_rot_button", "func_pushable")
 
 
 def _grow(lo, hi):
@@ -414,14 +427,65 @@ def _grow(lo, hi):
 
 
 def solid_entities(hulls):
-    """Brush entities that are always solid (glass, walls, buttons; doors are handled
-    by state): [(root of the model's standing-player hull, entity origin, grown box)]."""
+    """Brush entities that are solid (glass, walls, buttons, breakables until broken;
+    doors are handled by state): [(entity index, root of the model's standing-player
+    hull, entity origin, grown box)]."""
+    models = hulls.models()
+    out = []
+    for i, e in enumerate(hulls.entities):
+        if e.get("classname") in SOLID_ENTITIES and e.get("model", "").startswith("*"):
+            o = tuple(float(c) for c in e["origin"].split()) if e.get("origin") else (0.0, 0.0, 0.0)
+            out.append((i, hulls.model_head(int(e["model"][1:]), 1), o, _grow(*_placed(models, e))))
+    return out
+
+
+def breakables(hulls):
+    """func_breakables a player can break (not "only trigger", not unbreakable glass)."""
+    return [i for i, e in enumerate(hulls.entities)
+            if e.get("classname") == "func_breakable" and e.get("model", "").startswith("*")
+            and not int(e.get("spawnflags") or 0) & 1 and str(e.get("material") or "0") != "7"]
+
+
+def _movedir(e):
+    """A func_door's direction of travel (HLSDK SetMovedir): angle -1 up, -2 down,
+    else the yaw of `angles`/`angle`."""
+    a = e.get("angles")
+    yaw = float(a.split()[1]) if a else float(e.get("angle") or 0)
+    if a is None and e.get("angle") in ("-1", "-2"):
+        return (0.0, 0.0, 1.0 if e.get("angle") == "-1" else -1.0)
+    return (math.cos(math.radians(yaw)), math.sin(math.radians(yaw)), 0.0)
+
+
+def water_movers(hulls):
+    """func_waters: water that moves like a door when fired (a tank draining, a cistern
+    filling): [(entity index, the box it's compiled in, the box it moves to)]."""
+    models = hulls.models()
+    out = []
+    for i, e in enumerate(hulls.entities):
+        if e.get("classname") == "func_water" and e.get("model", "").startswith("*"):
+            lo, hi = _placed(models, e)
+            d = _movedir(e)
+            travel = sum(abs(d[k] * (hi[k] - lo[k] - 2)) for k in range(3)) - float(e.get("lip") or 0)
+            out.append((i, (lo, hi), (tuple(lo[k] + d[k] * travel for k in range(3)),
+                                      tuple(hi[k] + d[k] * travel for k in range(3)))))
+    return out
+
+
+def lifts(hulls):
+    """func_plats: a lift is placed at its top and, unnamed, starts at the bottom
+    (`height` below; HLSDK: size - 8 without one) and rises when stood on:
+    [((its grown box at the bottom, at the top), (x0, x1, y0, y1) where riders stand,
+    the riders' origin z at the bottom, rise)]. The walker stands on it at both stops
+    and rides it either way."""
     models = hulls.models()
     out = []
     for e in hulls.entities:
-        if e.get("classname") in SOLID_ENTITIES and e.get("model", "").startswith("*"):
-            o = tuple(float(c) for c in e["origin"].split()) if e.get("origin") else (0.0, 0.0, 0.0)
-            out.append((hulls.model_head(int(e["model"][1:]), 1), o, _grow(*_placed(models, e))))
+        if e.get("classname") == "func_plat" and e.get("model", "").startswith("*") and not e.get("targetname"):
+            lo, hi = _placed(models, e)
+            rise = float(e.get("height") or 0) or (hi[2] - lo[2] - 8)
+            low = ((lo[0], lo[1], lo[2] - rise), (hi[0], hi[1], hi[2] - rise))
+            out.append(((_grow(*low), _grow(lo, hi)), (lo[0] + 16, hi[0] - 16, lo[1] + 16, hi[1] - 16),
+                        hi[2] - rise + HALF[2], rise))
     return out
 
 
@@ -467,11 +531,23 @@ class Walker:
     With jumps=True, also running jumps across gaps and down, and long jumps while
     `long_jump` is set, flown as arcs; gravity zones (trigger_gravity) scale jumps and
     safe falls, and lethal trigger_hurts are death (nothing lands in them).
+    Water (the world's, and func_waters where they are now): swimming in any
+    direction on a SWIM lattice, falls into it don't hurt, ledges level with the
+    surface can be climbed onto; and no way may keep the head under for more than
+    BREATH units. Lifts (func_plats): standing on one at the bottom rides it up.
+    Breakables block until broken (`removed`).
     Positions are standing-player origins on a grid of `step` units (x, y multiples)."""
 
-    def __init__(self, hulls, ladders=(), step=8, solids=(), zones=(), lethal=(), jumps=False):
+    def __init__(self, hulls, ladders=(), step=8, solids=(), zones=(), lethal=(), jumps=False, lifts=(),
+                 water=None):
         self.h = hulls
         self.step = step
+        self.lifts = list(lifts)
+        self.waters = []             # boxes of the func_waters, where they are now
+        self.removed = frozenset()   # entities gone (broken breakables)
+        self._wcache = {}
+        # swim when the world has liquid or water can appear (func_waters)
+        self.swim = (any(c in LIQUID for c in hulls.leaves) if water is None else water)
         self.zones = list(zones)
         self.lethal = list(lethal)
         self.jumps = jumps
@@ -484,24 +560,47 @@ class Walker:
         self.teleports = []          # [(grown box, landing position)] of the active ones
         self._cache = {}
         self._solids = {}
-        for head, o, (lo, hi) in solids:
+        for i, head, o, (lo, hi) in solids:
             for gx in range(int(lo[0] // 128), int(hi[0] // 128) + 1):
                 for gy in range(int(lo[1] // 128), int(hi[1] // 128) + 1):
-                    self._solids.setdefault((gx, gy), []).append((head, o, lo, hi))
+                    self._solids.setdefault((gx, gy), []).append((i, head, o, lo, hi))
 
     def _solid(self, p):
         if p not in self._cache:
-            hit = self.h.contents(1, p) != -1
-            if not hit:
-                for head, o, lo, hi in self._solids.get((int(p[0] // 128), int(p[1] // 128)), ()):
-                    if all(lo[k] < p[k] < hi[k] for k in range(3)) and \
-                            self.h.contents(1, (p[0] - o[0], p[1] - o[1], p[2] - o[2]), head) != -1:
-                        hit = True
-                        break
-            self._cache[p] = hit
+            self._cache[p] = self.h.contents(1, p) not in PASSABLE
         if self._cache[p]:
             return True
+        for i, head, o, lo, hi in self._solids.get((int(p[0] // 128), int(p[1] // 128)), ()):
+            if i not in self.removed and all(lo[k] < p[k] < hi[k] for k in range(3)) and \
+                    self.h.contents(1, (p[0] - o[0], p[1] - o[1], p[2] - o[2]), head) not in PASSABLE:
+                return True
+        if any(all(lo[k] < p[k] < hi[k] for k in range(3)) for stops, _, _, _ in self.lifts for lo, hi in stops):
+            return True
         return any(all(lo[k] < p[k] < hi[k] for k in range(3)) for lo, hi in self.blockers)
+
+    def water(self, p):
+        """Is p (an origin: the player's waist) in water?"""
+        if not self.swim:
+            return False
+        if p not in self._wcache:
+            self._wcache[p] = self.h.contents(0, p) in LIQUID
+        return self._wcache[p] or any(all(lo[k] <= p[k] <= hi[k] for k in range(3)) for lo, hi in self.waters)
+
+    def underwater(self, p):
+        """Are the eyes of a player at p under water (holding their breath)?"""
+        return self.water((p[0], p[1], p[2] + EYES))
+
+    def _afloat(self, x, y, z):
+        """A swimming position at the water a fall reached: on the SWIM lattice when
+        that's in water and clear, else where the fall stopped."""
+        s = SWIM
+        xs = sorted({s * math.floor(x / s), s * math.ceil(x / s)}, key=lambda v: abs(v - x))
+        ys = sorted({s * math.floor(y / s), s * math.ceil(y / s)}, key=lambda v: abs(v - y))
+        bz = s * math.floor(z / s)
+        for q in ((qx, qy, qz) for qz in (bz, bz - s) for qx in xs for qy in ys):
+            if self.water(q) and not self._solid(q):
+                return q             # the nearest lattice point in the water (one lattice: fewer positions)
+        return (x, y, z)
 
     def gravity(self, p):
         g = 1.0
@@ -524,8 +623,9 @@ class Walker:
         return any(all(lo[k] <= p[k] <= hi[k] for k in range(3)) for lo, hi in self.ladders)
 
     def _drop(self, x, y, z, fell=0.0):
-        """Fall from (x, y, z) to the ground (or onto a ladder); None if blocked, lethal
-        or bottomless. fell: how far the player was already falling (from a jump)."""
+        """Fall from (x, y, z) to the ground (or onto a ladder, or into water); None if
+        blocked, lethal or bottomless. fell: how far the player was already falling
+        (from a jump). Water breaks any fall."""
         start = z
         if self._solid((x, y, z)):
             return None
@@ -533,19 +633,24 @@ class Walker:
         while True:
             if self.lethal and self.deadly((x, y, z)):
                 return None
+            if self.swim and self.water((x, y, z)):
+                return self._afloat(x, y, z)
             if z != start and self._on_ladder((x, y, z)):
                 return (x, y, z)
             if self._solid((x, y, z - 1)):
-                return (x, y, z)
-            if start - z > limit:
-                return None
+                return (x, y, z) if start - z <= limit else None
+            if start - z > max(limit, 0) + 4096:
+                return None                    # bottomless
             # hull-1 solids are >= 72 thick vertically, so 8-unit strides can't skip one
-            z -= 8 if not (self._solid((x, y, z - 8)) or self._on_ladder((x, y, z - 8))) else 1
+            ahead = (x, y, z - 8)
+            z -= 8 if not (self._solid(ahead) or self._on_ladder(ahead) or (self.swim and self.water(ahead))) else 1
 
     def _moves(self, p):
         land = self.teleport_at(p)
         if land is not None:          # the teleporter takes over: that's the only way on
             return [land]
+        if self.swim and self.water(p):
+            return self._swim_moves(p)
         x, y, z = p
         on_ladder = self._on_ladder(p)
         out = []
@@ -567,6 +672,41 @@ class Walker:
                     out.append(q if self._on_ladder(q) else (self._drop(x, y, z + dz) or q))
         if self.jumps and not on_ladder and self._solid((x, y, z - 1)):
             out += self._jump_moves(p)
+        for _, (x0, x1, y0, y1), sz, rise in self.lifts:     # standing on a lift: ride it
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                for at, to in ((sz, sz + rise), (sz + rise, sz)):
+                    if abs(z - at) < 1 and not self._solid((x, y, to)):
+                        out.append((x, y, to))
+        return out
+
+    def _swim_moves(self, p):
+        """Swimming: a SWIM step in any of 6 directions while in water; out over an edge
+        or a sill (falling, or wading on); onto a ledge whose standing origin is up to
+        WATER_CLIMB above (pm_shared's water jump); never up out of the surface."""
+        out = []
+        x, y, z = p
+        s = SWIM
+        for dx, dy, dz in ((s, 0, 0), (-s, 0, 0), (0, s, 0), (0, -s, 0), (0, 0, s), (0, 0, -s)):
+            q = (x + dx, y + dy, z + dz)
+            if not self._solid(q):
+                if self.water(q):
+                    out.append(q)
+                elif not dz:
+                    d = self._drop(*q)
+                    if d:
+                        out.append(d)
+                continue
+            if dz:
+                continue
+            for lift in range(16, WATER_CLIMB + 1, 16):     # a wall: climb out onto it
+                if self._solid((x, y, z + lift)):
+                    break
+                r = (x + dx, y + dy, z + lift)
+                if not self._solid(r):
+                    d = self._drop(*r)
+                    if d:
+                        out.append(d)
+                    break
         return out
 
     # ------------------------------------------------------------------ jumping
@@ -597,7 +737,7 @@ class Walker:
     def _jump(self, p, d, vh, vz):
         """A jump's landing, flown once without doors; flown again only for the doors
         in its way (a jump on the far side of the map doesn't care about the airlock)."""
-        key = (p, d, vh)
+        key = (p, d, vh, self._wtoken)
         if key not in self._arcs:
             saved, self.blockers = self.blockers, []
             try:
@@ -607,14 +747,14 @@ class Walker:
         spot, (lo, hi) = self._arcs[key]
         if not any(all(blo[k] < hi[k] and bhi[k] > lo[k] for k in range(3)) for blo, bhi in self.blockers):
             return spot
-        key = (p, d, vh, self._token)
+        key = (p, d, vh, self._token, self._wtoken)
         if key not in self._arcs_blocked:
             self._arcs_blocked[key] = self._arc(p, d, vh, vz)
         return self._arcs_blocked[key]
 
     _token = 0
 
-    def configure(self, blockers=None, teleports=None, long_jump=None):
+    def configure(self, blockers=None, teleports=None, long_jump=None, waters=None, removed=None):
         """Set what changes between states of play (arcs are re-flown when it does)."""
         if blockers is not None:
             self.blockers = blockers
@@ -622,7 +762,14 @@ class Walker:
             self.teleports = teleports
         if long_jump is not None:
             self.long_jump = long_jump
+        if waters is not None:
+            self.waters = list(waters)
+        if removed is not None:
+            self.removed = frozenset(removed)
         self._token = tuple(self.blockers)
+        self._wtoken = (tuple(self.waters), self.removed)
+
+    _wtoken = ((), frozenset())
 
     def _arc(self, p, d, vh, vz):
         """Fly a jump from p in direction d: returns the standing position it lands on,
@@ -647,6 +794,8 @@ class Walker:
                 vh, nx, ny = 0.0, x, y         # hit a wall: drop down along it
             x, y, z = nx, ny, nz
             top = max(top, z)
+            if self.swim and self.water((x, y, z)):
+                return self._afloat(x, y, z)       # into water: it breaks the fall
             for k, c in enumerate((x, y, z)):
                 lo[k], hi[k] = min(lo[k], c), max(hi[k], c)
             self._flown = (tuple(c - 24 for c in lo[:2]) + (lo[2] - MAX_FALL,), tuple(c + 24 for c in hi))
@@ -685,7 +834,12 @@ class Walker:
     def flood(self, seeds, limit=400000, known=(), goal=None):
         """Every position reachable from `seeds`. known: positions already known to be
         reachable (not explored again; e.g. an earlier flood before a door opened).
-        goal(p): stop as soon as a position passes it; returns (found, seen) then."""
+        goal(p): stop as soon as a position passes it; returns (found, seen) then.
+        With water, a position only counts if a way there keeps the head under for at
+        most BREATH units at a stretch (a shortest-path search, the count reset by
+        every breath)."""
+        if self.swim:
+            return self._flood_breathing(seeds, limit, known, goal)
         seen = set(known) | set(seeds)
         todo = deque(seeds)
         while todo and len(seen) < limit:
@@ -697,6 +851,28 @@ class Walker:
                     seen.add(q)
                     todo.append(q)
         return (False, seen) if goal is not None else seen
+
+
+    def _flood_breathing(self, seeds, limit, known, goal):
+        known = set(known)
+        best = {p: 0.0 for p in known}
+        heap = []
+        for p in seeds:
+            best[p] = 0.0
+            heapq.heappush(heap, (0.0, p))
+        while heap and len(best) < limit:
+            c, p = heapq.heappop(heap)
+            if c > best.get(p, c):
+                continue
+            if goal is not None and goal(p):
+                return True, set(best)
+            for q in self._moves(p):
+                nc = c + math.dist(p, q) if self.underwater(q) else 0.0
+                if nc <= BREATH and nc < best.get(q, BREATH + 1):
+                    best[q] = nc
+                    if q not in known:
+                        heapq.heappush(heap, (nc, q))
+        return (False, set(best)) if goal is not None else set(best)
 
 
 def _placed(models, e):
@@ -897,13 +1073,32 @@ def _describe(ents, i, models):
     else:
         lo, hi = _placed(models, e)
         at = tuple(round((a + b) / 2) for a, b in zip(lo, hi))
-    verb = "pick up" if c.startswith(("item_", "weapon_", "ammo_")) else "touch" if c.startswith("trigger_") else "press"
+    verb = ("pick up" if c.startswith(("item_", "weapon_", "ammo_")) else "touch" if c.startswith("trigger_")
+            else "break" if c == "func_breakable" else "turn" if c == "func_rot_button" else "press")
     return f"{verb} {c} at {at} -> {e.get('target')}"
 
 
 HOSTILE = {"monster_headcrab", "monster_zombie", "monster_houndeye", "monster_bullchicken", "monster_alien_slave",
            "monster_alien_grunt", "monster_human_grunt", "monster_human_assassin", "monster_snark",
-           "monster_babycrab", "monster_alien_controller", "monster_gargantua"}
+           "monster_babycrab", "monster_alien_controller", "monster_gargantua", "monster_barnacle",
+           "monster_leech", "monster_ichthyosaur"}
+
+
+def _clear_line(hulls, a, b, step=16):
+    """Nothing solid (the world's sight hull) on the line from a to b?"""
+    n = max(1, int(math.dist(a, b) // step))
+    return all(hulls.contents(0, tuple(a[k] + (b[k] - a[k]) * i / n for k in range(3))) != -2 for i in range(n + 1))
+
+
+def threatens(hulls, kind, o, p, in_water):
+    """Can a `kind` monster at o get at a player standing at p? A barnacle only from
+    above (its tongue drops straight down); a leech only in the water; anything else
+    within 256 across and 160 up or down, with nothing solid between."""
+    if kind == "monster_barnacle":
+        return abs(p[0] - o[0]) <= 48 and abs(p[1] - o[1]) <= 48 and p[2] < o[2] and             _clear_line(hulls, o, (p[0], p[1], p[2] + EYES))
+    if kind in ("monster_leech", "monster_ichthyosaur") and not in_water(p):
+        return False
+    return abs(p[0] - o[0]) <= 256 and abs(p[1] - o[1]) <= 256 and abs(p[2] - o[2]) <= 160 and         _clear_line(hulls, (o[0], o[1], o[2] + 16), (p[0], p[1], p[2] + EYES))
 
 
 def progression(hulls, checkpoints, radius=24, light=None, max_states=300, globals=None, start=None,
@@ -958,11 +1153,13 @@ def progression(hulls, checkpoints, radius=24, light=None, max_states=300, globa
     res.warnings += world0.warnings
     ladders = [_placed(models, e) for e in ents if e.get("classname") == "func_ladder"]
     zones = gravity_zones(hulls)
-    if jumps is None:
-        jumps = bool(zones) or any(e.get("classname") == "item_longjump" for e in ents)
+    if jumps is None:            # (a player who brings the long jump module jumps too)
+        jumps = bool(zones) or any(e.get("classname") == "item_longjump" for e in ents) or world0.long_jump
+    movers = water_movers(hulls)
     w = Walker(hulls, ladders, solids=solid_entities(hulls), zones=zones, lethal=lethal_volumes(hulls),
-               jumps=jumps)
+               jumps=jumps, lifts=lifts(hulls), water=True if movers else None)
     tele = [(i, box, w.settle(land)) for i, box, land, _ in teleports(hulls) if land is not None]
+    brk = {i: _grow(*_placed(models, ents[i])) for i in breakables(hulls)}
     doors = []
     for i, e in enumerate(ents):
         if e.get("classname") in DOORS and (e.get("master") or e.get("targetname")) and e.get("model", "").startswith("*"):
@@ -988,35 +1185,47 @@ def progression(hulls, checkpoints, radius=24, light=None, max_states=300, globa
             lo, hi = _placed(models, e)
             actions.append((i, "touch", lambda p, lo=lo, hi=hi:
                             all(lo[k] - HALF[k] < p[k] < hi[k] + HALF[k] for k in range(3))))
-    rel = world0.relevance([i for i, _ in doors] + [i for i, _, _ in tele], watch)
+    for i in brk:                      # breakables: smashed (with a weapon) from next to them
+        lo, hi = _placed(models, ents[i])
+        actions.append((i, "break_", lambda p, lo=lo, hi=hi:
+                        sum(max(0, lo[k] - p[k], p[k] - hi[k]) ** 2 for k in range(3)) <= 64 * 64))
+    rel = world0.relevance([i for i, _ in doors] + [i for i, _, _ in tele] + [i for i, _, _ in movers], watch)
+    rel = (rel[0] | set(brk), rel[1])
     actions = [a for a in actions if a[0] in rel[0] or a[0] in gear]
 
     cache = {}
 
-    def configure(blocked, enabled, lj=False):
+    def configure(cfg):
+        blocked, enabled, lj, wet, broken = cfg
         w.configure(blockers=[b for i, b in doors if i in blocked],
-                    teleports=[(box, land) for i, box, land in tele if i in enabled], long_jump=lj)
+                    teleports=[(box, land) for i, box, land in tele if i in enabled], long_jump=lj,
+                    waters=[moved if i in wet else at for i, at, moved in movers], removed=broken)
 
     def flood(world, pos):
         blocked = tuple(i for i, _ in doors if not world.door_passable(i))
         enabled = tuple(i for i, _, _ in tele if world.teleport_enabled(i))
         lj = jumps and world.long_jump
-        cfg = (blocked, enabled, lj)
+        wet = tuple(i for i, _, _ in movers if i in world.opened)       # func_waters moved
+        broken = tuple(i for i in brk if i in world.gone)
+        cfg = (blocked, enabled, lj, wet, broken)
         for comp in cache.get(cfg, ()):
             if pos in comp:
                 return comp, cfg
-        configure(blocked, enabled, lj)
-        # a door (or more) opened since an earlier flood that reached pos: everything it
-        # reached is still reachable, so only grow it from the doors that opened (with
-        # the same teleporters on: one that switches on also stops walks across it)
+        configure(cfg)
+        # a door (or more) opened, or something broken, since an earlier flood that
+        # reached pos: everything it reached is still reachable, so only grow it from
+        # there (with the same teleporters on: one that switches on also stops walks
+        # across it; and the same water)
         base = None
-        for (b_other, e_other, lj_other), comps in cache.items():
-            if e_other == enabled and lj_other == lj and set(blocked) <= set(b_other):
+        for (b_other, e_other, lj_other, wet_other, br_other), comps in cache.items():
+            if e_other == enabled and lj_other == lj and wet_other == wet and set(blocked) <= set(b_other) \
+                    and set(broken) >= set(br_other):
                 for comp in comps:
                     if pos in comp and (base is None or len(comp) > len(base[1])):
-                        base = (b_other, comp)
+                        base = (b_other, comp, br_other)
         if base is not None:
             opened_boxes = [b for i, b in doors if i in base[0] and i not in blocked]
+            opened_boxes += [brk[i] for i in broken if i not in base[2]]
             frontier = [p for p in base[1] if any(all(lo[k] - 24 <= p[k] <= hi[k] + 24 for k in range(3))
                                                   for lo, hi in opened_boxes)]
             comp = frozenset(w.flood(frontier, known=base[1]))
@@ -1039,7 +1248,8 @@ def progression(hulls, checkpoints, radius=24, light=None, max_states=300, globa
     queue = deque([(world0, pos0, [], None)])
     while queue:
         world, pos, path, via = queue.popleft()
-        comp, (blocked, enabled, lj) = flood(world, pos)
+        comp, cfg = flood(world, pos)
+        blocked, enabled, lj = cfg[:3]
         key = (world.key(rel), min(comp))
         if via:
             nodes[via[0]]["children"].append((via[1], key))
@@ -1048,7 +1258,8 @@ def progression(hulls, checkpoints, radius=24, light=None, max_states=300, globa
         if len(nodes) >= max_states:
             res.truncated = True
             continue
-        node = {"world": world, "comp": comp, "blocked": blocked, "enabled": enabled, "lj": lj, "entry": pos,
+        node = {"world": world, "comp": comp, "blocked": blocked, "enabled": enabled, "lj": lj, "cfg": cfg,
+                "entry": pos,
                 "path": path, "children": [], "parent": via[0] if via else None}
         nodes[key] = node
         order.append(key)
@@ -1141,7 +1352,7 @@ def progression(hulls, checkpoints, radius=24, light=None, max_states=300, globa
     if tele:
         best = max(goals, key=lambda k: len(nodes[k]["enabled"]))
         node = nodes[best]
-        configure(node["blocked"], node["enabled"], node["lj"])
+        configure(node["cfg"])
         for t, (lo, hi), land in tele:
             if t not in node["enabled"]:
                 continue
@@ -1179,8 +1390,7 @@ def progression(hulls, checkpoints, radius=24, light=None, max_states=300, globa
             node = nodes[k]
             if node["world"].armed:
                 continue
-            if any(abs(p[0] - o[0]) <= 256 and abs(p[1] - o[1]) <= 256 and abs(p[2] - o[2]) <= 160
-                   for p in node["comp"]):
+            if any(threatens(hulls, kind, o, p, w.water) for p in node["comp"]):
                 res.unarmed.append((kind, tuple(round(c) for c in o), node["path"]))
                 break
 
@@ -1200,12 +1410,12 @@ def progression(hulls, checkpoints, radius=24, light=None, max_states=300, globa
             if sig not in seeable_cache:
                 seeable_cache[sig] = _seeable(node["comp"], light, levels)
             seeable = seeable_cache[sig]
-            configure(node["blocked"], node["enabled"], node["lj"])
+            configure(node["cfg"])
             best_cost, best_a = None, None
             for a, _ in useful:
                 # states that differ only in things that don't move doors or lights
                 # (e.g. who has said what) walk the same way
-                wk = (sig, node["blocked"], node["enabled"], node["lj"], node["entry"], a[0])
+                wk = (sig, node["cfg"], node["entry"], a[0])
                 if wk not in walk_cache:
                     walk_cache[wk] = _dark_walk(w, node["comp"], seeable, node["entry"], a[2])
                 cost = walk_cache[wk]
@@ -1294,14 +1504,17 @@ def stranded_check(hulls, pos, globals_=None, inventory=(), exits=None):
     models = hulls.models()
     world = World(ents, globals_, inventory).start()
     zones = gravity_zones(hulls)
-    jumps = bool(zones) or any(e.get("classname") == "item_longjump" for e in ents)
+    jumps = bool(zones) or any(e.get("classname") == "item_longjump" for e in ents) or world.long_jump
+    movers = water_movers(hulls)
     w = Walker(hulls, [_placed(models, e) for e in ents if e.get("classname") == "func_ladder"],
-               solids=solid_entities(hulls), zones=zones, lethal=lethal_volumes(hulls), jumps=jumps)
+               solids=solid_entities(hulls), zones=zones, lethal=lethal_volumes(hulls), jumps=jumps,
+               lifts=lifts(hulls), water=True if movers else None)
     blockers = [_grow(*_placed(models, e)) for i, e in enumerate(ents)
                 if e.get("classname") in DOORS and (e.get("master") or e.get("targetname"))
                 and e.get("model", "").startswith("*") and not world.door_passable(i)]
     tele = [(box, w.settle(land)) for i, box, land, _ in teleports(hulls) if land and world.teleport_enabled(i)]
-    w.configure(blockers=blockers, teleports=tele, long_jump=world.long_jump)
+    w.configure(blockers=blockers, teleports=tele, long_jump=world.long_jump,
+                waters=[moved if i in world.opened else at for i, at, moved in movers])
     ways = [(f"{name[0]} ({name[1]})" if isinstance(name, tuple) else str(name), ex[0], ex[1])
             for name, ex in (exits or {}).items() if world.master_ok(ex[2] if len(ex) > 2 else None)]
     if not ways:
@@ -1316,3 +1529,20 @@ def stranded_check(hulls, pos, globals_=None, inventory=(), exits=None):
         return False
     found, _ = w.flood([w.settle(pos)], goal=out)
     return hit[0] if found else None
+
+
+def node_positions(hulls, reached, spacing=192):
+    """Where to put info_nodes so monsters can find their way (the game builds its node
+    graph from them at the first load): one per `spacing` cell of the floor the player
+    can walk on (from verify's reachable positions; not swimming), the one nearest the
+    cell's middle. Returns node origins, 16 over the floor."""
+    best = {}
+    for p in reached:
+        if hulls.contents(0, p) in LIQUID or hulls.contents(1, (p[0], p[1], p[2] - 1)) in PASSABLE:
+            continue                                   # swimming, or not standing on anything
+        key = (int(p[0] // spacing), int(p[1] // spacing), int(p[2] // 96))
+        mid = ((key[0] + 0.5) * spacing, (key[1] + 0.5) * spacing)
+        d = (p[0] - mid[0]) ** 2 + (p[1] - mid[1]) ** 2
+        if key not in best or d < best[key][0]:
+            best[key] = (d, p)
+    return sorted((p[0], p[1], p[2] - HALF[2] + 16) for _, p in best.values())

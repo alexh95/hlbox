@@ -1048,3 +1048,70 @@ def rock_shelf(axis, back, front, u0, u1, top, depth=300, jitter=16, seed=0, tex
             pt(back, round(u1 - w * 0.15), round(top - depth * 0.6)),
             pt(round(back + (front - back) * 0.35), round((u0 + u1) / 2), round(top - depth))]
     return detail(hull(pts, tex, comment="rock shelf"))
+
+
+# ---------------------------------------------------------------- water, lifts, valves
+
+def water_mover(mins, maxs, name, direction="down", travel=None, speed=40, texture="!C2A5"):
+    """Water that moves like a door when `name` is fired (a func_water). mins..maxs is
+    the water where it's full. direction "down": a tank that drains, moving down out of
+    sight; "up": a room that floods, the water waiting lowered (a "starts open" door)
+    and rising into place. It moves its own height (or `travel`: past it, so a surface
+    left level with a floor doesn't show) and stays. Under where it goes there must be
+    solid (build checks). A func_water built outside the level never shows: build it
+    full, where it's seen. verify swims in it wherever the simulated state has it."""
+    b = box(mins, maxs, texture, comment="moving water")
+    h = maxs[2] - mins[2]
+    lip = -2 if travel is None else h - 2 - travel           # HLSDK: a door moves size - 2 - lip
+    return Entity("func_water", brushes=[b], targetname=name, speed=speed, wait=-1, lip=lip, skin=-3,
+                  angle=-2, spawnflags=1 if direction == "up" else 0, WaveHeight=1)
+
+
+def valve(pos, facing, target, radius=14, depth=6, texture="C3A1_GEAR3", rim="OUT_GALV1", turn=360, wait=-1,
+          master=None):
+    """A valve wheel (pos = its centre on the wall or pipe it sits on, `facing` the way
+    it faces): +use turns it (a func_rot_button about the axis out of the wall), firing
+    `target`. wait -1: turned once, it stays turned."""
+    from .geometry import hull
+    fx, fy = DIRS[facing]
+    x, y, z = pos
+    pts = []
+    for k in range(8):
+        a = 2 * math.pi * (k + 0.5) / 8
+        u, v = radius * math.cos(a), radius * math.sin(a)
+        for d in (0, depth):
+            pts.append((round(x + fx * d + (u if fy else 0)), round(y + fy * d + (u if fx else 0)), round(z + v)))
+    wheel = hull(pts, rim, comment="valve wheel")
+    wheel.fit(facing, texture)
+    c = (x + fx * depth / 2, y + fy * depth / 2, z)
+    origin = box(tuple(v - 2 for v in c), tuple(v + 2 for v in c), "ORIGIN", comment="valve axis")
+    kv = {"target": target, "speed": 90, "distance": turn, "wait": wait, "sounds": 0,
+          "spawnflags": 64 if fx else 128}                    # about the X or the Y axis
+    if master:
+        kv["master"] = master
+    return Entity("func_rot_button", brushes=[wheel, origin], kv=kv)
+
+
+def lift(center, size, z_top, rise, texture="C2A2A_LIFT1", speed=120):
+    """A lift (func_plat): a platform `size` (w, d) whose top is at `z_top` when up. It
+    waits `rise` lower and goes up when stood on, then down again after a few seconds.
+    (Unnamed: a named one waits at the top for a trigger.) verify rides it up."""
+    x, y = center
+    w, d = size
+    plat = box((x - w / 2, y - d / 2, z_top - 16), (x + w / 2, y + d / 2, z_top),
+               {"top": texture, "default": "OUT_GALV1"}, comment="lift")
+    return Entity("func_plat", brushes=[plat], height=rise, speed=speed, movesnd=2, stopsnd=1)
+
+
+def breakable(mins, maxs, texture="{GRATE2", material=2, health=20, see_through=True, name=None, target=None):
+    """Something solid to smash (func_breakable: a grate, boards): shot or hit until it
+    breaks. material: 0 glass, 1 wood, 2 metal, 3 flesh, 4 cinder, 5 tile, 6 computer,
+    8 rocks. verify: an armed player next to it can break it."""
+    kv = {"material": material, "health": health}
+    if see_through:
+        kv.update(rendermode=4, renderamt=255)                 # '{' textures: index 255 see-through
+    if name:
+        kv["targetname"] = name
+    if target:
+        kv["target"] = target
+    return Entity("func_breakable", brushes=[box(mins, maxs, texture, comment="breakable")], kv=kv)

@@ -240,6 +240,22 @@ def test_a_named_monstermaker_that_never_starts_is_caught():
     assert len(auto) == 1 and auto[0].get("target") == "crabs"
 
 
+def test_water_that_drains_into_the_room_below_is_caught():
+    """A func_water drains by moving down: under it there must be solid, not a room."""
+    from hlmap import Level, Map, Material
+    from hlmap.checks import water_movers
+    mat = Material("FIFTIES_FLR02C", "FIFTIES_WALL14A", "FIFTIES_CEIL01")
+    for below, caught in ((True, True), (False, False)):
+        m = Map("vtank")
+        lvl = Level(wall=16)
+        lvl.room("tank", (0, 0, 0), (256, 256, 256), mat)
+        if below:
+            lvl.room("under", (0, 0, -272), (256, 256, -16), mat)
+        m.add(props.water_mover((0, 0, 0), (256, 256, 192), "drain", direction="down", travel=208))
+        problems = water_movers(m, lvl)
+        assert bool(problems) == caught, problems
+
+
 def test_talk_checks_gestures_against_the_model():
     from hlmap import Map, scene
     talk = scene.Talk(Map("vtalk2"), "t", head=(0, 0, 64), actor="sci", actor_model="models/scientist.mdl")

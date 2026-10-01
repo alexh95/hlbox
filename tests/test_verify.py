@@ -436,6 +436,114 @@ def test_a_door_that_locks_behind_is_a_lockout_unless_the_player_can_come_back()
     assert not p.softlocks and not p.missing, (p.softlocks, p.missing)
 
 
+def _compiled(m, name):
+    out = Path(tempfile.mkdtemp()) / f"{name}.map"
+    res = compile_map(m.write(out), profile="fast", steps=("csg", "bsp"))
+    assert res.ok, res.summary()
+    return Hulls(res.bsp)
+
+
+def _flooded_corridor(length, pocket):
+    """Two pools (water 160 deep, a deck level with the surface at each end) joined by
+    a corridor full of water, `length` long; with an air pocket half way, or not. The
+    start is on the west deck; can the east deck be reached without drowning?"""
+    from hlmap.verify import progression
+    m = Map("vswim")
+    lvl = Level(wall=16)
+    west = lvl.room("west pool", (0, 0, 0), (256, 256, 256), MAT, water=160)
+    rooms = [west]
+    x = 272
+    halves = [length // 2, length - length // 2] if pocket else [length]
+    for k, n in enumerate(halves):
+        rooms.append(lvl.room(f"corridor {k}", (x, 96, 0), (x + n, 160, 112), MAT, water=112))
+        x += n + 16
+        if pocket and k == 0:
+            rooms.append(lvl.room("air pocket", (x, 32, 0), (x + 128, 224, 256), MAT, water=160))
+            x += 128 + 16
+    east = lvl.room("east pool", (x, 0, 0), (x + 256, 256, 256), MAT, water=160)
+    rooms.append(east)
+    for a, b in zip(rooms, rooms[1:]):
+        lvl.doorway(a, b, width=64, height=96, center=128)
+    lvl.build(m)
+    m.add(props.detail(box((0, 0, 0), (96, 256, 160), "CRETE4_WALL01B"),
+                       box((x + 160, 0, 0), (x + 256, 256, 160), "CRETE4_WALL01B")),
+          props.player_start((48, 128, 160)), props.light((128, 128, 220)), props.light((x + 128, 128, 220)))
+    return progression(_compiled(m, "vswim"), [("far deck", [(x + 208, 128, 197)])])
+
+
+def test_a_flooded_corridor_needs_air_on_the_way():
+    p = _flooded_corridor(2000, pocket=True)
+    assert not p.missing, p.missing            # swim, breathe in the pocket, swim, climb out
+    p = _flooded_corridor(2000, pocket=False)
+    assert "far deck" in [n for n, _ in p.missing]   # 2,000 units under water: drowned
+
+
+def _cistern(valve):
+    """A cistern with a doorway 320 up its wall; a func_water waiting under its floor
+    floods it to the doorway when the button fires it."""
+    from hlmap.verify import progression
+    m = Map("vflood")
+    lvl = Level(wall=16)
+    cistern = lvl.room("cistern", (0, 0, 0), (256, 256, 512), MAT)
+    ledge = lvl.room("ledge room", (272, 64, 320), (528, 192, 432), MAT)
+    lvl.doorway(cistern, ledge, width=96, height=96, center=128)
+    lvl.build(m)
+    m.add(props.water_mover((0, 0, 0), (256, 256, 320), "flood", direction="up", travel=336))
+    if valve:
+        m.add(props.switch((0, 128, 48), "east", "flood"))
+    m.add(props.player_start((128, 128, 0)), props.light((128, 128, 400)), props.light((400, 128, 400)))
+    return progression(_compiled(m, "vflood"), [("ledge room", [(480, 128, 357)])])
+
+
+def test_flooding_a_cistern_lets_the_player_swim_up():
+    assert "ledge room" in [n for n, _ in _cistern(valve=False).missing]
+    p = _cistern(valve=True)
+    assert not p.missing, p.missing
+    assert any("flood" in step for step in p.log), p.log
+
+
+def _lift_shaft(with_lift):
+    from hlmap.verify import progression
+    m = Map("vlift")
+    lvl = Level(wall=16)
+    shaft = lvl.room("shaft", (0, 0, 0), (256, 256, 512), MAT)
+    upper = lvl.room("upper", (272, 64, 384), (528, 192, 496), MAT)
+    lvl.doorway(shaft, upper, width=96, height=96, center=128)
+    lvl.build(m)
+    if with_lift:
+        m.add(props.lift((176, 128), (128, 128), 384, 384))    # top level with the upper floor
+    m.add(props.player_start((48, 128, 0)), props.light((128, 128, 450)), props.light((400, 128, 450)))
+    return progression(_compiled(m, "vlift"), [("upper", [(480, 128, 421)])])
+
+
+def test_a_lift_carries_the_player_up():
+    assert "upper" in [n for n, _ in _lift_shaft(False).missing]
+    assert not _lift_shaft(True).missing
+
+
+def _grate(crowbar):
+    from hlmap.verify import progression
+    m = Map("vgrate")
+    lvl = Level(wall=16)
+    a = lvl.room("a", (0, 0, 0), (256, 256, 128), MAT)
+    b = lvl.room("b", (272, 0, 0), (528, 256, 128), MAT)
+    door = lvl.doorway(a, b, width=64, height=96, center=128)
+    lvl.build(m)
+    (x0, y0, z0), (x1, y1, z1) = door.mins, door.maxs
+    m.add(props.breakable((x0 + 4, y0, z0), (x1 - 4, y1, z1)))
+    if crowbar:
+        m.add(props.point("weapon_crowbar", (64, 64, 8)))
+    m.add(props.player_start((48, 128, 0)), props.light((128, 128, 100)), props.light((400, 128, 100)))
+    return progression(_compiled(m, "vgrate"), [("room b", [(400, 128, 37)])])
+
+
+def test_a_grate_is_broken_with_a_weapon():
+    assert "room b" in [n for n, _ in _grate(crowbar=False).missing]      # nothing to break it with
+    p = _grate(crowbar=True)
+    assert not p.missing, p.missing
+    assert any("break" in step for step in p.log), p.log
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

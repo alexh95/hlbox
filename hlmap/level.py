@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 
 from .csg import Convex, Plane, line_intersection
 from .csg import subtract_all as carve_all
-from .geometry import Brush, Face, SIDE_NAMES, face_axes, make_face, world_axes
+from .geometry import Brush, Face, SIDE_NAMES, box, face_axes, make_face, world_axes
 from .wad import default_db
 
 AXES = "xyz"
@@ -113,6 +113,7 @@ class Material:
 
 
 DEFAULT_MATERIAL = Material("FIFTIES_FLR02", "FIFTIES_WALL14A", "FIFTIES_CEIL01")
+WATER_TEX = "!C2A5"          # liquids.wad: the dam's blue water ('!' makes it water)
 
 
 @dataclass(eq=False)
@@ -198,17 +199,22 @@ class Level:
         self.notes: list = []        # things the builder did that you should know about
 
     # --- description ------------------------------------------------------
-    def room(self, name, mins, maxs, material: Material | None = None, group=None, checkpoints=None, **overrides):
+    def room(self, name, mins, maxs, material: Material | None = None, group=None, checkpoints=None, water=None,
+             water_tex=WATER_TEX, **overrides):
         """Add a room of empty space. overrides: floor=, wall=, ceiling= texture names.
         Rooms must be separated by walls unless they share a `group` (then they merge).
         checkpoints: [(x, y), ...] places in it that must be reachable on foot (default:
         the centre and inset corners; give them for rooms with terrain). An empty list:
-        nothing in it needs reaching (a view through a window, a sky)."""
+        nothing in it needs reaching (a view through a window, a sky).
+        water: fill the room with water this deep (from its floor; up to its ceiling
+        floods it); doorways between watered rooms are filled to the lower level."""
         mat = material or self.material
         if overrides:
             mat = mat.with_(**overrides)
-        r = Room(name, AABB(tuple(mins), tuple(maxs)), mat, group=group,
-                 meta={"checkpoints": list(checkpoints)} if checkpoints is not None else {})
+        meta = {"checkpoints": list(checkpoints)} if checkpoints is not None else {}
+        if water:
+            meta["water"] = (mins[2] + min(water, maxs[2] - mins[2]), water_tex)
+        r = Room(name, AABB(tuple(mins), tuple(maxs)), mat, group=group, meta=meta)
         if not r.box.valid():
             raise ValueError(f"room {name}: mins must be < maxs, got {mins} {maxs}")
         self.rooms.append(r)
@@ -588,10 +594,27 @@ class Level:
             for piece in carve_all(extra, cutters):
                 brushes.append(self._convex_brush(piece))
         m.add_world(*brushes)
+        m.add_world(*self.water_brushes())
         for f in self.features:
             f.emit(m)
         m.level = self
         return brushes
+
+    def water_brushes(self):
+        """Water filling the rooms that have it, and the openings between two of them
+        (to the lower of their levels), as world brushes of a liquid ('!') texture."""
+        out = []
+        for r in self.rooms:
+            if "water" in r.meta:
+                level, tex = r.meta["water"]
+                out.append(box(r.mins, (r.maxs[0], r.maxs[1], level), tex, comment=f"water {r.name}"))
+        for op in self.openings:
+            if "water" in op.a.meta and "water" in op.b.meta:
+                level = min(op.a.meta["water"][0], op.b.meta["water"][0], op.maxs[2])
+                if level > op.mins[2]:
+                    out.append(box(op.mins, (op.maxs[0], op.maxs[1], level), op.a.meta["water"][1],
+                                   comment=f"water {op.room.name}"))
+        return out
 
     def _air_for(self, p):
         """The Room (or corridor pseudo-room) whose air contains p, for texturing."""

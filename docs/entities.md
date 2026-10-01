@@ -88,10 +88,19 @@ brushes; the others are point entities with an `origin`.
   its `sounds`. In toggle mode, the release doesn't check the master.
 - **func_breakable**: `health`, `material` (0 glass, 1 wood, 2 metal, 3 flesh, 4
   cinder, 5 ceiling tile, 6 computer, 7 unbreakable glass, 8 rocks), `spawnobject`,
-  `explodemagnitude`.
+  `explodemagnitude`, `target` (fired when it breaks). `spawnflags` 1 = only by a
+  trigger. A `{` texture needs `rendermode 4` to be see-through.
 - **func_pushable**: `material`, `friction`, `buoyancy`. `spawnflags` 128 = breakable.
-- **func_water**: acts like a door and is used for water. `skin` -3 (water).
-  Needs a `!` texture.
+- **func_water**: water that moves like a door (`speed`, `wait` -1, `lip`, `angle`
+  -1 up / -2 down; it moves its size - 2 - lip). `skin` -3 (water). Needs a `!`
+  texture. Named, it moves when fired (props.water_mover: a tank draining, a
+  cistern flooding). Not solid.
+- **func_plat**: a lift, placed at its top. `height` (travel; default its size - 8),
+  `speed`, `movesnd`, `stopsnd`. Unnamed, it starts at the bottom and rises when
+  stood on, then returns; named, it waits at the top for a trigger.
+- **func_rot_button**: a turning button (a valve wheel). ORIGIN brush at its axis;
+  `distance` (degrees), `speed`, `wait` (-1 stays turned), `spawnflags` 64 X axis,
+  128 Y axis (Z by default), 1 not solid, 32 toggle.
 - **func_ladder**: invisible climbable volume. Pair it with a visible ladder brush.
 - **func_wall_toggle**: shown and solid, or hidden and non-solid; each fire toggles.
   `spawnflags` 1 = starts hidden. `props.slideshow` uses one per slide.
@@ -172,5 +181,11 @@ brushes; the others are point entities with an `origin`.
 - **env_beam**: `LightningStart`, `LightningEnd` (named entities, e.g. info_target),
   `texture` "sprites/laserbeam.spr", `BoltWidth`, `NoiseAmplitude`, `damage` per
   second to whatever it crosses, `life` 0 = for ever, `spawnflags` 1 = starts on.
+- **monster_barnacle**: hangs from the ceiling (origin just under it); its tongue
+  drops straight down and hauls up whoever walks under. **monster_leech**: in water.
+  **monster_houndeye**: packs; sonic blast. Moving monsters need info_nodes.
+- **info_node**: a point monsters navigate by; the game links them into a graph at
+  the first load (maps/graphs/<map>.nod). Put them on the floor, about 200 apart
+  (m.auto_nodes does).
 - **xen_tree** (attacks the player close in front; a solid box), **xen_hair**
   (decoration), **xen_plantlight**, **xen_spore_small/medium/large** (solid).

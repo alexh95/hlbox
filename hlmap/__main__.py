@@ -69,20 +69,21 @@ def cmd_build(a):
         from .campaign import order
         rank = {n: i for i, n in enumerate(order())}
         maps.sort(key=lambda n: rank.get(n, len(rank)))
+    ok = True
     for k, name in enumerate(maps):
         if len(maps) > 1:
             print(f"==================== {name}")
         # maps built after this one in the same run: their compiled copies are stale,
-        # so transitions into them are checked when they're verified (both ways)
+        # so transitions into them are checked when they're verified (both ways), and
+        # coming back from them right after they are (so a way out that only opens
+        # then is known before the maps after them are verified)
         a1 = argparse.Namespace(**{**vars(a), "map": name, "pending": maps[k + 1:]})
         _build_one(a1)
-    if len(maps) > 1 and not a.no_verify:
-        print("==================== coming back")
-        ok = True
-        for k, name in enumerate(maps[:-1]):
-            ok = returns_from(name, maps[k + 1:]) and ok
-        if not ok:
-            sys.exit("verify failed: a map strands players coming back into it (already installed)")
+        if len(maps) > 1 and not a.no_verify:
+            for j in range(k):
+                ok = returns_from(maps[j], [name]) and ok
+    if not ok:
+        sys.exit("verify failed: a map strands players coming back into it (already installed)")
 
 
 def _build_one(a):
@@ -92,9 +93,10 @@ def _build_one(a):
     problems = m.check()
     level = getattr(m, "level", None)
     if level:
-        from .checks import doorway_clearance, use_reach
+        from .checks import doorway_clearance, use_reach, water_movers
         problems.extend(use_reach(m, level))
         problems.extend(doorway_clearance(m, level))
+        problems.extend(water_movers(m, level))
         for e in m.entities:
             o = e.origin
             if o is not None and not e.brushes and e.classname != "info_texlights" and not level.is_inside(o):
@@ -128,6 +130,17 @@ def _build_one(a):
         sys.exit(1)
     if not a.no_verify and not run_verify(m, res.bsp, pending=getattr(a, "pending", ())):
         sys.exit("verify failed: not installing (use --no-verify to override)")
+    if getattr(m, "auto_nodes", False) and getattr(m, "verified_reached", None):
+        # monsters find their way by the game's node graph: info_nodes on the floor the
+        # player can walk (straight into the compiled entity lump: no recompile)
+        from .bsp import BSP
+        from .verify import Hulls, node_positions
+        nodes = node_positions(Hulls(res.bsp), m.verified_reached)
+        b = BSP(res.bsp)
+        b.entities = b.entities + [{"classname": "info_node", "origin": f"{x:g} {y:g} {z:g}"} for x, y, z in nodes]
+        b.save(res.bsp)
+        print(f"nodes: {len(nodes)} info_nodes for monsters to find their way (the game builds the graph at "
+              "the first load)")
     if not a.no_install:
         from . import game
         files = m.content_files(d)
@@ -259,13 +272,13 @@ def _playtest_links(a, bsp, d):
     import math
     from . import game
     from .campaign import changelevels
-    from .verify import (HALF, Hulls, Walker, _placed, gravity_zones, lethal_volumes, solid_entities,
+    from .verify import (HALF, Hulls, Walker, _placed, gravity_zones, lethal_volumes, lifts, solid_entities,
                          straight_walk, teleports, touches_box)
     h = Hulls(bsp)
     zones = gravity_zones(h)
     jumps = bool(zones) or any(e.get("classname") == "item_longjump" for e in h.entities)
     w = Walker(h, [_placed(h.models(), e) for e in h.entities if e.get("classname") == "func_ladder"],
-               solids=solid_entities(h), zones=zones, lethal=lethal_volumes(h), jumps=jumps)
+               solids=solid_entities(h), zones=zones, lethal=lethal_volumes(h), jumps=jumps, lifts=lifts(h))
     # everywhere the player can get to: doors open, teleporters on, jumps with the module
     w.configure(teleports=[(box, w.settle(land)) for _, box, land, _ in teleports(h) if land], long_jump=jumps)
     start = next(e for e in h.entities if e.get("classname") == "info_player_start")
@@ -361,8 +374,9 @@ def run_verify(m, bsp_path, coverage_check=True, pending=()):
         return True
     h = Hulls(bsp_path)
     ok = True
-    world_brushes = list(m.worldspawn.brushes) + [b for e in m.entities if e.classname == "func_detail"
-                                                  for b in e.brushes]
+    world_brushes = [b for b in list(m.worldspawn.brushes) + [b for e in m.entities if e.classname == "func_detail"
+                                                               for b in e.brushes]
+                     if not all(f.texture.startswith(("!", "*")) for f in b.faces)]   # water isn't solid
     index = {}
     for b in world_brushes:
         lo, hi = b.bounds()
@@ -521,7 +535,7 @@ def run_verify(m, bsp_path, coverage_check=True, pending=()):
                 print(f"verify ok   darkness{tag}: every way forward is lit (worst {worst[2]} units in the dark, "
                       f"after {len(worst[0])} step{'s' if len(worst[0]) != 1 else ''}, "
                       f"to {worst[1].split(' -> ')[0]})")
-    ok = _check_returns(h, returns, exits) and ok
+    ok = _check_returns(h, returns, exits, found, reached) and ok
     for kind, at, path in unarmed:
         ok = False
         print(f"verify FAIL hostiles: the player can meet {kind} at {at} unarmed, after: "
@@ -545,7 +559,10 @@ def run_verify(m, bsp_path, coverage_check=True, pending=()):
         campaign.save_exits(m.name, h, found, reached)
         for target in sorted({t for t, _ in exits}):
             usable = [(lm, found.get((t, lm), [])) for t, lm in exits if t == target]
-            if not any(states for _, states in usable):
+            if not any(states for _, states in usable) and pending:
+                print(f"verify      exit to {target}: no way to it works on a first visit; checked again coming "
+                      f"back from {', '.join(pending)} (a pad they power?)")
+            elif not any(states for _, states in usable):
                 ok = False
                 print(f"verify FAIL exit to {target}: no way to it works in any state of play")
             for lm, states in usable:
@@ -564,6 +581,7 @@ def run_verify(m, bsp_path, coverage_check=True, pending=()):
         ok = _round_trips(h, m, checkpoints, exits, found) and ok
     ok = _verify_links(m.name, h, reached, pending) and ok
     prog.reached = reached
+    m.verified_reached = reached
     items = [e for e in h.entities if e.get("classname", "").startswith(("item_", "weapon_", "ammo_"))
              and e.get("origin")]
     for e in items:
@@ -614,13 +632,30 @@ def run_verify(m, bsp_path, coverage_check=True, pending=()):
     return ok
 
 
-def _check_returns(h, returns, exits):
+def _check_returns(h, returns, exits, found=None, reached=None):
     """Coming back from later maps: [(label, globals, position, gear)]. Can the player
-    leave again from where they land? Returns True unless they're stranded."""
-    from .verify import stranded_check
+    leave again from where they land? With `found` (the ways out first visits found,
+    {(target, landmark): states}) and a way out none of them could use (a pad powered
+    by a card from a later map), the map is played from where returning players land
+    instead, and the states they can leave in are added to `found` (and their
+    positions to `reached`). Returns True unless they're stranded."""
+    from .verify import progression, stranded_check
     ok = True
+    closed = [k for k in exits if found is not None and not found.get(k)]
     for label, glob, pos, inv in returns:
-        way = stranded_check(h, pos, glob, inv, exits)
+        if not closed:
+            way = stranded_check(h, pos, glob, inv, exits)
+        else:
+            prog = progression(h, [], globals=glob, start=pos, inventory=inv, exits=exits)
+            ways = [k for k, states in prog.exits.items() if states]
+            way = ", ".join(f"{t} ({lm})" for t, lm in ways)
+            for key in ways:
+                have = found.setdefault(key, [])
+                have += [st for st in prog.exits[key] if (st[0], st[3]) not in [(x[0], x[3]) for x in have]]
+                if key in closed:
+                    print(f"verify ok   exit to {key[0]} ({key[1]}): usable coming back from {label}")
+            if reached is not None:
+                reached |= prog.reached
         if way:
             print(f"verify ok   coming back from {label}: the player can leave again ({way})")
         else:
@@ -646,7 +681,18 @@ def returns_from(name, later):
             state = [f"{g} {'on' if glob.get(g, 0) == 1 else 'off'}" for g in sorted(read & set(glob))
                      if not g.endswith("_not")] + [f"with {GEAR_NAMES.get(g, g)}" for g in sorted(inv)]
             seen.setdefault(key, (f"{prev} via {lm}{': ' + ', '.join(state) if state else ''}", glob, pos, inv))
-    return _check_returns(h, list(seen.values()), exits)
+    if not seen:
+        return True
+    print(f"==================== coming back into {name} from {', '.join(later)}")
+    saved = campaign.load_exits(name)
+    found, touch = saved if saved else ({}, set())
+    ok = _check_returns(h, list(seen.values()), exits, found, touch)
+    campaign.save_exits(name, h, found, touch)            # with the ways out only coming back opens
+    for target in sorted({t for t, _ in exits}):
+        if not any(found.get((t, lm)) for t, lm in exits if t == target):
+            print(f"verify WARN exit to {target}: still no way to it, first visit or coming back from "
+                  f"{', '.join(later)}")
+    return ok
 
 
 def _round_trips(h, m, checkpoints, exits, found):

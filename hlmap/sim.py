@@ -11,7 +11,9 @@ Half-Life game code (HLSDK) does, including its quirks:
   - trigger_relay, multi_manager: no master; func_button, func_door, game_counter
     and trigger_once/multiple honour one
   - func_door: a named door opens when fired (a "toggle" one, spawnflags 32, also
-    closes); "starts open" (1) doors start open
+    closes); "starts open" (1) doors start open, and fired move to where they were
+    built (HLSDK swaps the two positions); a func_water moves the same way
+  - func_breakable: broken by an armed player, then gone (firing its target)
   - gear: the HEV suit, the long jump module (only taken with the suit) and weapons
     go into the player's inventory; player_weaponstrip takes weapons and ammo (not
     the suit or the long jump); game_player_equip gives what it names
@@ -37,10 +39,12 @@ _MM_RESERVED = {"classname", "targetname", "origin", "angles", "spawnflags", "ta
 LIGHTS = ("light", "light_spot")
 BUTTONS = ("func_button", "func_rot_button")
 DOORS = ("func_door", "func_door_rotating")
+MOVERS = DOORS + ("func_water",)      # move when fired (a func_water is water that moves like a door)
 ITEMS = ("item_", "weapon_", "ammo_")
 # fired but only make sounds, messages or effects (recorded, no state)
 GEAR = ("item_suit", "item_longjump")          # kept for good once taken
-GEAR_NAMES = {"item_suit": "HEV suit", "item_longjump": "long jump module", "weapon_crowbar": "crowbar"}
+GEAR_NAMES = {"item_suit": "HEV suit", "item_longjump": "long jump module", "weapon_crowbar": "crowbar",
+              "weapon_9mmhandgun": "pistol"}
 EFFECTS = {"ambient_generic", "game_text", "env_shake", "env_fade", "env_spark", "env_sprite", "env_beam",
            "env_message", "speaker", "trigger_camera", "env_explosion", "env_funnel", "env_laser",
            "scripted_sequence", "scripted_sentence"}
@@ -96,7 +100,7 @@ class World:
         self.render = {}      # entity -> renderamt set by env_render
         self.gone = set()     # removed: picked-up items, fire-once relays, killtargets
         self.pressed = set()  # toggle buttons in their pressed state; wait -1 buttons used up
-        self.opened = {i for i, e in enumerate(ents) if e.get("classname") in DOORS and e.get("targetname")
+        self.opened = {i for i, e in enumerate(ents) if e.get("classname") in MOVERS and e.get("targetname")
                        and int(e.get("spawnflags") or 0) & 1}   # named doors open now (1 = starts open)
         self.inventory = set(inventory)   # the player's gear and weapons
         self.retarget = {}    # trigger_changetarget
@@ -195,6 +199,15 @@ class World:
         self.gone.add(i)
         if c in GEAR or c.startswith("weapon_"):
             self.inventory.add(c)
+        self._use_targets(i, TOGGLE, None)
+        return self.run(self._until(until))
+
+    def break_(self, i, until=None):
+        """The player breaks a func_breakable (with a weapon): it's gone, and fires its
+        target."""
+        if not self.armed:
+            return self
+        self.gone.add(i)
         self._use_targets(i, TOGGLE, None)
         return self.run(self._until(until))
 
@@ -333,10 +346,13 @@ class World:
                     self.render[j] = int(float(e.get("renderamt") or 0))
         elif c in BUTTONS:
             self._button(i)
-        elif c in DOORS:
+        elif c in MOVERS:
             if self.master_ok(e.get("master")):
-                if int(e.get("spawnflags") or 0) & 32 and i in self.opened:
+                sf = int(e.get("spawnflags") or 0)
+                if sf & 32 and i in self.opened:
                     self.opened.discard(i)        # a toggle door closes again
+                elif sf & 1 and not sf & 32 and e.get("targetname"):
+                    self.opened.discard(i)        # starts open: fired, it moves to where it was built
                 else:
                     self.opened.add(i)
         elif c == "player_weaponstrip":

@@ -1,8 +1,10 @@
 """The campaign: its maps in the order a player meets them, and where they join.
 
     office  --(road tunnel)-->  labs  --(transit pad)-->  xen
-       ^                          |  ^                     |
-       +--(pad in the basement)---+  +--(one way: the field lab's pad, after the course)
+       ^                          |  ^ |                   |
+       +--(pad in the basement)---+  | +--(SITE 3 pad,     +--(one way: the field lab's pad,
+                                     |    the Xen card)-->  pumps      after the course)
+                                     +---------------------------+
 
 Each map is its own script. The stretch of road tunnel where the level changes is
 built here, once, so both maps have exactly the same copy of it (verify compares
@@ -27,7 +29,7 @@ from hlmap import Material, box, props
 from hlmap.campaign import Link, PadLink
 from hlmap.mapfile import Entity, prepare_texture
 
-MAPS = ["office", "labs", "xen"]
+MAPS = ["office", "labs", "xen", "pumps"]
 
 TUNNEL_HEIGHT = 192
 TUNNEL = Material(floor="OUT_PAVE1", wall="TNNL_W12", ceiling="TNNL_C1")
@@ -97,4 +99,6 @@ XEN_GATE = PadLink("pad_xen", ("labs", "xen"),       # the hub <-> the Xen field
                    carries=["gear_confiscated"])     # the field lab took the crowbar: the station gives one back
 XEN_RETURN = PadLink("pad_xen_lab", ("labs", "xen"),  # the Xen field lab (the course's end) -> the hub
                      one_way_from="xen",             # the hub's end only receives: no way back to the lab
-                     carries=["xen_clearance"])      # the field lab's keycard (what it opens comes later)
+                     carries=["xen_clearance"])      # the field lab's keycard: it powers the hub's SITE 3 pad
+PUMPS_PAD = PadLink("pad_pumps", ("labs", "pumps"),  # the hub's SITE 3 <-> the pump station (needs the Xen card)
+                    carries=["pumps_running"])        # the station's pumps, restarted

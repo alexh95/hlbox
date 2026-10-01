@@ -27,7 +27,8 @@ the chamber sends you to the transit hub, a room with no doors, somewhere in Xen
 the look out of its window. Its pads lead back to the chamber, to the office basement
 (another map) and to the Xen field station (the xen map: the long jump course).
 Players who finish the course come back from its field lab onto an arrivals pad (a
-one-way link). Two more wait offline for sites still to come ("SITE 3", "SITE 4").
+one-way link), with its clearance card, which powers the pad to the pump station
+(the pumps map). One more waits offline for a site still to come ("SITE 4").
 
 The tunnel leads back to the office.
 """
@@ -35,7 +36,7 @@ from hlmap import Level, Map, Material, box, logic, props, scene, teleport
 from hlmap.art import boxworth_faces, font, paint
 from hlmap.geometry import cylinder
 from hlmap.mapfile import prepare_texture
-from maps.campaign import LAMP_TEX, LINK, OFFICE_PAD, SODIUM, TUNNEL, XEN_GATE, XEN_RETURN
+from maps.campaign import LAMP_TEX, LINK, OFFICE_PAD, PUMPS_PAD, SODIUM, TUNNEL, XEN_GATE, XEN_RETURN
 from PIL import Image, ImageDraw
 
 BAY = Material(floor="TNNL_FLR4", wall="TNNL_W12C2", ceiling="TNNL_C1", floor_align="min")
@@ -87,8 +88,8 @@ TEST_SKIPPED = [
 HUB_WELCOME = [
     ("Welcome to the resonance transit hub. Please step away from the pads.", None, None),
     ("Its location is classified. Also, unknown. Please do not tap on the glass.", None, None),
-    ("The Xen field station is open. Mind the gravity. Sites three and four are pending construction. Watch "
-     "this space.", None, None),
+    ("The Xen field station is open. Mind the gravity. The pump station needs a clearance from the field lab. "
+     "Site four is pending construction.", None, None),
 ]
 
 
@@ -132,7 +133,8 @@ def build():
     # values when the map is loaded on its own
     sector_pass = logic.Flag("sector_pass", False, (600, 200, 200))
     briefing = logic.Flag("brief_pending", True, (600, 200, 200))
-    m.add(sector_pass.entities(), briefing.entities())
+    clearance = logic.Flag("xen_clearance", False, (1024, -352, 150))   # the Xen field lab's card: SITE 3's power
+    m.add(sector_pass.entities(), briefing.entities(), clearance.entities())
 
     tunnel(m, tunnel_exit)
     loading_bay(m, bay, lab_door, sector_pass, briefing)
@@ -141,7 +143,7 @@ def build():
     talks = test(m, chamber, chamber_door, briefing, net)
     # the intercom panel by the console: skips whatever the intercom is saying
     m.add(scene.skip_button((1296, 224, 60), "north", [welcome] + talks, name="intercom_skip"))
-    transit_hub(m, hub, view, hub_window, net)
+    transit_hub(m, hub, view, hub_window, net, clearance)
 
     m.add(props.player_start((-944, 208, 0), facing="north"))     # where the office's tunnel lands you
     m.checkpoints = [("the loading dock", (320, 832, 48))]
@@ -163,7 +165,7 @@ def build():
         "chamber_pad": (1500, 330, 80, 8, 15, ["transit_start"]),
         "skip_panel": (1296, 300, 64, 8, 270),
         "hub": (1024, -560, 110, 12, 90, ["transit_start"]),
-        "hub_east": (900, -420, 90, 8, 0, ["transit_start"]),
+        "hub_east": (900, -420, 90, 8, 0, ["transit_start", "xen_clearance_on", ("transit_sync", 1.2)]),
         "hub_window": (1024, -300, 90, 4, 270, ["transit_start"]),
         "hub_board": (900, -400, 70, 0, 250, ["transit_start"]),
         "hub_offline": (1024, -420, 70, 0, 20, ["transit_start"]),
@@ -403,7 +405,7 @@ def test(m, chamber, chamber_door, briefing, net):
     return [talk] + list(endings.values())
 
 
-def transit_hub(m, hub, view, window, net):
+def transit_hub(m, hub, view, window, net, clearance):
     """The resonance transit hub and its network: a pad here and in the test chamber;
     pads into the office basement and to the Xen field station (other maps: campaign
     PadLinks, their partners face the other way), and an arrivals pad for the Xen field
@@ -417,7 +419,8 @@ def transit_hub(m, hub, view, window, net):
     net.pad("hub_xen", (1120, -200, 0), "south", site="TRANSIT HUB", label="XEN FIELD STATION", link=XEN_GATE)
     net.pad("hub_field_lab", (1328, -420, 0), "west", site="TRANSIT HUB", label="XEN FIELD LAB",
             link=XEN_RETURN)                        # arrivals only: the course's end leads back here
-    net.pad("hub_site3", (1312, -200, 0), "south", site="TRANSIT HUB", label="SITE 3", offline=True)
+    net.pad("hub_site3", (1312, -200, 0), "south", site="TRANSIT HUB", label="PUMP STATION", link=PUMPS_PAD,
+            power=clearance)                        # dark until the Xen field lab's card
     net.pad("hub_site4", (720, -420, 0), "east", site="TRANSIT HUB", label="SITE 4", offline=True)
     m.add(net.entities(m))
     # the room: lab lights, the network board, the window and what's out there

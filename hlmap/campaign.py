@@ -207,6 +207,18 @@ def save_exits(map_name, hulls, found, reached):
     exits_path(map_name).write_text(json.dumps({"exits": out}, indent=1))
 
 
+def load_exits(map_name):
+    """A map's recorded ways out, as progression found them: ({(target, landmark):
+    [(globals, position, path, inventory)]}, every recorded touch position), or None."""
+    ex = _exits(map_name)
+    if ex is None:
+        return None
+    found = {(e["target"], e["landmark"]): [({k: int(v) for k, v in st["globals"].items()}, tuple(st["position"]),
+                                             st.get("path", []), list(st.get("inventory", ())))
+                                            for st in e["states"]] for e in ex}
+    return found, {tuple(p) for e in ex for p in e["touch"]}
+
+
 def _exits(map_name):
     p = exits_path(map_name)
     if not p.exists():

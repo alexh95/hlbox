@@ -223,7 +223,32 @@ against the level's intended air and refuses to install on failure:
 - **Gear and hostiles.** The HEV suit, the long jump module and weapons are
   inventory in the simulated state (§3.10), picked up like keys (the module only
   with the suit). A hostile monster, or a monstermaker making one, that the player
-  can get within 256 units of in a state without a weapon fails the map.
+  can get at in a state without a weapon fails the map: within 256 across and 160
+  up or down with a clear line (sight hull) between; a barnacle only from right
+  under it; a leech only in the water.
+- **Water and breath.** The clip hulls keep water (-3) apart from solid; hull 0 has
+  the surface. Where the player's waist is in water the walker swims: 16-unit moves
+  in six directions, falls into water break, a ledge level with the surface can be
+  climbed onto (the water jump), and nothing lifts out of the surface. The flood is
+  a shortest-path search counting units swum with the eyes under, reset by every
+  breath: a place only reached by more than 1,800 such units is out of reach
+  (the game's 12 s of air are about 3,000). func_waters are water boxes that move
+  with the simulated state (a tank that drains, a cistern that floods).
+  - In the game: a func_water compiled outside the level (waiting under a floor)
+    never showed or filled; built full where it's seen and starting lowered (a
+    "starts open" door that fired, moves back to where it was built), it rises. A
+    func_water drains rigidly, so `checks.water_movers` makes sure it never moves
+    into another room's air (the first layout drained the tank into the tunnel
+    under it). Both found by playtests and screenshots, not by verify.
+  Tests: a 2,000-unit flooded corridor drowns the player and the same with an air
+  pocket half way doesn't; a cistern is climbable only once flooded.
+- **Lifts and breakables.** A func_plat is solid at both its stops and ridden either
+  way; a func_breakable blocks until an armed player next to it breaks it (it's
+  then gone from the walker's solids). Tests: a lift up a shaft; a grate with and
+  without a crowbar to hand.
+- **Navigation nodes.** With `m.auto_nodes`, the build writes info_nodes into the
+  compiled entity lump after verify: one per 192 cell of the floor the player can
+  walk (not swimming), so moving monsters chase properly.
 - **Lockout.** Every state of play must still be able to reach the state that sees
   everything. Otherwise the line of play leading there is reported (e.g. a one-shot
   breaker used before the outage, which locks a power-dependent door for good).

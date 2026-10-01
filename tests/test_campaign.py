@@ -254,13 +254,16 @@ def test_the_test_brings_the_transit_network_online():
     away = {e["landmark"]: e["hlmap_master"] for e in w.ents                     # pads into other maps
             if e.get("classname") == "trigger_changelevel" and e.get("hlmap_style") == "portal"
             and not e.get("hlmap_arrivals")}
-    assert sorted(away) == ["pad_office", "pad_xen"], away                       # (the field lab's is arrivals only)
+    assert sorted(away) == ["pad_office", "pad_pumps", "pad_xen"], away          # (the field lab's is arrivals only)
     assert not any(w.master_ok(m) for m in away.values())
     w.press(_index(w, "func_button", target="lab_test"))
     assert all(w.teleport_enabled(i) for i in pads)
     assert w.master_ok(away["pad_office"]) and w.master_ok(away["pad_xen"])
-    discs = [i for i, e in enumerate(w.ents) if e.get("targetname", "").endswith("_disc")]
+    assert not w.master_ok(away["pad_pumps"])                                    # that one needs the Xen card
+    discs = [i for i, e in enumerate(w.ents) if e.get("targetname", "").endswith("_disc")
+             and e["targetname"] != "hub_site3_disc"]
     assert discs and all(w.frame[i] == 0 for i in discs)         # lit
+    assert w.frame[_index(w, "func_wall", targetname="hub_site3_disc")] == 1    # dark: no Xen card yet
     w.fire("transit_start")                                     # starting it again does nothing
     assert all(w.frame[i] == 0 for i in discs) and all(w.teleport_enabled(i) for i in pads)
 
@@ -377,6 +380,46 @@ def test_the_field_lab_pad_is_one_way():
     assert back[0].get("hlmap_arrivals")                                 # not a way out, for verify
     assert len([e for e in labs.ents if e.get("classname") == "info_landmark"
                 and e.get("targetname") == "pad_xen_lab"]) == 1          # the field lab's pad lands you there
+
+
+
+def test_the_xen_card_powers_the_pad_to_the_pump_station():
+    w = _labs({"xen_clearance": 1, "transit_online": 1})          # back from the Xen field lab with the card
+    pad = _index(w, "trigger_changelevel", landmark="pad_pumps")
+    assert w.master_ok(w.ents[pad]["hlmap_master"])
+    assert w.frame[_index(w, "func_wall", targetname="hub_site3_disc")] == 0    # lit on arrival (the sync)
+
+
+def _pumps(globals_=None, inventory=()):
+    return World(_map_ents("pumps"), globals_, inventory).start()
+
+
+def test_the_pump_station_lets_an_armed_player_into_the_hall():
+    w = _pumps()
+    door = _index(w, "func_door", master="pumps_armed_is_on")
+    assert not w.door_passable(door)
+    w.pickup(_index(w, "weapon_9mmhandgun"))
+    assert w.door_passable(door) and w.armed
+
+
+def test_the_valves_move_the_water_and_the_pumps_open_the_way_back():
+    w = _pumps(inventory=("weapon_9mmhandgun",))
+    tank = _index(w, "func_water", targetname="tank_water")
+    gate = _index(w, "func_door", master="pumps_tank_drained_is_on")
+    assert tank not in w.opened and not w.door_passable(gate)
+    w.press(_index(w, "func_rot_button", target="drain_tank"))
+    assert tank in w.opened and w.door_passable(gate)                  # drained: the bottom gate unlocks
+    seal = _index(w, "func_door", targetname="cistern_seal")
+    cistern = _index(w, "func_water", targetname="cistern_water")
+    assert w.door_passable(seal) and cistern in w.opened               # the water waits lowered (moved)
+    w.press(_index(w, "func_rot_button", target="flood_cistern"))
+    assert cistern not in w.opened and not w.door_passable(seal)       # risen into place; the tunnel sealed
+    out = _index(w, "func_door", targetname="pumps_out")
+    assert not w.door_passable(out)
+    w.press(_index(w, "func_button", target="start_pumps"))
+    assert w.door_passable(out) and w.globals["pumps_running"] == 1
+    lights = [i for i, e in enumerate(w.ents) if e.get("targetname") == "hall_lights"]
+    assert lights and all(w.lit[i] for i in lights)
 
 
 if __name__ == "__main__":

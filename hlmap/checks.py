@@ -59,7 +59,8 @@ def doorway_clearance(m, level, depth=64):
     crate or other furniture within `depth` units of the opening (a player must be able
     to walk straight up to a door, not around obstacles). Windows (a sill) aren't walked
     through; solid beside the opening that reaches its wall (rock around a passage, a
-    thicker jamb) only makes the doorway deeper."""
+    thicker jamb) only makes the doorway deeper. Nothing may stand in an opening
+    itself (a sign hung in a doorway: grown to the player's size, it plugs it)."""
     problems = []
     blockers = []
     for r in level.extra_air:
@@ -73,9 +74,17 @@ def doorway_clearance(m, level, depth=64):
     for op in level.openings:
         if op.room.name.endswith("-mouth"):
             continue
+        (lo, hi) = op.mins, op.maxs
+        # in the opening or within the player's half width of it, at any height it
+        # has (a sign hung on the wall in a doorway: grown to the player, it plugs it)
+        zlo, zhi = list(lo), list(hi)
+        zlo[op.axis] -= 16
+        zhi[op.axis] += 16
+        for name, blo, bhi in (blockers if lo[2] <= max(op.a.floor, op.b.floor) + 18 else ()):   # (not windows)
+            if not name.startswith("stair hole") and all(blo[k] < zhi[k] - 1 and zlo[k] + 1 < bhi[k] for k in range(3)):
+                problems.append(f"{name} is in opening {op.room.name} (it blocks it)")
         a = op.axis
         o = 1 - a
-        (lo, hi) = op.mins, op.maxs
         if lo[2] > max(op.a.floor, op.b.floor) + 18:
             continue                      # a window
         for sign, room in ((-1, op.a), (+1, op.b)) if op.direction[a] > 0 else ((+1, op.a), (-1, op.b)):
@@ -92,3 +101,35 @@ def doorway_clearance(m, level, depth=64):
                     problems.append(f"{name} blocks the way to doorway {op.room.name} "
                                     f"(within {depth} units on the {room.name} side)")
     return sorted(set(problems))
+
+
+def water_movers(m, level):
+    """Water that moves (func_water: a tank draining, a cistern filling) may only ever
+    fill one room: where it starts and where it moves to, it must not reach into the
+    air of another (a tank drained down into the room under it floods that room)."""
+    problems = []
+    for e in m.entities:
+        if e.classname != "func_water" or not e.brushes:
+            continue
+        los, his = zip(*(b.bounds() for b in e.brushes))
+        lo = tuple(min(v[k] for v in los) for k in range(3))
+        hi = tuple(max(v[k] for v in his) for k in range(3))
+        angle = str(e.get("angle") or "")
+        d = (0, 0, 1) if angle == "-1" else (0, 0, -1) if angle == "-2" else None
+        if d is None:
+            yaw = math.radians(float(str(e.get("angles") or "0 0 0").split()[1]))
+            d = (math.cos(yaw), math.sin(yaw), 0)
+        travel = sum(abs(d[k] * (hi[k] - lo[k] - 2)) for k in range(3)) - float(e.get("lip") or 0)
+        def rooms_in(blo, bhi):
+            return [r.name for r in level.rooms
+                    if all(blo[k] < r.maxs[k] - 1 and r.mins[k] + 1 < bhi[k] for k in range(3))]
+        start = rooms_in(lo, hi)
+        end = rooms_in(tuple(lo[k] + d[k] * travel for k in range(3)), tuple(hi[k] + d[k] * travel for k in range(3)))
+        name = e.get("targetname") or ""
+        if len(start) > 1 or len(end) > 1:
+            problems.append(f"func_water {name} reaches into rooms {', '.join(sorted(set(start + end)))} "
+                            "(it would flood more than one)")
+        elif start and end and end != start:
+            problems.append(f"func_water {name} moves out of {start[0]} into {end[0]} (it would flood it: under "
+                            "where water drains to, there must be solid)")
+    return problems
