@@ -1115,3 +1115,28 @@ def breakable(mins, maxs, texture="{GRATE2", material=2, health=20, see_through=
     if target:
         kv["target"] = target
     return Entity("func_breakable", brushes=[box(mins, maxs, texture, comment="breakable")], kv=kv)
+
+
+def mounted_gun(pivot, name, yaw=0, yaw_range=60, pitch_range=30, damage=15, rate=10, texture="GENERIC015K",
+                body="OUT_GALV1"):
+    """A mounted machine gun the player can man (func_tank, 12mm rounds) on a pedestal,
+    pivoting at `pivot` and pointing `yaw` degrees (it turns +-yaw_range, tilts
+    +-pitch_range), with its controls behind it (func_tankcontrols: stand there and
+    +use; +use again to let go). Returns [gun, controls, pedestal]. verify: a player
+    at the controls can break the breakables it can hit."""
+    x, y, z = pivot
+    gun = Entity("func_tank", brushes=[
+        box((x - 20, y - 10, z - 10), (x + 16, y + 10, z + 10), body, comment="gun body"),
+        box((x + 16, y - 3, z - 3), (x + 72, y + 3, z + 3), texture, comment="barrel"),
+        box((x - 36, y - 14, z - 4), (x - 20, y + 14, z + 4), texture, comment="handles"),
+        box((x - 8, y - 8, z - 8), (x + 8, y + 8, z + 8), "ORIGIN")],
+        targetname=name, yawrate=120, yawrange=yaw_range, yawtolerance=15, pitchrate=120, pitchrange=pitch_range,
+        pitchtolerance=5, barrel=72, barrely=0, barrelz=0, spriteflash="sprites/muzzleflash2.spr", spritescale=0.5,
+        firerate=rate, bullet_damage=damage, persistence=3, firespread=1, minRange=0, maxRange=0, bullet=3,
+        spawnflags=32, angle=yaw)
+    a = math.radians(yaw)
+    bx, by = x - 56 * math.cos(a), y - 56 * math.sin(a)          # where the gunner stands
+    ctl = Entity("func_tankcontrols", brushes=[box((bx - 24, by - 24, z - 52), (bx + 24, by + 24, z + 24),
+                                                   "AAATRIGGER")], target=name)
+    stand = detail(box((x - 6, y - 6, z - 52), (x + 6, y + 6, z - 10), body, comment="gun pedestal"))
+    return [gun, ctl, stand]

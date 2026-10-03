@@ -65,7 +65,7 @@ class Hulls:
         brush model's tree (model_head) instead of the world's; p is then relative to
         the entity's origin."""
         if hull == 0:
-            n = self.heads[0]
+            n = self.heads[0] if head is None else head
             while n >= 0:
                 pl, c0, c1 = self.nodes[n]
                 nrm, d = self._plane(pl)
@@ -499,11 +499,18 @@ def gravity_zones(hulls):
 
 
 def lethal_volumes(hulls):
-    """trigger_hurts that kill (damage >= LETHAL, on from the start): grown boxes."""
+    """trigger_hurts that kill (damage >= LETHAL, on from the start): [(grown box,
+    root of the model's standing-player hull, entity origin)]. A player touches one
+    where their origin is inside that hull (the engine tests brush triggers' own
+    hulls, not just their boxes: a diagonal strip of live rail kills on the strip)."""
     models = hulls.models()
-    return [_grow(*_placed(models, e)) for e in hulls.entities
-            if e.get("classname") == "trigger_hurt" and e.get("model", "").startswith("*")
-            and float(e.get("dmg") or 0) >= LETHAL and not int(e.get("spawnflags") or 0) & 2]
+    out = []
+    for e in hulls.entities:
+        if e.get("classname") == "trigger_hurt" and e.get("model", "").startswith("*") \
+                and float(e.get("dmg") or 0) >= LETHAL and not int(e.get("spawnflags") or 0) & 2:
+            o = tuple(float(c) for c in e["origin"].split()) if e.get("origin") else (0.0, 0.0, 0.0)
+            out.append((_grow(*_placed(models, e)), hulls.model_head(int(e["model"][1:]), 1), o))
+    return out
 
 
 def teleports(hulls):
@@ -610,7 +617,11 @@ class Walker:
         return g
 
     def deadly(self, p):
-        return any(all(lo[k] <= p[k] <= hi[k] for k in range(3)) for lo, hi in self.lethal)
+        for (lo, hi), head, o in self.lethal:
+            if all(lo[k] <= p[k] <= hi[k] for k in range(3)) and \
+                    self.h.contents(1, (p[0] - o[0], p[1] - o[1], p[2] - o[2]), head) not in PASSABLE:
+                return True
+        return False
 
     def teleport_at(self, p):
         """Where an active teleporter the player at p touches sends them, or None."""
@@ -1068,6 +1079,8 @@ class Progress:
 def _describe(ents, i, models):
     e = ents[i]
     c = e.get("classname", "")
+    if c == "path_track":
+        return f"board the tram at {e.get('hlmap_stop')}"
     if e.get("origin") and not e.get("model"):
         at = tuple(round(float(v)) for v in e["origin"].split())
     else:
@@ -1095,10 +1108,12 @@ def threatens(hulls, kind, o, p, in_water):
     above (its tongue drops straight down); a leech only in the water; anything else
     within 256 across and 160 up or down, with nothing solid between."""
     if kind == "monster_barnacle":
-        return abs(p[0] - o[0]) <= 48 and abs(p[1] - o[1]) <= 48 and p[2] < o[2] and             _clear_line(hulls, o, (p[0], p[1], p[2] + EYES))
+        return abs(p[0] - o[0]) <= 48 and abs(p[1] - o[1]) <= 48 and p[2] < o[2] and \
+            _clear_line(hulls, o, (p[0], p[1], p[2] + EYES))
     if kind in ("monster_leech", "monster_ichthyosaur") and not in_water(p):
         return False
-    return abs(p[0] - o[0]) <= 256 and abs(p[1] - o[1]) <= 256 and abs(p[2] - o[2]) <= 160 and         _clear_line(hulls, (o[0], o[1], o[2] + 16), (p[0], p[1], p[2] + EYES))
+    return abs(p[0] - o[0]) <= 256 and abs(p[1] - o[1]) <= 256 and abs(p[2] - o[2]) <= 160 and \
+        _clear_line(hulls, (o[0], o[1], o[2] + 16), (p[0], p[1], p[2] + EYES))
 
 
 def progression(hulls, checkpoints, radius=24, light=None, max_states=300, globals=None, start=None,
@@ -1185,11 +1200,22 @@ def progression(hulls, checkpoints, radius=24, light=None, max_states=300, globa
             lo, hi = _placed(models, e)
             actions.append((i, "touch", lambda p, lo=lo, hi=hi:
                             all(lo[k] - HALF[k] < p[k] < hi[k] + HALF[k] for k in range(3))))
+    for i, ctl, hits in tank_targets(hulls):   # breakables a mounted gun can hit, from its controls
+        lo, hi = ctl
+        for j in hits:
+            if j in brk:
+                actions.append((j, "shoot", lambda p, lo=lo, hi=hi:
+                                sum(max(0, lo[k] - p[k], p[k] - hi[k]) ** 2 for k in range(3)) <= 32 * 32))
     for i in brk:                      # breakables: smashed (with a weapon) from next to them
         lo, hi = _placed(models, ents[i])
         actions.append((i, "break_", lambda p, lo=lo, hi=hi:
                         sum(max(0, lo[k] - p[k], p[k] - hi[k]) ** 2 for k in range(3)) <= 64 * 64))
-    rel = world0.relevance([i for i, _ in doors] + [i for i, _, _ in tele] + [i for i, _, _ in movers], watch)
+    # tracks: switches, gates and lifts change where the tram goes (hlmap/track.py)
+    tracks = [i for i, e in enumerate(ents) if e.get("classname") in ("path_track", "func_trackchange")]
+    trams = [i for i, e in enumerate(ents) if e.get("classname") == "func_tracktrain"]
+    stops = tram_stops(ents)
+    rel = world0.relevance([i for i, _ in doors] + [i for i, _, _ in tele] + [i for i, _, _ in movers] + tracks,
+                           watch)
     rel = (rel[0] | set(brk), rel[1])
     actions = [a for a in actions if a[0] in rel[0] or a[0] in gear]
 
@@ -1245,6 +1271,7 @@ def progression(hulls, checkpoints, radius=24, light=None, max_states=300, globa
                       ["origin"].split())
     pos0 = w.settle(start)
     nodes, order = {}, []
+    steps = {}                      # (state, next state): what the player does
     queue = deque([(world0, pos0, [], None)])
     while queue:
         world, pos, path, via = queue.popleft()
@@ -1253,6 +1280,7 @@ def progression(hulls, checkpoints, radius=24, light=None, max_states=300, globa
         key = (world.key(rel), min(comp))
         if via:
             nodes[via[0]]["children"].append((via[1], key))
+            steps.setdefault((via[0], key), path[-1])
         if key in nodes:
             continue
         if len(nodes) >= max_states:
@@ -1285,8 +1313,27 @@ def progression(hulls, checkpoints, radius=24, light=None, max_states=300, globa
                 if was != now:
                     change.append(f"{tele_name(t)} {'on' if now else 'off'}")
             res.warnings += [x for x in w2.warnings if x not in res.warnings]
-            step = _describe(ents, i, models) + (f": {'; '.join(change)}" if change else "")
+            step = ("man the mounted gun, " if method == "shoot" else "") + _describe(ents, i, models) + \
+                (f": {'; '.join(change)}" if change else "")
             queue.append((w2, spot, path + [step], (key, a)))
+        # the tram: from the stop it stands at, to every stop it can be driven to (and
+        # what its dead ends set off on the way: a lift); the player gets off there
+        for t in trams:
+            at = world.train.get(t)
+            if at not in stops:
+                continue
+            label, board = stops[at]
+            reach = _boarding(board)
+            if not any(reach(p) for p in comp):
+                continue
+            for w2, dest in world.rides(t):
+                if dest == at and w2.key(rel) == base:
+                    continue
+                land = w.settle((stops[dest][1][0], stops[dest][1][1], stops[dest][1][2] + HALF[2]))
+                change = w2.describe_change(world)
+                res.warnings += [x for x in w2.warnings if x not in res.warnings]
+                step = f"drive the tram from {label} to {stops[dest][0]}" + (f": {'; '.join(change)}" if change else "")
+                queue.append((w2, land, path + [step], (key, (at, "ride", reach))))
     res.states = len(nodes)
 
     # which checkpoints each state reaches
@@ -1327,13 +1374,34 @@ def progression(hulls, checkpoints, radius=24, light=None, max_states=300, globa
     for k in order:                   # parents come first (breadth first)
         par = nodes[k]["parent"]
         seen_on_way[k] = cov[k] | (seen_on_way[par] if par in seen_on_way else frozenset())
-    goals = {k for k in order if cov[k] == reachable}
+    # what each state can still get to, by any line of play from it (one area at a time
+    # counts: by tram, each stop's platform is an area of its own)
+    ahead = {k: cov[k] for k in order}
+    changed = True
+    while changed:
+        changed = False
+        for k in reversed(order):
+            got = ahead[k]
+            for _, c in nodes[k]["children"]:
+                if c in ahead and not ahead[c] <= got:
+                    got = got | ahead[c]
+            if got != ahead[k]:
+                ahead[k] = got
+                changed = True
+    goals = {k for k in order if cov[k] == reachable}         # everything in reach at once
     if not goals and back:            # a one-way course: all of it on the way to leaving
         goals = {k for k in order if k in back and seen_on_way[k] == reachable}
+    line = None
+    if not goals:                     # by tram: one stop at a time, along any line of play
+        line = _covering_line(order[0], nodes, cov, reachable)
+        if line:
+            goals = {line[-1]}
     if not goals:
-        res.warnings.append("no single state of play reaches every area (areas that close behind you?)")
-        goals = {max(order, key=lambda k: len(cov[k]))}
-    finish = set(goals) | back
+        res.warnings.append("no line of play reaches every area (areas that close behind you?)")
+        goals = {max(order, key=lambda k: len(seen_on_way[k]))}
+    # a lockout: a state from which some area can never be reached again, unless the
+    # player can leave from there and come back (come_back)
+    finish = set(back)
     changed = True
     while changed:
         changed = False
@@ -1341,11 +1409,15 @@ def progression(hulls, checkpoints, radius=24, light=None, max_states=300, globa
             if k not in finish and any(c in finish for _, c in nodes[k]["children"]):
                 finish.add(k)
                 changed = True
+    finish |= {k for k in order if ahead[k] == reachable}
     for k in order:
         if k not in finish:
-            lost = sorted(checkpoints[c][0] for c in reachable - cov[k])
+            lost = sorted(checkpoints[c][0] for c in reachable - ahead[k])
             res.softlocks.append((nodes[k]["path"], lost))
-    res.log = nodes[next(k for k in order if k in goals)]["path"]
+    if line:
+        res.log = [steps[(a, b)] for a, b in zip([order[0]] + line, line)]
+    else:
+        res.log = nodes[next(k for k in order if k in goals)]["path"]
 
     # every teleporter trip must have a way back (to where the player stepped on), or
     # at least leave everything else still reachable; checked with all of them on
@@ -1424,6 +1496,310 @@ def progression(hulls, checkpoints, radius=24, light=None, max_states=300, globa
             if best_a is not None:
                 res.darkness.append((node["path"], _describe(ents, best_a[0], models), best_cost))
     return res
+
+
+def tank_targets(hulls, reach=4096):
+    """Mounted guns a player can man (func_tank with func_tankcontrols): [(gun entity,
+    the controls' box, [breakables it can hit])]. A gun turns +-yawrange about its
+    `angle` and tilts +-pitchrange, and its bullets fly `reach` (HLSDK func_tank:
+    4096); it hits a breakable if a point of it is within those, in sight of the gun's
+    pivot (the world's sight hull)."""
+    models = hulls.models()
+    ents = hulls.entities
+    out = []
+    for e in ents:
+        if e.get("classname") != "func_tankcontrols" or not e.get("model", "").startswith("*"):
+            continue
+        gun = next((i for i, g in enumerate(ents) if g.get("classname", "").startswith("func_tank")
+                    and g.get("classname") != "func_tankcontrols" and g.get("targetname") == e.get("target")), None)
+        if gun is None or not ents[gun].get("origin"):
+            continue
+        g = ents[gun]
+        o = tuple(float(c) for c in g["origin"].split())
+        yaw0 = float(g["angles"].split()[1]) if g.get("angles") else float(g.get("angle") or 0)
+        yr, pr = float(g.get("yawrange") or 0), float(g.get("pitchrange") or 0)
+        hits = []
+        for j, b in enumerate(ents):
+            if b.get("classname") != "func_breakable" or not b.get("model", "").startswith("*"):
+                continue
+            lo, hi = _placed(models, b)
+            pts = [tuple((lo[k] + hi[k]) / 2 for k in range(3))] + \
+                  [tuple(lo[k] + (hi[k] - lo[k]) * f for k, f in enumerate(fs))
+                   for fs in ((.2, .2, .5), (.8, .8, .5), (.2, .8, .5), (.8, .2, .5), (.5, .5, .2), (.5, .5, .8))]
+            for p in pts:
+                d = [p[k] - o[k] for k in range(3)]
+                dist = math.sqrt(sum(c * c for c in d))
+                if dist > reach or dist < 1:
+                    continue
+                yaw = math.degrees(math.atan2(d[1], d[0]))
+                pitch = math.degrees(math.atan2(d[2], math.hypot(d[0], d[1])))
+                if abs((yaw - yaw0 + 180) % 360 - 180) <= yr + 0.5 and abs(pitch) <= pr + 0.5 and \
+                        _clear_line(hulls, o, p):
+                    hits.append(j)
+                    break
+        out.append((gun, _placed(models, e), hits))
+    return out
+
+
+def trams(hulls):
+    """The trams (func_tracktrain): [(entity index, model mins, model maxs (relative to
+    its origin), height (origin over the track), wheels, deck (over the track,
+    hlmap_deck; else the model's top))]."""
+    models = hulls.models()
+    out = []
+    for i, e in enumerate(hulls.entities):
+        if e.get("classname") == "func_tracktrain" and e.get("model", "").startswith("*"):
+            lo, hi = models[int(e["model"][1:])]
+            height = float(e.get("height") or 0)
+            deck = float(e["hlmap_deck"]) if e.get("hlmap_deck") else hi[2] + height
+            out.append((i, lo, hi, height, float(e.get("wheels") or 100), deck))
+    return out
+
+
+def _ahead(g, path, s, d):
+    """The point d further than s along the polyline `path` (node indices), clamped."""
+    pts = [g.nodes[k]["origin"] for k in path]
+    s += d
+    for a, b in zip(pts, pts[1:]):
+        L = math.dist(a[:2], b[:2])
+        if s <= L or b is pts[-1]:
+            t = min(1.0, s / L) if L else 0.0
+            return tuple(a[k] + (b[k] - a[k]) * t for k in range(3))
+        s -= L
+    return pts[-1]
+
+
+def _spread(a, b, step):
+    n = max(1, round((b - a) / step))
+    return [a + (b - a) * f / n for f in range(n + 1)]
+
+
+def tram_body(hulls, tram, step=12):
+    """Points of a tram's own body (its model's tree, sampled every `step`), about its
+    origin, outermost first: what must stay clear of walls as it runs."""
+    i, lo, hi = tram[0], tram[1], tram[2]
+    head = struct.unpack_from("<4i", hulls.bsp.lumps["models"], int(hulls.entities[i]["model"][1:]) * 64 + 36)[0]
+    pts = [(x, y, z) for x in _spread(lo[0] + 1, hi[0] - 1, step) for y in _spread(lo[1] + 1, hi[1] - 1, step)
+           for z in _spread(lo[2] + 1, hi[2] - 1, step) if hulls.contents(0, (x, y, z), head) == -2]
+    return sorted(pts, key=lambda q: -(abs(q[0]) / max(1, hi[0]) + abs(q[1]) / max(1, hi[1])))
+
+
+def _tram_points(o, yaw, body):
+    """A tram's body points turned to `yaw` at origin o (the model is built facing
+    west: the engine turns it to the track's yaw + 180)."""
+    c, sn = math.cos(yaw), math.sin(yaw)
+    return [(o[0] - x * c + y * sn, o[1] - x * sn - y * c, o[2] + z) for x, y, z in body]
+
+
+def track_checks(hulls, step=32):
+    """Does the tram fit along its track, and can players get on at the stops?
+      clearance: for every stretch (targets and switches' other ways), every `step`
+        units, the tram as the game places it (origin `height` over the track, facing
+        the track `wheels` ahead, built facing west and turned) must have its sides and
+        top in open air (the sight hull; sky counts as a wall), and up every lift.
+      riding: a player standing on the deck, anywhere along the track and up every
+        lift, must not touch a lethal trigger_hurt (a live rail across a lift's shaft
+        kills everyone riding the lift).
+      boarding: at each stop the platform (its board point) must be level with the
+        deck (within 16), and its edge next to the tram's side (a gap of at most 24,
+        which a player's 32-unit box steps over without falling).
+    Returns [problem strings]."""
+    from .track import Graph
+    ents = hulls.entities
+    found = trams(hulls)
+    if not found:
+        return []
+    g = Graph.from_entities(ents)
+    problems = []
+    _, lo, hi, height, wheels, deck = found[0]
+    body = tram_body(hulls, found[0])
+    lethal = lethal_volumes(hulls)
+    riders = [(x, y, deck - height + HALF[2] + 1) for x in (lo[0] / 2, 0, hi[0] / 2) for y in (lo[1] / 2, 0, hi[1] / 2)]
+
+    def deadly(p):
+        return any(all(a[k] <= p[k] <= b[k] for k in range(3)) and
+                   hulls.contents(1, (p[0] - o_[0], p[1] - o_[1], p[2] - o_[2]), head) not in PASSABLE
+                   for (a, b), head, o_ in lethal)
+    killed = set()
+
+    def ride(o, yaw, where):
+        for q in _tram_points(o, yaw, riders):
+            if deadly(q):
+                spot = (round(q[0] / 64), round(q[1] / 64), round(q[2] / 64))
+                if spot not in killed:
+                    killed.add(spot)
+                    problems.append(f"a player riding the tram dies at {tuple(round(v) for v in q)} ({where}): "
+                                    "a lethal trigger_hurt reaches the deck")
+                return
+    seen = set()
+    for k in range(len(g.nodes)):
+        for b in (g.next[k], g.alt[k]):
+            if b is None or g.nodes[b]["origin"] == g.nodes[k]["origin"]:
+                continue
+            for c in ({g.next[b], g.alt[b]} - {None}) or {None}:
+                path = [k, b] + ([c] if c is not None else [])
+                a, bb = g.nodes[k]["origin"], g.nodes[b]["origin"]
+                L = math.dist(a[:2], bb[:2])
+                for n in range(int(L // step) + 1):
+                    s = n * step
+                    p = _ahead(g, path, s, 0)
+                    f = _ahead(g, path, s, wheels)
+                    yaw = math.atan2(f[1] - p[1], f[0] - p[0]) if f[:2] != p[:2] else \
+                        math.atan2(bb[1] - a[1], bb[0] - a[0])
+                    o = (p[0], p[1], p[2] + height)
+                    ride(o, yaw, f"between {g.nodes[k]['name']} and {g.nodes[b]['name']}")
+                    for q in _tram_points(o, yaw, body):
+                        if hulls.contents(0, q) in (-2, -6):
+                            spot = (round(q[0] / 64) * 64, round(q[1] / 64) * 64, round(q[2] / 64) * 64)
+                            if spot not in seen:
+                                seen.add(spot)
+                                problems.append(f"the tram runs into a wall at {tuple(round(v) for v in q)} "
+                                                f"(between {g.nodes[k]['name']} and {g.nodes[b]['name']})")
+                            break
+    for i, e in enumerate(ents):                      # up the lifts, with the tram on them
+        if e.get("classname") != "func_trackchange":
+            continue
+        top = g.by_name.get(e.get("toptrack"))
+        bottom = g.by_name.get(e.get("bottomtrack"))
+        if top is None or bottom is None:
+            problems.append(f"lift {e.get('targetname')}: its top or bottom track is missing")
+            continue
+        t, bt = g.nodes[top]["origin"], g.nodes[bottom]["origin"]
+        nb = g.next[top] if g.next[top] is not None else g.prev[top]
+        d = g.nodes[nb]["origin"] if nb is not None else (t[0] + 1, t[1], t[2])
+        yaw = math.atan2(d[1] - t[1], d[0] - t[0])
+        hit = None
+        for z in range(int(bt[2]), int(t[2]) + 1, 8):
+            ride((t[0], t[1], z + height), yaw, f"riding lift {e.get('targetname')}")
+        for z in range(int(bt[2]), int(t[2]) + 1, step):
+            hit = next((q for q in _tram_points((t[0], t[1], z + height), yaw, body)
+                        if hulls.contents(0, q) in (-2, -6)), None)
+            if hit:
+                problems.append(f"lift {e.get('targetname')}: the tram runs into the shaft at "
+                                f"{tuple(round(v) for v in hit)}")
+                break
+    for k, n in enumerate(g.nodes):                    # boarding at the stops
+        if not n["stop"] or not n["board"]:
+            continue
+        nb = g.next[k] if g.next[k] is not None else g.prev[k]
+        if nb is None:
+            continue
+        d, o = g.nodes[nb]["origin"], n["origin"]
+        yaw = math.atan2(d[1] - o[1], d[0] - o[0])
+        u = (math.cos(yaw), math.sin(yaw))
+        bx, by, bz = n["board"]
+        rel = (bx - o[0], by - o[1])
+        along, across = rel[0] * u[0] + rel[1] * u[1], -rel[0] * u[1] + rel[1] * u[0]
+        half_l, half_w = (hi[0] - lo[0]) / 2, (hi[1] - lo[1]) / 2
+        # from the board point toward the track, where does the platform end?
+        side = (-u[1], u[0]) if across > 0 else (u[1], -u[0])
+        edge = abs(across)
+        def floor_at(d):
+            return hulls.contents(0, (o[0] + side[0] * d + u[0] * along, o[1] + side[1] * d + u[1] * along, bz - 2))
+        while edge > 0 and floor_at(edge) == -2:
+            edge -= 1
+        gap = edge - half_w
+        rise = bz - (o[2] + deck)
+        if hulls.contents(1, (bx, by, bz + HALF[2] + 1)) == -2 or hulls.contents(1, (bx, by, bz + HALF[2] - 2)) != -2:
+            problems.append(f"stop {n['stop']}: nowhere to stand at its board point "
+                            f"{tuple(round(v) for v in n['board'])} (on the platform, clear of its edge: a player "
+                            "there must not fall off)")
+        elif abs(along) > half_l or gap > 24 or gap < 0 or abs(rise) > 16:
+            problems.append(f"stop {n['stop']}: the platform at {tuple(round(v) for v in n['board'])} isn't "
+                            f"beside the tram's deck ({round(gap)} away, {round(rise)} up): players can't get on")
+    return problems
+
+
+def tram_exits(hulls, walker, known, step=64, near=256):
+    """Can a player get off the tram between stops? Every `step` units along the track,
+    stepping off its sides and ends (and jumping off its sides, 45 up and out) must
+    end in the live rail (a lethal trigger_hurt); within `near` of a stop, also on
+    ground the stops reach (`known`: positions, the platforms). Anywhere else the
+    player could leave the tram where verify's model of it (a ride from stop to stop)
+    doesn't. Returns [problem strings]."""
+    from .track import Graph
+    found = trams(hulls)
+    if not found:
+        return []
+    g = Graph.from_entities(hulls.entities)
+    _, lo, hi, height, wheels, deck = found[0]
+    grid = {}
+    for p in known:
+        grid.setdefault((int(p[0] // 64), int(p[1] // 64)), []).append(p)
+
+    def is_known(p):
+        gx, gy = int(p[0] // 64), int(p[1] // 64)
+        return any(abs(q[0] - p[0]) <= 32 and abs(q[1] - p[1]) <= 32 and abs(q[2] - p[2]) <= 40
+                   for ix in (gx - 1, gx, gx + 1) for iy in (gy - 1, gy, gy + 1) for q in grid.get((ix, iy), ()))
+    stops = [n["origin"] for n in g.nodes if n["stop"]]
+    problems, seen = [], set()
+    for k in range(len(g.nodes)):
+        for b in (g.next[k], g.alt[k]):
+            if b is None:
+                continue
+            a, bb = g.nodes[k]["origin"], g.nodes[b]["origin"]
+            L = math.dist(a[:2], bb[:2])
+            if L < 1:
+                continue
+            u = ((bb[0] - a[0]) / L, (bb[1] - a[1]) / L)
+            v = (-u[1], u[0])
+            for n in range(int(L // step) + 1):
+                p = (a[0] + u[0] * n * step, a[1] + u[1] * n * step, a[2])
+                z = p[2] + deck + HALF[2] + 1
+                outs = [(p[0] + v[0] * sd * (hi[1] + 20), p[1] + v[1] * sd * (hi[1] + 20), z) for sd in (-1, 1)]
+                outs += [(p[0] + u[0] * sd * (hi[0] + 20), p[1] + u[1] * sd * (hi[0] + 20), z) for sd in (-1, 1)]
+                outs += [(p[0] + v[0] * sd * (hi[1] + 64), p[1] + v[1] * sd * (hi[1] + 64), z + JUMP_HEIGHT)
+                         for sd in (-1, 1)]
+                for c in outs:
+                    if walker._solid(c):
+                        continue
+                    land = walker._drop(*c)
+                    at_stop = any(math.dist(p[:2], s[:2]) <= near and abs(p[2] - s[2]) < 64 for s in stops)
+                    if land is None or (at_stop and is_known(land)):
+                        continue
+                    spot = tuple(round(w_ / 64) * 64 for w_ in land)
+                    if spot not in seen:
+                        seen.add(spot)
+                        problems.append(f"a player can get off the tram near {tuple(round(w_) for w_ in p)} onto "
+                                        f"{tuple(round(w_) for w_ in land)} (no live rail there, not a stop)")
+    return problems
+
+
+def tram_stops(ents):
+    """Platforms the tram stops at (path_tracks with hlmap_stop, see hlmap/track.py):
+    {path_track entity index: (label, board point on the platform floor)}."""
+    return {i: (e["hlmap_stop"], tuple(float(c) for c in e["hlmap_board"].split()))
+            for i, e in enumerate(ents) if e.get("classname") == "path_track" and e.get("hlmap_stop")
+            and e.get("hlmap_board")}
+
+
+def _boarding(board):
+    """Standing positions from which a player steps onto the tram at a stop's board
+    point (on the platform edge)."""
+    bx, by, bz = board
+    return lambda p: abs(p[0] - bx) <= 40 and abs(p[1] - by) <= 40 and abs(p[2] - (bz + HALF[2])) <= 24
+
+
+def _covering_line(start, nodes, cov, reachable, limit=50000):
+    """The shortest line of play (states after the start) along which every area is
+    reached at some point, e.g. one stop after another by tram; None if there's none."""
+    first = (start, cov[start])
+    todo, back = deque([first]), {first: None}
+    while todo and len(back) < limit:
+        k, got = todo.popleft()
+        if got == reachable:
+            line, at = [], (k, got)
+            while back[at] is not None:
+                line.append(at[0])
+                at = back[at]
+            return line[::-1]
+        for _, c in nodes[k]["children"]:
+            if c in nodes:
+                nxt = (c, got | cov[c])
+                if nxt not in back:
+                    back[nxt] = (k, got)
+                    todo.append(nxt)
+    return None
 
 
 def _seeable(comp, light, levels):

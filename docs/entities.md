@@ -106,6 +106,41 @@ brushes; the others are point entities with an `origin`.
   `spawnflags` 1 = starts hidden. `props.slideshow` uses one per slide.
 - **func_train** / **path_corner**: moving platforms. `target` = first path_corner,
   `speed`.
+
+## Trains and tracks (hlmap/track.py builds these)
+
+- **path_track**: a node of track. `target` = the next node (forward), `altpath` = a
+  switch's other way. Fired, a node with an altpath toggles between the two ("off"
+  throws it, "on" sets it back); one without toggles `spawnflags` 1 (disabled: trains
+  stop at the node before). `netname` fires when a train stops at it at a dead end,
+  `message` when one passes. `spawnflags` 4 makes the altpath apply going backward, 8
+  takes the controls from the player, 32768 starts it switched. Each node keeps ONE
+  previous node: the last whose link points at it as the map starts (entity order).
+- **func_tracktrain**: the drivable train. Built facing WEST (the engine turns it to
+  face the track + 180), ORIGIN brush required (and no `origin` key: SDHLT reads it
+  as a second ORIGIN brush). `target` = its first node, `height` = its origin over
+  the nodes, `wheels` = how far ahead it looks to face along the track (and, for a
+  lift, how close to its centre it must stop), `speed` (top speed; +forward/+back
+  step a quarter at a time), `startspeed`, `dmg` (to what blocks it), `sounds` 1-6
+  (`plats/ttrain*.wav`), `volume` (x0.1), `bank`. `spawnflags` 1 no pitch, 2 no
+  player control, 4 forward only, 8 not solid. A player standing on it presses +use
+  to drive (anywhere on it, unless a func_traincontrols says where). It passes through
+  walls: only the track stops it.
+- **func_traincontrols**: a box (AAATRIGGER) on the train, `target` = the train: the
+  player must stand in it to drive. Optional.
+- **func_trackchange**: a track lift. ORIGIN brush at its centre, built at the top;
+  `toptrack`/`bottomtrack` = nodes at its two levels (the nearest of each named
+  node's chain), `train`, `height` (travel), `speed`, `rotation` (degrees turned on
+  the way), `spawnflags` 8 starts at the bottom, `movesnd`/`stopsnd`. Fired, it moves
+  to its other level, with the train if that's stopped on it (within `wheels` of its
+  centre, on or next to its node); close but not on it, it buzzes and stays. It
+  disables its node at the level it isn't at.
+- **func_tank** / **func_tankcontrols**: a mounted gun the player can use. ORIGIN at
+  the pivot, built pointing east, `angle` = where it points; `yawrange`/`pitchrange`
+  (degrees each way), `yawrate`/`pitchrate`, `barrel` (muzzle distance), `bullet` (1
+  9mm, 2 MP5, 3 12mm), `bullet_damage`, `firerate`, `spawnflags` 32 = player
+  controllable. func_tankcontrols: a box (AAATRIGGER) where the gunner stands,
+  `target` = the gun; +use there to take it, +use again to let go.
 - **func_rotating**: fan. ORIGIN brush, `speed`, `spawnflags` 1 = start on.
 - **trigger_once** / **trigger_multiple**: AAATRIGGER texture. `target`, `delay`,
   `wait` (for trigger_multiple).

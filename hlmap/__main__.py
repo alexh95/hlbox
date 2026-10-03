@@ -248,6 +248,9 @@ def cmd_playtest(a):
     if a.teleports:
         _playtest_teleports(a, bsp, d)
         return
+    if a.tram:
+        _playtest_tram(a, bsp, d)
+        return
     if not a.at:
         sys.exit('pass --pickups, --links, or --at "x y feet_z yaw" with --do steps')
     start = tuple(float(c) for c in a.at.split())
@@ -258,6 +261,44 @@ def cmd_playtest(a):
     after = log[log.find("HLMAP_PLAY_START"):] if "HLMAP_PLAY_START" in log else ""
     for line in after.splitlines():
         if line.startswith(("Firing:", "Found:")) or "error" in line.lower():
+            print("  console:", line)
+    for p in pngs:
+        print(f"shot {p}")
+
+
+def _playtest_tram(a, bsp, d):
+    """Ride the tram in the real game: the player starts on a stop's platform (its board
+    point) facing the tram, walks aboard, takes the controls (+use), then for each
+    --drive leg "notches:seconds" sets the speed (+forward or, negative, +back that
+    many quarter steps) and rides that long. Prints what the train reports (developer
+    2: its speed, the dead ends it stops at) and what fired (a lift, a gate)."""
+    import math
+
+    from . import game
+    from .verify import Hulls, tram_stops
+    h = Hulls(bsp)
+    ents = h.entities
+    stops = tram_stops(ents)
+    k = next((i for i, (label, _) in stops.items() if label.upper() == a.tram.upper()), None)
+    if k is None:
+        sys.exit(f"no stop {a.tram!r}; stops: {', '.join(label for label, _ in stops.values())}")
+    node = tuple(float(c) for c in ents[k]["origin"].split())
+    board = stops[k][1]
+    yaw = math.degrees(math.atan2(node[1] - board[1], node[0] - board[0]))
+    script = ["+forward", int(math.dist(board[:2], node[:2]) / 3.2) + 8, "-forward", 40, "+use", 2, "-use", 30]
+    for leg in a.drive or ["4:20"]:
+        notches, secs = leg.split(":")
+        n = int(notches)
+        key = "forward" if n > 0 else "back"
+        for _ in range(abs(n)):
+            script += [f"+{key}", 2, f"-{key}", 4]
+        script += [int(float(secs) * 100)]
+    pngs, log = game.playtest(bsp, (board[0], board[1], board[2], yaw), script, d, fire=a.fire or ())
+    (d / "console.log").write_text(log, encoding="utf-8")
+    after = log[log.find("HLMAP_PLAY_START"):] if "HLMAP_PLAY_START" in log else ""
+    for line in after.splitlines():
+        if "TRAIN" in line or "TrackTrain" in line or line.startswith(("Firing:", "Found:")) \
+                or "error" in line.lower():
             print("  console:", line)
     for p in pngs:
         print(f"shot {p}")
@@ -579,6 +620,7 @@ def run_verify(m, bsp_path, coverage_check=True, pending=()):
                       + (f"; gear: {', '.join(GEAR_NAMES.get(g, g) for g in gear)}" if gear else ""))
     if getattr(m, "verify_round_trips", False) and found:
         ok = _round_trips(h, m, checkpoints, exits, found) and ok
+    ok = _verify_tracks(h, reached) and ok
     ok = _verify_links(m.name, h, reached, pending) and ok
     prog.reached = reached
     m.verified_reached = reached
@@ -629,6 +671,37 @@ def run_verify(m, bsp_path, coverage_check=True, pending=()):
                 print(f"    {f['texture']} at {f['at']} facing {f['normal']}")
         else:
             print(f"verify ok   coverage: all {checked} visible faces present")
+    return ok
+
+
+def _verify_tracks(h, reached):
+    """A tram (hlmap/track.py): does it fit along its track and up its lifts, can
+    players get on at the stops, and only there (the live rail)?"""
+    from .verify import (Walker, _placed, gravity_zones, lethal_volumes, lifts, solid_entities, track_checks,
+                         tram_exits, trams)
+    if not trams(h):
+        return True
+    ok = True
+    problems = track_checks(h)
+    for p in problems[:12]:
+        print(f"verify FAIL track: {p}")
+    if problems:
+        ok = False
+        if len(problems) > 12:
+            print(f"    ... and {len(problems) - 12} more")
+    else:
+        print("verify ok   track: the tram clears the walls all along its track and up its lifts, nothing lethal "
+              "reaches its riders, and it's level with every stop's platform")
+    models = h.models()
+    w = Walker(h, [_placed(models, e) for e in h.entities if e.get("classname") == "func_ladder"],
+               solids=solid_entities(h), zones=gravity_zones(h), lethal=lethal_volumes(h), lifts=lifts(h))
+    off = tram_exits(h, w, reached or ())
+    for p in off[:8]:
+        print(f"verify FAIL track: {p}")
+    if off:
+        ok = False
+    else:
+        print("verify ok   track: between stops, getting off the tram lands on the live rail")
     return ok
 
 
@@ -921,6 +994,9 @@ def main(argv=None):
     pt.add_argument("--pickups", action="store_true", help="walk straight at every item; check it's picked up")
     pt.add_argument("--links", action="store_true", help="walk into every level change; check the next map loads")
     pt.add_argument("--teleports", action="store_true", help="walk onto every teleporter; snapshot the landing")
+    pt.add_argument("--tram", metavar="STOP", help="board the tram at this stop and drive it (see --drive)")
+    pt.add_argument("--drive", action="append", metavar="NOTCHES:SECONDS",
+                    help='with --tram: set the speed (quarters, negative = backward) and ride, e.g. "4:20"')
     pt.add_argument("--at", help='"x y feet_z yaw" player start')
     pt.add_argument("--fire", action="append", help="targetname to trigger first (as for shots)")
     pt.add_argument("--do", action="append", help='a console command ("+forward") or frames to wait ("60"); '

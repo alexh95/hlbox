@@ -13,13 +13,18 @@ from hlmap.sim import World  # noqa: E402
 
 
 def _lump(entities):
-    """Entities as they appear in a compiled BSP's entity lump (brush models numbered)."""
+    """Entities as they appear in a compiled BSP's entity lump (brush models numbered;
+    an ORIGIN brush gives its entity an origin, as the compiler does)."""
     out, model = [], 1
     for e in entities:
         d = {"classname": e.classname, **{k: _kv_value(v) for k, v in e.kv.items() if v is not None}}
         if e.brushes:
             d["model"] = f"*{model}"
             model += 1
+            for b in e.brushes:
+                if any(f.texture == "ORIGIN" for f in b.faces):
+                    lo, hi = b.bounds()
+                    d["origin"] = " ".join(f"{(lo[k] + hi[k]) / 2:g}" for k in range(3))
         out.append(d)
     return out
 
@@ -266,6 +271,70 @@ def test_talk_checks_gestures_against_the_model():
         assert "'wav'" in str(e) and "wave" in str(e)
     else:
         raise AssertionError("unknown gesture not caught")
+
+
+def _track_world(train_at):
+    """A straight line west to east with a lift in the middle (node m), an upper line
+    over it, a switch at w (to a spur), a gate at e; the tram (wheels 96) at train_at."""
+    def node(name, x, z=0, **kv):
+        return {"classname": "path_track", "targetname": name, "origin": f"{x} 0 {z}", **kv}
+    ents = [{"classname": "worldspawn"},
+            node("lift_down", 0, netname="lift"), node("lift_up", 0, 384, netname="lift"),
+            node("spur", -512, target="spur_end"), node("spur_end", -768),
+            node("w", -256, target="before", altpath="spur"), node("before", -128, target="lift_down", altpath="m"),
+            node("m", 0, target="e"), node("e", 256, target="far", spawnflags="1"), node("far", 512),
+            node("u0", -128, 384, target="lift_up", altpath="um"), node("um", 0, 384, target="u1"),
+            node("u1", 256, 384),
+            {"classname": "func_trackchange", "targetname": "lift", "toptrack": "um", "bottomtrack": "m",
+             "train": "tram", "height": "384", "spawnflags": "8", "origin": "0 0 376"},
+            {"classname": "func_tracktrain", "targetname": "tram", "target": train_at, "wheels": "96"}]
+    return World(ents).start()
+
+
+def test_switches_and_gates_follow_the_game():
+    """HLSDK CPathTrack::Use: a switch fired "off" goes to its altpath, "on" back;
+    toggles flip; a node without an altpath toggles disabled (a gate)."""
+    from hlmap.sim import OFF, ON
+    w = _track_world("w")
+    sw = next(i for i, e in enumerate(w.ents) if e.get("targetname") == "w")
+    gate = next(i for i, e in enumerate(w.ents) if e.get("targetname") == "e")
+    assert sw not in w.switched and gate in w.closed
+    w.fire("w", ON)
+    assert sw not in w.switched                  # "on": already on its target
+    w.fire("w", OFF)
+    assert sw in w.switched                      # "off": to the altpath
+    w.fire("w")
+    assert sw not in w.switched
+    w.fire("e")
+    assert gate not in w.closed
+
+
+def test_the_lift_takes_the_tram_only_when_it_stands_on_it():
+    t_of = lambda w: next(i for i, e in enumerate(w.ents) if e.get("classname") == "func_tracktrain")
+    lift_of = lambda w: next(i for i, e in enumerate(w.ents) if e.get("classname") == "func_trackchange")
+    name = lambda w, i: w.ents[i].get("targetname")
+    w = _track_world("lift_down")                # stopped on the lift (its dead end): up with it
+    w.fire("lift")
+    assert w.lift_top[lift_of(w)] and name(w, w.train[t_of(w)]) == "um"
+    w = _track_world("before")                   # 128 short of it: too close to move without it
+    w.fire("lift")
+    assert not w.lift_top[lift_of(w)]
+    assert ("func_trackchange", "blocked") in [(c, u) for _, c, u in w.effects]
+    w = _track_world("spur_end")                 # far away: the lift goes up empty
+    w.fire("lift")
+    assert w.lift_top[lift_of(w)] and name(w, w.train[t_of(w)]) == "spur_end"
+
+
+def test_driving_stops_at_gates_and_follows_switches():
+    w = _track_world("before")
+    t = next(i for i, e in enumerate(w.ents) if e.get("classname") == "func_tracktrain")
+    where = lambda world: sorted({world.ents[n].get("targetname") for _, n in world.rides(t, stops_only=False)})
+    assert "far" not in where(w) and "spur_end" not in where(w)      # the gate; the switch on the line
+    assert "u1" in where(w)                     # up the lift, from its dead end
+    w.fire("w")
+    assert "spur_end" in where(w)
+    w.fire("e")
+    assert "far" in where(w)
 
 
 if __name__ == "__main__":

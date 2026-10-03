@@ -254,16 +254,19 @@ def test_the_test_brings_the_transit_network_online():
     away = {e["landmark"]: e["hlmap_master"] for e in w.ents                     # pads into other maps
             if e.get("classname") == "trigger_changelevel" and e.get("hlmap_style") == "portal"
             and not e.get("hlmap_arrivals")}
-    assert sorted(away) == ["pad_office", "pad_pumps", "pad_xen"], away          # (the field lab's is arrivals only)
+    assert sorted(away) == ["pad_freight", "pad_office", "pad_pumps", "pad_xen"], away   # (the field lab's: arrivals)
     assert not any(w.master_ok(m) for m in away.values())
     w.press(_index(w, "func_button", target="lab_test"))
     assert all(w.teleport_enabled(i) for i in pads)
     assert w.master_ok(away["pad_office"]) and w.master_ok(away["pad_xen"])
     assert not w.master_ok(away["pad_pumps"])                                    # that one needs the Xen card
+    assert not w.master_ok(away["pad_freight"])                                  # and that one the pumps
+    later = ("hub_site3_disc", "hub_site4_disc")
     discs = [i for i, e in enumerate(w.ents) if e.get("targetname", "").endswith("_disc")
-             and e["targetname"] != "hub_site3_disc"]
+             and e["targetname"] not in later]
     assert discs and all(w.frame[i] == 0 for i in discs)         # lit
-    assert w.frame[_index(w, "func_wall", targetname="hub_site3_disc")] == 1    # dark: no Xen card yet
+    for name in later:
+        assert w.frame[_index(w, "func_wall", targetname=name)] == 1           # dark: no Xen card, no pumps yet
     w.fire("transit_start")                                     # starting it again does nothing
     assert all(w.frame[i] == 0 for i in discs) and all(w.teleport_enabled(i) for i in pads)
 
@@ -420,6 +423,69 @@ def test_the_valves_move_the_water_and_the_pumps_open_the_way_back():
     assert w.door_passable(out) and w.globals["pumps_running"] == 1
     lights = [i for i, e in enumerate(w.ents) if e.get("targetname") == "hall_lights"]
     assert lights and all(w.lit[i] for i in lights)
+
+
+# ------------------------------------------------------------ the freight line
+
+def test_the_pumps_power_the_pad_to_the_freight_line():
+    w = _labs({"transit_online": 1})
+    pad = _index(w, "trigger_changelevel", landmark="pad_freight")
+    assert not w.master_ok(w.ents[pad]["hlmap_master"])               # dark until the pumps run
+    w = _labs({"transit_online": 1, "pumps_running": 1})
+    assert w.master_ok(w.ents[pad]["hlmap_master"])
+
+
+def _freight():
+    w = World(_map_ents("freight"), {}, ("weapon_9mmhandgun",)).start()
+    return w, _index(w, "func_tracktrain")
+
+
+def _stops(w, t):
+    """{stop: the world with the tram there} for every stop the tram can be driven to."""
+    out = {}
+    for w2, n in w.rides(t):
+        out.setdefault(w2.ents[n]["hlmap_stop"], w2)
+    return out
+
+
+def test_the_tram_goes_round_by_the_chord_switch_and_up_the_lift():
+    w, t = _freight()
+    assert set(_stops(w, t)) == {"DISPATCH", "WEST PORTAL"}            # the sector gate and the west gate
+    w = _stops(w, t)["WEST PORTAL"]
+    w.press(_index(w, "func_button", target="chord_switch"))
+    there = _stops(w, t)
+    assert {"DEPOT", "TOWER", "DISPATCH"} <= set(there) and "YARD" not in there   # the chord, the lift up
+    lift = _index(w, "func_trackchange")
+    assert there["TOWER"].lift_top[lift]
+
+
+def test_the_yard_wants_the_switch_and_the_barricade_shot():
+    w, t = _freight()
+    w = _stops(w, t)["WEST PORTAL"]
+    w.press(_index(w, "func_button", target="chord_switch"))
+    w = _stops(w, t)["TOWER"]
+    w.press(_index(w, "func_button", target="yard_switch"))
+    assert "YARD" not in _stops(w, t)                                   # the barricade
+    w.shoot(_index(w, "func_breakable", target="yard_barricade"))
+    assert "YARD" in _stops(w, t)
+
+
+def test_line_power_opens_the_gates_and_the_loop():
+    w, t = _freight()
+    w = _stops(w, t)["WEST PORTAL"]
+    w.press(_index(w, "func_button", target="chord_switch"))
+    w = _stops(w, t)["TOWER"]
+    w.press(_index(w, "func_button", target="yard_switch"))
+    w.shoot(_index(w, "func_breakable", target="yard_barricade"))
+    w = _stops(w, t)["YARD"]
+    w.press(_index(w, "func_button", target="line_power"))
+    w.run(until=w.time + 3)
+    assert w.globals.get("freight_power") == 1
+    for gate in ("west_gate", "sector_gate"):
+        assert _index(w, "path_track", targetname=gate) not in w.closed
+        assert w.door_passable(_index(w, "func_door", targetname=gate))
+    home = _stops(w, t)["DISPATCH"]                                     # down the lift, through the sector gate
+    assert {"DISPATCH", "WEST PORTAL", "DEPOT"} <= set(_stops(home, t))  # and on round the loop
 
 
 if __name__ == "__main__":

@@ -25,7 +25,8 @@ screenshots. There is no GUI editor in the loop.
 ```
 python -m hlmap setup                  # once per checkout: fetch the compilers
 python -m hlmap build <map>            # script -> .map -> compile (normal) -> install -> build/<map>/plan.png
-python -m hlmap build office labs xen pumps  # several maps, in campaign order (each verified with how you arrive)
+python -m hlmap build office labs xen pumps freight   # several maps, in campaign order (each verified
+                                       # with how you arrive)
 python -m hlmap build <map> --shots    # ...and take in-engine screenshots of CAMERAS
 python -m hlmap build <map> --profile fast|final
 python -m hlmap preview <map> [--view top|x|y] [--cut N]   # cutaway PNG only, no compile
@@ -40,15 +41,20 @@ python -m hlmap playtest <map> --at "x y feet_z yaw" [--fire NAME] --script "+fo
                                        # (a frame = 10 ms of game time; `give item_suit` etc. work)
 python -m hlmap playtest <map> --links # walk into every level change: does the next map load? (snapshot)
 python -m hlmap playtest <map> --teleports [--fire transit_start]   # step onto every teleporter (snapshot)
+python -m hlmap playtest <map> --tram STOP [--fire chord_switch] [--drive 4:20]...
+                                       # board the tram at a stop and drive it (speed in quarter notches,
+                                       # negative = back : seconds); prints its speed changes and dead ends
 python -m hlmap info <map>             # BSP stats + entity lump
 python tests/test_verify.py            # the verifier must catch holes, invisible walls, missing faces,
                                        # lockouts and dark routes; jumps, long jumps, low gravity, pits;
-                                       # swimming and breath, flooding, lifts, grates
+                                       # swimming and breath, flooding, lifts, grates; the tram between
+                                       # stops, its lift, walls in its way, getting off between stops
 python tests/test_logic.py             # logic helpers behave as intended (simulated, no compile)
 python tests/test_office.py            # the office's story: briefing, power cut, welcome back (simulated)
 python tests/test_campaign.py          # level transitions must match up; what office hands to labs;
                                        # the lab's skippable intercom and early chamber door; the Xen
-                                       # airlock's kit check, the crowbar taken and given back
+                                       # airlock's kit check, the crowbar taken and given back; the
+                                       # freight line's switches, barricade, lift and line power
 ```
 
 The verification loop after every change:
@@ -80,7 +86,12 @@ The verification loop after every change:
        gives 12 s of air, about 3,000 units of swimming): a place reached only by a
        longer swim counts as out of reach. An air pocket on the way resets it.
      - **Lifts** (func_plat) are ridden up and down; **breakables** (func_breakable)
-       block until an armed player next to one breaks it.
+       block until an armed player next to one breaks it, or one at a mounted gun's
+       controls that can hit it.
+     - **Trams** (`hlmap.track`) are rides from stop to stop: where the tram stands,
+       the switches, gates and lifts are state of play; from the platform it stands
+       at, the player can ride to every stop it can be driven to (forward and back,
+       as switched, through what its dead ends set off: a lift going up with it).
      - **Gear** is part of the state of play: the HEV suit, the long jump module
        (only taken with the suit) and weapons are picked up like keys.
        player_weaponstrip takes weapons and ammo (not the suit or the module),
@@ -91,13 +102,20 @@ The verification loop after every change:
        locked. The log prints the shortest line of play, with what each step changes.
      - "locks never opened" plus unreachable rooms means a key behind its own door.
    - **Lockout:** no order of play may leave an area unreachable for good. For
-     example, a one-shot breaker used before the power fails.
+     example, a one-shot breaker used before the power fails. (Areas reached one at a
+     time count: by tram, each platform is an area of its own.)
    - **Hostiles:** a monster from `verify.HOSTILE` (headcrabs, zombies, ...), or a
      monstermaker making one, that the player can get at without a weapon fails:
      within 256 units with nothing solid between; a barnacle only from right under
      it; a leech only in the water. Hand out a weapon first, and gate the way on it
      (the Xen airlock won't cycle without one; the pump station's door to the hall
      opens for an armed player).
+   - **Tracks:** the tram (its own model, as the game turns it on curves) must clear
+     the walls all along its track and up its lifts; a player standing on its deck
+     must touch no lethal trigger_hurt anywhere it goes (a live rail across a lift's
+     opening killed everyone riding the lift); every stop's board point is
+     ground to stand on, level with the deck, the platform's edge within 24 of the
+     tram; getting off between stops must land on the live rail.
    - **Teleporters:** each lands the player standing, clear of solid, not in mid-air,
      not on another teleporter (that would bounce them on) and not in a level change.
      With them all on, every trip must have a way back to where it was stepped on. A
@@ -341,6 +359,40 @@ def build():
   - `m.auto_nodes = True`: after verify, info_nodes go into the compiled map on the
     floor the player can walk (one per 192), so monsters like houndeyes can find
     their way; the game builds its node graph from them at the first load.
+- **Railways (`hlmap.track`, the freight line).**
+  ```python
+  t = track.Track("freight")
+  low = t.line("low", [(704, -768), (256, -768), (-1024, -768), ...], z=0, closed=True)  # a loop
+  ch = t.branch("chord", low.at((256, -768)), [(0, -512), (0, 512)], to=low.at((256, 768)))
+  t.rename(low.at((256, -768)), "chord_switch")       # a lever fires it: the switch flips
+  t.gate(low.at((-1280, 40)), "west_gate")            # closed until "west_gate" fires (a door named so too)
+  t.stop(low.at((704, -768)), "DISPATCH", board=(704, -846, 48))   # a platform beside that node
+  t.lift(low.at((1280, 0)), up.at((1280, 0)), "lift")  # a track lift between two lines
+  t.tram(low.at((704, -768)))                          # the track must run west from there
+  m.add(*t.entities())
+  m.add(track.live_rail(lvl.floor_polygons(channel_rooms + curves), holes=t.lift_holes()))
+  ```
+  - Track runs in channels (rooms and `lvl.corridor(..., checkpoints=False)` curves,
+    192 wide for the 192 x 104 tram) with the **live rail** over all of their floors:
+    the player can only get on and off at platforms, which is what verify assumes.
+    Platforms are rooms beside the channel with their floor at the deck (48) and an
+    edge brush out to 8 from the tram's side; the board point stands on the edge.
+    Keep the live rail out of a lift's opening (`holes=t.lift_holes()`): the tram
+    rides up through it with the player on board.
+  - Lines turn at 45 or 90 degrees; `entities()` rounds every corner into two half
+    turns (the game aims the tram at the track 96 ahead, so its ends swing out).
+    Stops, switches and the nodes before a lift stay where they are: keep them on
+    straights, and the track straight through the node before a lift.
+  - Forward is the order of a line's points. Each node knows one node behind it:
+    reversing past a merge takes the main line (branches are written first).
+  - The lift starts at the bottom; going forward the tram always stops on it and goes
+    up or down with it; reversing it crosses. Every loop through a lift node must
+    pass through it again (`Track.check`; the game loses the tram otherwise).
+  - `track.switch_sign(pos, facing, name, ("ROUTE: WEST", "ROUTE: DEPOT"))` next to a
+    switch's lever; `t.diagram()` draws the line map for a wall.
+  - `props.mounted_gun(pivot, name, yaw)`: a func_tank the player mans (12mm), with
+    its controls behind it; a `func_breakable` (target = a gate's name) across the
+    track is its barricade.
 - **Stairs between floors.** `steps, hole = lvl.stairs(name, lower, upper, top=(x, y),
   down="north")` makes a staircase from `upper`'s floor down into `lower`, which must
   sit directly below (`wall` units of slab).
@@ -714,6 +766,16 @@ def build():
   the labs alarm). Played "once" they repeat for ever and can't be stopped, and a
   large radius carries them through the map. `build` flags this; make them
   `stoppable=True` and turn them off (a trigger_relay with triggerstate 0).
+- A func_tracktrain or func_trackchange gets its origin from its ORIGIN brush: an
+  `origin` key as well makes SDHLT stop with "Only one ORIGIN brush allowed".
+- A tram is built facing west: the engine turns it to face along the track plus 180
+  degrees. Moving, it goes through walls and doors; only the track stops it (a
+  disabled node). The track's lethal bed is what keeps the player on board.
+- A tram stopped on a lift goes with it only if the game sees it on the lift's node:
+  stopped at the lift's own dead end, having come from the node before. A lift fired
+  with the tram close but not on it buzzes and stays (EvaluateTrain).
+- Stock maps have no `BRKHANDLE` texture (the office makes its own): pass
+  `texture="HANDLESIDE"` to `props.lever` elsewhere.
 - Collision is only trusted after `verify` passes. If you change a geometry
   generator, run `python tests/test_verify.py` and add a verify-based test for it.
 - A func_door_rotating needs an ORIGIN brush at the hinge (props.door_rotating adds one).

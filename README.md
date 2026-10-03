@@ -39,7 +39,7 @@ def build():
 ```
 python -m hlmap setup                 # download the SDHLT compilers (checksum-verified)
 python -m hlmap build office          # maps/office.py -> compile -> install -> build/office/plan.png
-python -m hlmap build office labs xen pumps   # the whole campaign, in order
+python -m hlmap build office labs xen pumps freight   # the whole campaign, in order
 python -m hlmap build office --shots  # + in-engine screenshots from the map's CAMERAS
 python -m hlmap play office           # launch Half-Life into the map
 python -m hlmap tex FIFTIES --sheet   # search textures, render a contact sheet
@@ -92,6 +92,19 @@ playing it:
   holds its breath (no way may keep the head under too long), moves the water with
   the valves, rides the lift and breaks the grate; the build places the monsters'
   navigation nodes.
+- Restarting the pumps powers the hub's last pad, to the fifth map, `freight`: a
+  freight line whose power went with the pumps. A tram waits at dispatch, and the
+  track loops: a lower loop round a block of rock with a chord through it (a depot
+  half way), a track lift up to an upper loop, and a spur off that to the yard. The
+  west gate is sealed, so it's the chord: throw the switch in the signal box, back
+  up past it and take the other way. Up the lift, a mounted gun on the tower clears
+  the spur's barricade; the yard office has the line's breaker, which opens the
+  gates so the tram can go all the way round, home to dispatch. Between platforms
+  the rail is live. `hlmap/track.py` builds railways (lines, loops, branches,
+  switches, gates, stops, the lift, the tram, rails and sleepers, a line map), and
+  `verify` rides the tram from stop to stop as the track is switched, checks it
+  clears the walls on every curve and up the lift, that each platform meets it, and
+  that there's no getting off between stops.
 - `hlmap/terrain.py` builds open terrain for outdoor areas under a sky: hills and
   lawns as watertight triangle columns (GoldSrc has no displacements). The office's
   cafeteria opens onto a patio and a staff car park with brush-built cars and painted

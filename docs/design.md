@@ -245,15 +245,41 @@ against the level's intended air and refuses to install on failure:
 - **Lifts and breakables.** A func_plat is solid at both its stops and ridden either
   way; a func_breakable blocks until an armed player next to it breaks it (it's
   then gone from the walker's solids). Tests: a lift up a shaft; a grate with and
-  without a crowbar to hand.
+  without a crowbar to hand. A mounted gun (func_tank with its controls) breaks the
+  breakables it can hit: in its turning range, within 4,096, in sight of its pivot.
+- **Trams** (`hlmap/track.py`). The live rail (lethal trigger_hurt over every track
+  bed) means a player is only ever on foot at a platform, so the tram is a ride from
+  stop to stop (path_tracks marked `hlmap_stop`, with a board point on the
+  platform). Where it stands, the switches, the gated nodes and the lifts are World
+  state; `World.rides` drives it through the path_track graph as the game links it
+  (one previous per node, in entity order; switches as thrown; never into a
+  disabled node), and through what its dead ends set off (a lift taking it up:
+  HLSDK EvaluateTrain decides whether it goes with it). Three more checks:
+  - clearance: the tram's own model, sampled from its BSP tree, placed every 32
+    units along every stretch as the game places it (facing the track `wheels`
+    ahead, so its ends swing out on curves), and up every lift, must clear the world;
+  - riding: a player standing anywhere on the deck, all along the track and up every
+    lift, touches no lethal trigger_hurt;
+  - boarding: each board point is standing ground, level with the deck, with the
+    platform's edge within 24 of the tram's side;
+  - getting off: stepping or jumping off anywhere between stops lands in the live
+    rail (near a stop, on ground the stops reach).
+  Found by them while building the freight line: 45-degree corners swung the tram's
+  canopy 28 units through the walls (now each corner is two half turns), tunnel lamps
+  in its way, a platform end in the way of the tram turning off at a switch. The
+  riding check came from the first playtest: the upper level's live rail covered the
+  lift's opening, and everyone riding the lift died in it (`live_rail(holes=)` keeps
+  the openings clear now).
 - **Navigation nodes.** With `m.auto_nodes`, the build writes info_nodes into the
   compiled entity lump after verify: one per 192 cell of the floor the player can
   walk (not swimming), so moving monsters chase properly.
-- **Lockout.** Every state of play must still be able to reach the state that sees
-  everything. Otherwise the line of play leading there is reported (e.g. a one-shot
-  breaker used before the outage, which locks a power-dependent door for good).
-  In a map with round trips (below), a state from which a way out can be used isn't
-  a lockout: the player can leave and come back.
+- **Lockout.** From every state of play, every area must still be reachable by some
+  line of play (one at a time counts: by tram, each platform is an area of its own).
+  Otherwise the line of play leading there is reported (e.g. a one-shot breaker used
+  before the outage, which locks a power-dependent door for good). In a map with
+  round trips (below), a state from which a way out can be used isn't a lockout: the
+  player can leave and come back. The log shows the shortest line of play along which
+  every area is reached.
 - **Round trips** (`m.verify_round_trips`). For each distinct state (the global
   states the map reads, the gear) the player can leave by each way out, and each way
   the other map offers back (its changelevel's `hlmap_master` evaluated with those
@@ -436,6 +462,29 @@ helpers do, and the verifier runs them:
   lights off, fails the power, then resets the breaker. In the game, the conference
   stays dark while the projector comes back, matching the simulation.
 
+### 3.11 Railways (`hlmap/track.py`)
+- **Lines** of path_tracks through points (45/90-degree corners), closed into loops
+  or not; **branches** off a node (which becomes a switch: firing its name throws
+  it) joining the track again (a merge) or ending (a spur); **gates** (a node closed
+  until its name fires: a blast door or a breakable named the same); **stops** (a
+  platform beside a node).
+- **Corners** are rounded when the entities are written (`Track.smooth`): a corner
+  node becomes two, 64 before and after it; where a node can't move (a switch, a
+  stop, a merge), a node 64 out on the way that turns off makes the first half turn.
+- **The lift** (func_trackchange) between a node on one line and one straight above
+  it: each level's node before it targets a dead end on the lift (whose `netname`
+  fires it) and has the lift node as its altpath, so trains always stop on it going
+  forward and go up or down with it, and cross it reversing. The approach must run
+  straight (EvaluateTrain looks at the node the train came from).
+- **Checks** (`Track.check`): from each lift node, following the track (with any
+  switches) must come back to it or dead-end (HLSDK Nearest gives up after 9,999
+  nodes and loses the train).
+- **The tram** (192 x 104, a flatbed with a console, side rails with a gap each side
+  and a canopy), built facing west at its first node; rails and sleepers as one
+  func_illusionary per stretch; `live_rail` (one trigger_hurt over many floors: the
+  engine tests a brush trigger's own hull); `switch_sign` (a +0/+A sign that flips
+  with its switch); `diagram()` (the line map for a wall).
+
 ## 4. Geometry roadmap
 
 ### 4.1 Convex geometry core (foundation for everything below)
@@ -586,7 +635,8 @@ Quality and budget measures:
   - In labs, the resonance test brings the network online: a pad in the test
     chamber goes to a transit hub, a room with no doors whose window looks out on a
     Xen sky (a room made of sky, `checkpoints=[]`, with floating rocks). Its two
-    offline pads, SITE 3 and 4, are where the next ideas plug in.
+    offline pads, SITE 3 and 4, were where the next ideas plugged in: the pump
+    station and the freight line.
   - Sites in other maps. Done: a campaign `PadLink` names the pair; each map's pad
     (`net.pad(..., link=)`) fires a use-only trigger_changelevel after the flash, with
     an info_landmark half the landing distance in front of it and a
@@ -596,6 +646,13 @@ Quality and budget measures:
     basement and to the Xen field station. The Xen field lab's pad has its own power
     (`power=`, the course's clearance card) and is one way (`one_way_from`): the hub's
     end is an arrivals pad, with no trigger.
+- **Railways. Done** (`hlmap/track.py`, §3.11). A drivable tram on looping track
+  with switches, gates, a track lift and platforms; verify rides it (§3.8, Trams).
+  The freight line (`maps/freight.py`) has a lower loop with a chord through it, a
+  lift to an upper loop with a yard spur, a mounted gun for the spur's barricade.
+  Not yet: trains that run by themselves (path_track `speed`, `spawnflags` 8 taking
+  the controls, func_train shuttles), a tram that crosses a level change (its
+  `globalname`), more than one tram, track on slopes (the tram doesn't pitch).
 - **NPCs and items.**
   - Scientists, security guards and monsters placed on the floor with checks.
   - `scripted_sequence` and `scripted_sentence` using the existing sentences.

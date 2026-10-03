@@ -271,7 +271,7 @@ class Level:
         self.openings.append(op)
         return op
 
-    def corridor(self, name, path, width=96, height=112, material=None, cut=True, max_cut=0.3):
+    def corridor(self, name, path, width=96, height=112, material=None, cut=True, max_cut=0.3, checkpoints=True):
         """A corridor along a polyline `path` [(x, y), ...] at any angle, from inside one
         room to inside another (both ends must be in room air; the rooms' walls get
         carved where it passes through). Keep points on integers and turns at 45 or 90
@@ -280,7 +280,8 @@ class Level:
         cut: other rooms it passes within a wall of get the corner cut off, parallel
         to it and one wall away (their cut corner becomes solid); a cut that would
         take more than `max_cut` of a room's floor is an error. Returns the Corridor
-        (floor_point(), frame() for placing things)."""
+        (floor_point(), frame() for placing things). checkpoints=False: nothing in it
+        needs reaching on foot (a railway cutting with a live rail)."""
         start = self.room_at((path[0][0], path[0][1], self._floor_near(path[0]) + 1))
         end = self.room_at((path[-1][0], path[-1][1], self._floor_near(path[-1]) + 1))
         if start is None or end is None:
@@ -289,6 +290,7 @@ class Level:
             raise ValueError(f"corridor {name}: {start.name} and {end.name} have different floors")
         mat = (material or start.material).with_(floor_align="world", ceiling_align="world")
         c = Corridor(name, path, width, height, start.floor, self.wall, mat, (start, end))
+        c.must_reach = checkpoints
         for r in self.rooms:
             if r in (start, end):
                 continue
@@ -423,6 +425,19 @@ class Level:
         return Entity("func_detail", brushes=steps, kv={"zhlt_detaillevel": "1"}), hole
 
     # --- queries ------------------------------------------------------------
+    def floor_polygons(self, spaces):
+        """The floors of rooms and corridors as [(convex polygon [(x, y), ...], z)]
+        (a room's whole box; a corridor's segments): e.g. for a live rail over a
+        railway's channels (hlmap.track.live_rail)."""
+        out = []
+        for sp in spaces:
+            if isinstance(sp, Room):
+                (x0, y0, z), (x1, y1, _) = sp.mins, sp.maxs
+                out.append(([(x0, y0), (x1, y0), (x1, y1), (x0, y1)], z))
+            else:
+                out += [(seg["floor"], sp.z0) for seg in sp.segments]
+        return out
+
     def all_air(self):
         return self.rooms + [o.room for o in self.openings] + self.extra_air
 
@@ -465,7 +480,8 @@ class Level:
                 pts[i] = (x, y)
             out.append((f"room {r.name}", [(x, y, z + 37) for x, y in pts]))
         for c in self.corridors:
-            out.append((f"corridor {c.name}", [(x, y, c.z0 + 37) for x, y in c.checkpoints()]))
+            if getattr(c, "must_reach", True):
+                out.append((f"corridor {c.name}", [(x, y, c.z0 + 37) for x, y in c.checkpoints()]))
         for f in self.features:
             if hasattr(f, "checkpoints"):
                 for k, p in enumerate(f.checkpoints()):
@@ -838,6 +854,7 @@ class Corridor:
                 raise ValueError(f"corridor {name}: segment {i} is too short for its turns")
             seg = {
                 "air": Convex.prism(air_poly, z0, z1).tidy(),
+                "floor": [tuple(q) for q in air_poly],
                 "pieces": [Convex.prism([LO0, LO1, L1, L0], z0, z1), Convex.prism([R0, R1, RO1, RO0], z0, z1),
                            Convex.prism([LO0, LO1, RO1, RO0], z0 - t, z0), Convex.prism([LO0, LO1, RO1, RO0], z1, z1 + t)],
                 "outer": Convex.prism([LO0, LO1, RO1, RO0], z0 - t, z1 + t),

@@ -5,6 +5,7 @@
        +--(pad in the basement)---+  | +--(SITE 3 pad,     +--(one way: the field lab's pad,
                                      |    the Xen card)-->  pumps      after the course)
                                      +---------------------------+
+                                  labs --(SITE 4 pad, the pumps running)--> freight
 
 Each map is its own script. The stretch of road tunnel where the level changes is
 built here, once, so both maps have exactly the same copy of it (verify compares
@@ -29,7 +30,7 @@ from hlmap import Material, box, props
 from hlmap.campaign import Link, PadLink
 from hlmap.mapfile import Entity, prepare_texture
 
-MAPS = ["office", "labs", "xen", "pumps"]
+MAPS = ["office", "labs", "xen", "pumps", "freight"]
 
 TUNNEL_HEIGHT = 192
 TUNNEL = Material(floor="OUT_PAVE1", wall="TNNL_W12", ceiling="TNNL_C1")
@@ -102,3 +103,5 @@ XEN_RETURN = PadLink("pad_xen_lab", ("labs", "xen"),  # the Xen field lab (the c
                      carries=["xen_clearance"])      # the field lab's keycard: it powers the hub's SITE 3 pad
 PUMPS_PAD = PadLink("pad_pumps", ("labs", "pumps"),  # the hub's SITE 3 <-> the pump station (needs the Xen card)
                     carries=["pumps_running"])        # the station's pumps, restarted
+FREIGHT_PAD = PadLink("pad_freight", ("labs", "freight"),   # the hub's SITE 4 <-> the freight line (needs the pumps)
+                      carries=["freight_power"])      # the line's power, back on

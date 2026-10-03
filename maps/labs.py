@@ -28,7 +28,8 @@ the look out of its window. Its pads lead back to the chamber, to the office bas
 (another map) and to the Xen field station (the xen map: the long jump course).
 Players who finish the course come back from its field lab onto an arrivals pad (a
 one-way link), with its clearance card, which powers the pad to the pump station
-(the pumps map). One more waits offline for a site still to come ("SITE 4").
+(the pumps map). Restarting the pumps powers SITE 4, the freight line (the freight
+map).
 
 The tunnel leads back to the office.
 """
@@ -36,7 +37,7 @@ from hlmap import Level, Map, Material, box, logic, props, scene, teleport
 from hlmap.art import boxworth_faces, font, paint
 from hlmap.geometry import cylinder
 from hlmap.mapfile import prepare_texture
-from maps.campaign import LAMP_TEX, LINK, OFFICE_PAD, PUMPS_PAD, SODIUM, TUNNEL, XEN_GATE, XEN_RETURN
+from maps.campaign import FREIGHT_PAD, LAMP_TEX, LINK, OFFICE_PAD, PUMPS_PAD, SODIUM, TUNNEL, XEN_GATE, XEN_RETURN
 from PIL import Image, ImageDraw
 
 BAY = Material(floor="TNNL_FLR4", wall="TNNL_W12C2", ceiling="TNNL_C1", floor_align="min")
@@ -134,7 +135,8 @@ def build():
     sector_pass = logic.Flag("sector_pass", False, (600, 200, 200))
     briefing = logic.Flag("brief_pending", True, (600, 200, 200))
     clearance = logic.Flag("xen_clearance", False, (1024, -352, 150))   # the Xen field lab's card: SITE 3's power
-    m.add(sector_pass.entities(), briefing.entities(), clearance.entities())
+    pumps = logic.Flag("pumps_running", False, (1024, -352, 150))       # the pump station restarted: SITE 4's power
+    m.add(sector_pass.entities(), briefing.entities(), clearance.entities(), pumps.entities())
 
     tunnel(m, tunnel_exit)
     loading_bay(m, bay, lab_door, sector_pass, briefing)
@@ -143,7 +145,7 @@ def build():
     talks = test(m, chamber, chamber_door, briefing, net)
     # the intercom panel by the console: skips whatever the intercom is saying
     m.add(scene.skip_button((1296, 224, 60), "north", [welcome] + talks, name="intercom_skip"))
-    transit_hub(m, hub, view, hub_window, net, clearance)
+    transit_hub(m, hub, view, hub_window, net, clearance, pumps)
 
     m.add(props.player_start((-944, 208, 0), facing="north"))     # where the office's tunnel lands you
     m.checkpoints = [("the loading dock", (320, 832, 48))]
@@ -405,12 +407,13 @@ def test(m, chamber, chamber_door, briefing, net):
     return [talk] + list(endings.values())
 
 
-def transit_hub(m, hub, view, window, net, clearance):
+def transit_hub(m, hub, view, window, net, clearance, pumps):
     """The resonance transit hub and its network: a pad here and in the test chamber;
     pads into the office basement and to the Xen field station (other maps: campaign
     PadLinks, their partners face the other way), and an arrivals pad for the Xen field
-    lab's one-way pad; two offline slots for sites to come; the view out; the
-    intercom."""
+    lab's one-way pad; pads to the pump station and the freight line, dark until what
+    the player brings back powers them (the field lab's card, the pumps running); the
+    view out; the intercom."""
     x0, y0, z0 = hub.mins
     x1, y1, z1 = hub.maxs
     chamber_pad = net.pad("pad_chamber", (1736, 400, 0), "west", site="TEST CHAMBER")   # arrive facing Boxworth
@@ -421,7 +424,8 @@ def transit_hub(m, hub, view, window, net, clearance):
             link=XEN_RETURN)                        # arrivals only: the course's end leads back here
     net.pad("hub_site3", (1312, -200, 0), "south", site="TRANSIT HUB", label="PUMP STATION", link=PUMPS_PAD,
             power=clearance)                        # dark until the Xen field lab's card
-    net.pad("hub_site4", (720, -420, 0), "east", site="TRANSIT HUB", label="SITE 4", offline=True)
+    net.pad("hub_site4", (720, -420, 0), "east", site="TRANSIT HUB", label="FREIGHT LINE", link=FREIGHT_PAD,
+            power=pumps)                            # dark until the pumps run again
     m.add(net.entities(m))
     # the room: lab lights, the network board, the window and what's out there
     for x in (768, 1024, 1280):

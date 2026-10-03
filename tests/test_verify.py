@@ -544,6 +544,142 @@ def test_a_grate_is_broken_with_a_weapon():
     assert any("break" in step for step in p.log), p.log
 
 
+def _railway(lever=True, live="all", pillar=False, upper_rail=None):
+    """A railway in one big room, its floor all live rail (or only the west half:
+    live="west"): a loop (clockwise) with the tram at stop A on the south side; a
+    switch (a button on A's platform throws it) to a spur ending at stop B; a lift on
+    the east side up to a loop 384 higher with stop C. pillar: one too close to the
+    track's west side."""
+    from hlmap import track
+    m = Map("vrail")
+    lvl = Level(wall=16)
+    lvl.room("yard", (-1024, -1152, 0), (1536, 1024, 640), MAT)
+    lvl.build(m)
+    t = track.Track("t")
+    low = t.line("low", [(256, -512), (0, -512), (-512, -512), (-512, 512), (512, 512), (512, 256), (512, 0),
+                         (512, -512)], closed=True)
+    spur = t.branch("spur", low.at((0, -512)), [(-256, -768), (-256, -1024)])
+    up = t.line("up", [(512, 0), (512, -256), (1024, -256), (1024, 0), (1024, 512), (512, 512), (512, 256)], z=384,
+                closed=True)
+    t.rename(low.at((0, -512)), "spur_switch")
+    t.stop(low.at((256, -512)), "A", board=(256, -596, 48))
+    t.stop(spur.at((-256, -1024)), "B", board=(-172, -1024, 48))
+    t.stop(up.at((1024, 0)), "C", board=(1108, 0, 432))
+    t.lift(low.at((512, 0)), up.at((512, 0)), "lift")
+    t.tram(low.at((256, -512)))
+    m.add(*t.entities())
+    plat = {"top": "-0TNNL_FLR7", "default": "TNNL_CRT1"}
+    m.add(props.detail(box((96, -800, 0), (416, -572, 48), plat), box((240, -800, 48), (272, -768, 140), plat),
+                       box((-196, -1120, 0), (-36, -928, 48), plat), box((1084, -96, 384), (1244, 96, 432), plat)))
+    if lever:
+        m.add(props.switch((256, -768, 96), "north", "spur_switch"))
+    floor = [(-1024, -1152), (1536, -1152), (1536, 1024), (-1024, 1024)] if live == "all" else \
+        [(-1024, -1152), (0, -1152), (0, 1024), (-1024, 1024)]
+    m.add(track.live_rail([(floor, 0)]))
+    if pillar:
+        m.add(props.detail(box((-468, -32, 0), (-444, 32, 200), "TNNL_CRT1")))
+    if upper_rail is not None:      # a live rail over the upper loop's west side, across the lift's opening or not
+        m.add(track.live_rail([([(448, -320), (576, -320), (576, 576), (448, 576)], 384)],
+                              holes=t.lift_holes() if upper_rail == "holed" else ()))
+    m.add(props.player_start((256, -700, 48), facing="north"), props.light((0, 0, 600), brightness=400))
+    return _compiled(m, "vrail")
+
+
+def test_the_tram_takes_the_player_between_stops():
+    from hlmap.verify import progression
+    stops = [("platform B", [(-116, -1024, 85)]), ("platform C", [(1164, 0, 469)])]
+    p = progression(_railway(lever=True), stops)
+    assert not p.missing, p.missing
+    assert any("drive the tram from A to B" in step for step in p.log) or \
+        any("drive the tram" in step and "to B" in step for step in p.log), p.log
+    assert not p.softlocks, p.softlocks[:2]
+    # without the switch's button, the spur (and B) is out of reach; the lift still takes it up to C
+    p = progression(_railway(lever=False), stops)
+    assert [n for n, _ in p.missing] == ["platform B"], p.missing
+
+
+def test_the_tram_rides_the_lift_up_and_down():
+    from hlmap.sim import World
+    from hlmap.verify import tram_stops
+    h = _railway(lever=False)
+    w = World(h.entities).start()
+    t = next(i for i, e in enumerate(h.entities) if e.get("classname") == "func_tracktrain")
+    stops = tram_stops(h.entities)
+    rides = {stops[n][0]: w2 for w2, n in w.rides(t)}
+    assert set(rides) == {"A", "C"}, sorted(rides)
+    lift = next(i for i, e in enumerate(h.entities) if e.get("classname") == "func_trackchange")
+    assert rides["C"].lift_top[lift] and not w.lift_top[lift]      # up with the tram
+    back = {stops[n][0] for _, n in rides["C"].rides(t)}
+    assert "A" in back, back                                      # and down again
+
+
+def test_the_tram_must_clear_the_walls():
+    from hlmap.verify import track_checks
+    assert track_checks(_railway()) == []
+    problems = track_checks(_railway(pillar=True))
+    assert any("runs into a wall" in p for p in problems), problems
+
+
+def test_a_live_rail_across_the_lift_shaft_kills_its_riders():
+    """In the freight line's first playtest the upper level's live rail covered the
+    lift's opening: everyone riding the lift up (or down) died passing through it."""
+    from hlmap.verify import track_checks
+    problems = track_checks(_railway(upper_rail="across"))
+    assert any("riding lift" in p for p in problems), problems
+    assert track_checks(_railway(upper_rail="holed")) == []
+
+
+def test_getting_off_the_tram_between_stops_is_caught():
+    from hlmap.verify import (Walker, _placed, gravity_zones, lethal_volumes, lifts, progression,
+                              solid_entities, tram_exits)
+    for live, expect in (("all", False), ("west", True)):
+        h = _railway(live=live)
+        reached = progression(h, []).reached
+        models = h.models()
+        w = Walker(h, [], solids=solid_entities(h), zones=gravity_zones(h), lethal=lethal_volumes(h),
+                   lifts=lifts(h))
+        assert bool(tram_exits(h, w, reached)) == expect, live
+
+
+def test_a_diagonal_live_rail_kills_only_on_its_strip():
+    from hlmap import track
+    from hlmap.verify import Walker, lethal_volumes
+    m = Map("vstrip")
+    lvl = Level(wall=16)
+    lvl.room("room", (0, 0, 0), (512, 512, 128), MAT)
+    lvl.build(m)
+    m.add(track.live_rail([([(0, 64), (64, 0), (512, 448), (448, 512)], 0)]))     # a strip along the diagonal
+    m.add(props.player_start((400, 100, 0)))
+    h = _compiled(m, "vstrip")
+    w = Walker(h, lethal=lethal_volumes(h))
+    assert w.deadly((256, 256, 37))                  # on the strip
+    assert not w.deadly((400, 100, 37))              # in its bounding box, off the strip
+
+
+def test_a_lift_node_must_be_on_every_loop_from_it():
+    """HLSDK Nearest follows the track from a lift's node and gives up after 9999
+    nodes: a loop that doesn't come back through the lift loses the tram."""
+    from hlmap import track
+
+    def network(beyond):
+        t = track.Track("t")
+        low = t.line("low", [(0, 0), (-512, 0), (-512, 512), (512, 512), (512, 256), (512, -256), (512, -512),
+                             (0, -512)], closed=True)
+        up = t.line("up", [(512, 512), (512, 256), (512, -256)] + beyond, z=384)
+        t.lift(low.at((512, -256)), up.at((512, -256)), "lift")
+        t.tram(low.at((0, 0)))
+        return t, up
+    network([(512, -512)])[0].entities()             # fine: from the lift, the upper line dead-ends
+    t, up = network([(1024, -256), (1024, 256), (1536, 256), (1536, -256)])
+    up.nodes[-1].target = up.at((1024, -256))        # a loop beyond the lift that never comes back through it
+    try:
+        t.entities()
+    except ValueError as e:
+        assert "loses" in str(e) or "lose" in str(e), e
+    else:
+        raise AssertionError("a loop that never passes the lift node went unnoticed")
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

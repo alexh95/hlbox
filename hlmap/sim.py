@@ -17,12 +17,20 @@ Half-Life game code (HLSDK) does, including its quirks:
   - gear: the HEV suit, the long jump module (only taken with the suit) and weapons
     go into the player's inventory; player_weaponstrip takes weapons and ammo (not
     the suit or the long jump); game_player_equip gives what it names
+  - path_track: fired, a switch (one with an altpath) toggles between its target
+    and its altpath, any other toggles "disabled"; func_trackchange (a track lift)
+    moves to its other level, taking the tram with it if it's stopped on it, and
+    enables the track at the level it's at only (HLSDK EvaluateTrain,
+    UpdateAutoTargets); where the tram stands (a path_track) is state too, and
+    `rides` drives it as far as the track lets it (hlmap/track.py)
 """
 from __future__ import annotations
 
 import heapq
+import math
 
 OFF, ON, SET, TOGGLE = 0, 1, 2, 3
+SF_PATH_DISABLED, SF_PATH_ALTERNATE = 1, 32768
 USE_NAMES = {OFF: "off", ON: "on", SET: "set", TOGGLE: "toggle"}
 
 # stock light styles (HLSDK world.cpp); 'a' = dark, 'm' = normal, 'z' = double
@@ -103,6 +111,22 @@ class World:
         self.opened = {i for i, e in enumerate(ents) if e.get("classname") in MOVERS and e.get("targetname")
                        and int(e.get("spawnflags") or 0) & 1}   # named doors open now (1 = starts open)
         self.inventory = set(inventory)   # the player's gear and weapons
+        # tracks (hlmap/track.py): switches thrown, nodes closed, lifts at the top, trams' nodes
+        self._graph = None
+        self.switched = {i for i, e in enumerate(ents) if e.get("classname") == "path_track"
+                         and int(float(e.get("spawnflags") or 0)) & SF_PATH_ALTERNATE}
+        self.closed = {i for i, e in enumerate(ents) if e.get("classname") == "path_track"
+                       and int(float(e.get("spawnflags") or 0)) & SF_PATH_DISABLED}
+        self.lift_top = {i: not int(float(e.get("spawnflags") or 0)) & 8 for i, e in enumerate(ents)
+                         if e.get("classname") == "func_trackchange"}
+        self.train = {}
+        for i, e in enumerate(ents):
+            if e.get("classname") == "func_tracktrain":
+                self.train[i] = next((j for j in self.names.get(e.get("target") or "", ())
+                                      if ents[j].get("classname") == "path_track"), None)
+        self._lift_cache = {}
+        for i in self.lift_top:            # CFuncTrackChange::Find -> UpdateAutoTargets
+            self._lift_targets(i)
         self.retarget = {}    # trigger_changetarget
         self.effects = []     # what happened, for logs: (entity, classname, use)
         self.warnings = []
@@ -117,6 +141,9 @@ class World:
         w.shown = dict(self.shown)
         w.gone, w.pressed, w.opened = set(self.gone), set(self.pressed), set(self.opened)
         w.inventory = set(self.inventory)
+        w._graph, w._lift_cache = self._graph, self._lift_cache
+        w.switched, w.closed = set(self.switched), set(self.closed)
+        w.lift_top, w.train = dict(self.lift_top), dict(self.train)
         w.retarget = dict(self.retarget)
         w.effects, w.warnings = [], []
         w._queue, w._seq, w.time = [], 0, self.time
@@ -207,6 +234,13 @@ class World:
         target."""
         if not self.armed:
             return self
+        self.gone.add(i)
+        self._use_targets(i, TOGGLE, None)
+        return self.run(self._until(until))
+
+    def shoot(self, i, until=None):
+        """A mounted gun (func_tank) the player mans breaks a func_breakable: gone, and
+        fires its target (no weapon of their own needed)."""
         self.gone.add(i)
         self._use_targets(i, TOGGLE, None)
         return self.run(self._until(until))
@@ -365,6 +399,16 @@ class World:
                         continue
                     self.inventory.add(k)
             self.effects.append((i, c, USE_NAMES[use]))
+        elif c == "path_track":
+            g = self.graph
+            k = g.by_entity.get(i)
+            if k is not None and g.alt[k] is not None:
+                if should_toggle(use, i not in self.switched):
+                    self.switched ^= {i}
+            elif should_toggle(use, i not in self.closed):
+                self.closed ^= {i}
+        elif c == "func_trackchange":
+            self._trackchange(i)
         elif c == "trigger_changetarget":
             for j in self.names.get(self.target(i) or "", ()):
                 self.retarget[j] = e.get("m_iszNewTarget")
@@ -372,6 +416,128 @@ class World:
             self.effects.append((i, c, USE_NAMES[use]))
         else:
             self.effects.append((i, c, USE_NAMES[use]))
+
+    # ------------------------------------------------------------ tracks
+    @property
+    def graph(self):
+        """The path_tracks as the game links them (track.Graph), shared by copies."""
+        if self._graph is None:
+            from .track import Graph
+            g = Graph.from_entities(self.ents)
+            g.by_entity = {n["index"]: k for k, n in enumerate(g.nodes)}
+            self._graph = g
+        return self._graph
+
+    def _alts(self):
+        g = self.graph
+        return {g.by_entity[i] for i in self.switched if i in g.by_entity}
+
+    def _node_entity(self, k):
+        return self.graph.nodes[k]["index"]
+
+    def _lift_targets(self, i):
+        """A track lift's (top, bottom) path_tracks (the named ones' nearest to it, as
+        CFuncTrackChange::Find picks them when the map starts), the tram it carries
+        and its centre."""
+        if i not in self._lift_cache:
+            e, g = self.ents[i], self.graph
+            o = tuple(float(c) for c in (e.get("origin") or "0 0 0").split())
+            ends = []
+            for key in ("toptrack", "bottomtrack"):
+                j = next((j for j in self.names.get(e.get(key) or "", ()) if self.cls(j) == "path_track"), None)
+                k = g.nearest(g.by_entity[j], o, self._alts()) if j is not None else None
+                if j is not None and k is None:
+                    self.warnings.append(f"track lift {e.get('targetname')}: following the track from {e.get(key)} "
+                                         "never comes back (HLSDK: bad sequence of path_tracks; the tram gets lost)")
+                ends.append(self._node_entity(k) if k is not None else None)
+            t = next((j for j in self.names.get(e.get("train") or "", ()) if self.cls(j) == "func_tracktrain"), None)
+            self._lift_cache[i] = (ends[0], ends[1], t, o)
+            self._update_lift(i)
+        return self._lift_cache[i]
+
+    def _update_lift(self, i):
+        """UpdateAutoTargets: the lift's node at the level it's at is open, the other
+        one closed."""
+        top, bottom, _, _ = self._lift_cache[i]
+        at_top = self.lift_top[i]
+        for node, open_ in ((top, at_top), (bottom, not at_top)):
+            if node is not None:
+                if open_:
+                    self.closed.discard(node)
+                else:
+                    self.closed.add(node)
+
+    def _trackchange(self, i):
+        """CFuncTrackChange::Use: go to the other level; the tram goes with it if it's
+        stopped on it (EvaluateTrain: following), and the lift refuses (an alarm) if
+        the tram is close but not on it."""
+        top, bottom, t, o = self._lift_targets(i)
+        cur = top if self.lift_top[i] else bottom
+        code = self._evaluate_train(t, cur, o)
+        if code == "blocking":
+            self.effects.append((i, "func_trackchange", "blocked"))
+            return
+        self.lift_top[i] = not self.lift_top[i]
+        self._update_lift(i)
+        if code == "following":
+            g = self.graph
+            dest = top if self.lift_top[i] else bottom
+            k = g.nearest(g.by_entity[dest], o, self._alts()) if dest is not None else None
+            if k is None:
+                self.warnings.append(f"track lift {self.ents[i].get('targetname')}: the tram is lost at the "
+                                     "other level")
+            self.train[t] = self._node_entity(k) if k is not None else None
+
+    def _evaluate_train(self, t, cur, origin):
+        """HLSDK EvaluateTrain, with the tram stopped at its node: it counts as at the
+        lift's node `cur` if its node is cur or next to it (the engine's m_ppath can be
+        the node before where it stands), and as following the lift if within `wheels`
+        of its centre (in plan); close but not on it, it blocks."""
+        if t is None or cur is None or self.train.get(t) is None:
+            return "safe"
+        g = self.graph
+        k, c = g.by_entity[self.train[t]], g.by_entity[cur]
+        mine = {k, g.prev[k]}
+        if not mine & {c, g.prev[c], g.next[c]}:
+            return "safe"
+        p = g.nodes[k]["origin"]
+        d = math.hypot(p[0] - origin[0], p[1] - origin[1])
+        wheels = float(self.ents[t].get("wheels") or 0)
+        if d < wheels:
+            return "following"
+        return "safe" if d > 150 + wheels else "blocking"
+
+    def rides(self, t, stops_only=True):
+        """Where the player can drive tram `t` from where it stands, forward and back as
+        the track is switched, and through what its dead ends set off (a lift taking
+        it up): [(World with the tram there, path_track entity index)], at the stops
+        (path_tracks with hlmap_stop) unless stops_only is False."""
+        g = self.graph
+        out, seen, todo = [], set(), [self]
+        while todo:
+            w = todo.pop()
+            if w.train.get(t) is None:
+                continue
+            closed = {g.by_entity[i] for i in w.closed if i in g.by_entity}
+            reach, ends = g.drive(g.by_entity[w.train[t]], w._alts(), closed)
+            for k in reach:
+                if stops_only and not g.nodes[k]["stop"]:
+                    continue
+                w2 = w.copy()
+                w2.train[t] = g.nodes[k]["index"]
+                out.append((w2, g.nodes[k]["index"]))
+            for k, _ in ends:
+                net = g.nodes[k]["netname"]
+                if not net:
+                    continue
+                w2 = w.copy()
+                w2.train[t] = g.nodes[k]["index"]
+                w2.fire(net)
+                state = w2.key(None)
+                if state not in seen:
+                    seen.add(state)
+                    todo.append(w2)
+        return out
 
     # ------------------------------------------------------------ progress-relevant state
     def relevance(self, doors, watch=()):
@@ -433,8 +599,13 @@ class World:
         return rel, rel_globals
 
     def key(self, relevance):
+        """The state that matters (relevance: from relevance(); None: all of it)."""
+        if relevance is None:
+            relevance = (set(range(len(self.ents))), set(self.globals))
         rel, rel_globals = relevance
-        return (tuple(sorted((g, self.globals.get(g, 0)) for g in rel_globals)),
+        return (tuple(sorted(self.switched)), tuple(sorted(self.closed)), tuple(sorted(self.lift_top.items())),
+                tuple(sorted(self.train.items())),
+                tuple(sorted((g, self.globals.get(g, 0)) for g in rel_globals)),
                 tuple((i, tuple(self.bits[i])) for i in sorted(rel) if i in self.bits),
                 tuple(sorted(self.gone & rel)), tuple(sorted(self.pressed & rel)),
                 tuple(sorted(self.opened & rel)), tuple(sorted(self.inventory)),
@@ -449,6 +620,15 @@ class World:
             a, b = before.globals.get(g, 0), self.globals.get(g, 0)
             if a != b and not g.endswith("_not"):
                 out.append(f"{g} {'on' if b == 1 else 'off' if b == 0 else 'dead'}")
+        for i in sorted(self.switched ^ before.switched):
+            out.append(f"switch {self.ents[i].get('targetname')} {'thrown' if i in self.switched else 'back'}")
+        lift_nodes = {n for v in self._lift_cache.values() for n in v[:2]}
+        for i in sorted(self.closed ^ before.closed):
+            if i not in lift_nodes:
+                out.append(f"track at {self.ents[i].get('targetname')} {'closed' if i in self.closed else 'open'}")
+        for i, top in sorted(self.lift_top.items()):
+            if before.lift_top.get(i) != top:
+                out.append(f"{self.ents[i].get('targetname')} {'up' if top else 'down'}")
         groups = {}
         for i, on in self.lit.items():
             if before.lit.get(i) != on:

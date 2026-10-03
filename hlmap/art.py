@@ -478,3 +478,46 @@ def network_diagram(sites, edges, size=(256, 192), title="NETWORK", color=(120, 
         ly = y - r - 8 if s != hub and y < cy - 4 else y + r + 8
         d.text((lx, ly), s, fill=(150, 150, 160) if s in offline else (236, 236, 242), font=font(10), anchor="mm")
     return img
+
+
+LINE_COLORS = [(250, 180, 60), (110, 200, 255), (160, 230, 120)]
+
+
+def line_map(segments, stops, switches=(), lifts=(), size=(256, 192), title="LINE MAP"):
+    """A railway's board in plan: `segments` [((x0, y0), (x1, y1), level)] (each level
+    its colour), `stops` [(label, (x, y))] as dots with names, `switches` [(x, y)] as
+    rings, `lifts` [(x, y)] as squares joining the levels. North is up."""
+    w, h = size
+    img = Image.new("RGB", size, (16, 20, 30))
+    d = ImageDraw.Draw(img)
+    d.rectangle((0, 0, w - 1, 20), fill=(30, 38, 56))
+    d.text((w // 2, 10), title, fill=(236, 236, 242), font=font(12), anchor="mm")
+    pts = [p for a, b, _ in segments for p in (a, b)]
+    if not pts:
+        return img
+    x0, x1 = min(p[0] for p in pts), max(p[0] for p in pts)
+    y0, y1 = min(p[1] for p in pts), max(p[1] for p in pts)
+    m = 22
+    s = min((w - 2 * m) / max(1, x1 - x0), (h - 20 - 2 * m) / max(1, y1 - y0))
+    ox = (w - (x1 - x0) * s) / 2
+    oy = 20 + (h - 20 - (y1 - y0) * s) / 2
+
+    def at(p):
+        return (ox + (p[0] - x0) * s, oy + (y1 - p[1]) * s)
+    for a, b, lv in sorted(segments, key=lambda t: t[2]):
+        col = LINE_COLORS[lv % len(LINE_COLORS)]
+        d.line((*at(a), *at(b)), fill=col, width=3)
+    for p in switches:
+        x, y = at(p)
+        d.ellipse((x - 4, y - 4, x + 4, y + 4), outline=(236, 236, 242), width=1)
+    for p in lifts:
+        x, y = at(p)
+        d.rectangle((x - 5, y - 5, x + 5, y + 5), outline=(236, 236, 242), fill=(60, 66, 80), width=1)
+    for label, p in stops:
+        x, y = at(p)
+        d.ellipse((x - 4, y - 4, x + 4, y + 4), fill=(236, 236, 242))
+        half = d.textlength(label, font=font(9)) / 2
+        lx = min(w - 3 - half, max(3 + half, x))
+        ly = y + 11 if y < h - 16 else y - 11
+        d.text((lx, ly), label, fill=(236, 236, 242), font=font(9), anchor="mm")
+    return img
